@@ -24,17 +24,44 @@ export class SessionEngine {
   ) {}
 
   async onSwap(session: TokenSession, event: SwapEvent): Promise<void> {
-    const key = session.pair.pair.toLowerCase();
-    const previous = this.locks.get(key) ?? Promise.resolve();
-    const current = previous
-      .catch(() => undefined)
-      .then(() => this.handle(session, event));
-    this.locks.set(key, current);
-    try {
-      await current;
-    } finally {
-      if (this.locks.get(key) === current) this.locks.delete(key);
-    }
+    await this.withLock(session, () => this.handle(session, event));
+  }
+
+  async sellManually(session: TokenSession): Promise<TokenSession> {
+    return this.withLock(session, async () => {
+      if (!session.entry || session.exit) {
+        throw new Error('Aucune position ouverte à vendre.');
+      }
+      if (session.status !== 'HOLDING' && session.status !== 'MANUAL_REVIEW') {
+        throw new Error(`Vente manuelle impossible depuis le statut ${session.status}.`);
+      }
+      await this.performSell(
+        session,
+        'Sortie manuelle effectuée depuis le dashboard local.',
+        true,
+      );
+      return session;
+    });
+  }
+
+  async ignoreManually(session: TokenSession): Promise<TokenSession> {
+    return this.withLock(session, async () => {
+      if (session.entry && !session.exit) {
+        throw new Error('Une position ouverte ne peut pas être ignorée; vendez-la d’abord.');
+      }
+      if (!['WAITING_FIRST_BUY', 'REJECTED', 'EXPIRED'].includes(session.status)) {
+        throw new Error(`Actif impossible à ignorer depuis le statut ${session.status}.`);
+      }
+      session.status = 'REJECTED';
+      session.rejectionReason = 'Actif ignoré manuellement depuis le dashboard local.';
+      session.updatedAtMs = Date.now();
+      await this.sessions.save(session);
+      logger.warn(
+        { pair: session.pair.pair, token: session.pair.token },
+        'Actif placé dans la liste d’ignorance depuis le dashboard local.',
+      );
+      return session;
+    });
   }
 
   isTerminal(session: TokenSession): boolean {
@@ -50,6 +77,28 @@ export class SessionEngine {
     session.rejectionReason = 'Aucun premier achat avant expiration du moniteur.';
     await this.sessions.save(session);
     return true;
+  }
+
+  private async withLock<T>(session: TokenSession, operation: () => Promise<T>): Promise<T> {
+    const key = session.pair.pair.toLowerCase();
+    const previous = this.locks.get(key) ?? Promise.resolve();
+    let resolveCurrent: (() => void) | undefined;
+    const marker = new Promise<void>((resolve) => {
+      resolveCurrent = resolve;
+    });
+    const current = previous.catch(() => undefined).then(async () => {
+      try {
+        return await operation();
+      } finally {
+        resolveCurrent?.();
+      }
+    });
+    this.locks.set(key, marker);
+    try {
+      return await current;
+    } finally {
+      if (this.locks.get(key) === marker) this.locks.delete(key);
+    }
   }
 
   private async handle(session: TokenSession, event: SwapEvent): Promise<void> {
@@ -168,7 +217,18 @@ export class SessionEngine {
     );
 
     if (session.subsequentBuyCount < session.targetBuysAfterEntry) return;
+    await this.performSell(
+      session,
+      'Sortie effectuée après le nombre cible d’achats.',
+      false,
+    );
+  }
 
+  private async performSell(
+    session: TokenSession,
+    successMessage: string,
+    rethrowFailure: boolean,
+  ): Promise<void> {
     session.status = 'SELL_PENDING';
     session.sellAttempts += 1;
     session.updatedAtMs = Date.now();
@@ -176,6 +236,7 @@ export class SessionEngine {
     try {
       session.exit = await this.executor.sell(session);
       session.status = 'CLOSED';
+      session.rejectionReason = undefined;
       session.updatedAtMs = Date.now();
       await this.sessions.save(session);
       logger.info(
@@ -185,7 +246,7 @@ export class SessionEngine {
           mode: session.exit.mode,
           amountOutWei: session.exit.amountOutWei.toString(),
         },
-        'Sortie effectuée après le nombre cible d’achats.',
+        successMessage,
       );
     } catch (error) {
       session.status = 'MANUAL_REVIEW';
@@ -196,6 +257,7 @@ export class SessionEngine {
         { pair: session.pair.pair, error: errorMessage(error) },
         'Vente échouée; intervention manuelle requise.',
       );
+      if (rethrowFailure) throw error;
     }
   }
 
