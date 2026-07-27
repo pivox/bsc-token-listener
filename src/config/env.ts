@@ -140,6 +140,8 @@ export const config = {
   reconcileSeconds: readInteger('RECONCILE_SECONDS', 15, 5, 300, 'EVENT_RECONCILE_SECONDS'),
   riskPolicy,
   riskMinScore: readInteger('RISK_MIN_SCORE', 80, 0, 100),
+  riskAllowUnknownReviews: readBoolean('RISK_ALLOW_UNKNOWN_REVIEWS', false),
+  riskAllowUnknownMinScore: readInteger('RISK_ALLOW_UNKNOWN_MIN_SCORE', 95, 0, 100),
   minWbnbLiquidityWei: parseEther(read('MIN_WBNB_LIQUIDITY', '0.25')),
   riskProbeRequired: readBoolean('RISK_PROBE_REQUIRED', true, 'REQUIRE_SAFETY_PROBE'),
   safetyProbeAddress,
