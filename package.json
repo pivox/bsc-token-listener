@@ -10,6 +10,7 @@
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --test tests/*.test.ts",
     "rpc:check": "tsx scripts/check-rpc.ts",
+    "pair:diagnose": "tsx scripts/diagnose-pair-created.ts",
     "db:migrate": "tsx scripts/migrate.ts",
     "deploy:probe": "tsx scripts/deploy-safety-probe.ts"
   },
