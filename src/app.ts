@@ -2,20 +2,22 @@ import type { Address } from 'viem';
 import { pancakeRouterAbi } from './abi/pancake-router.abi.js';
 import { chain } from './config/chain.js';
 import { config } from './config/env.js';
+import { ActionDashboardServer } from './dashboard/action-dashboard.js';
+import { DashboardActionService } from './dashboard/dashboard-action.service.js';
 import {
   DashboardRepository,
   DashboardService,
 } from './dashboard/dashboard.js';
-import { WritableDashboardServer } from './dashboard/writable-dashboard.js';
 import { TokenMetadataService } from './discovery/token-metadata.service.js';
 import { TradeExecutor } from './execution/trade-executor.js';
+import { HeartbeatService } from './heartbeat/heartbeat.js';
 import { PairCreatedListener } from './listeners/pair-created.listener.js';
 import { SwapListener } from './listeners/swap.listener.js';
-import { HeartbeatService } from './heartbeat/heartbeat.js';
 import { publicClient, wsClient } from './rpc/clients.js';
 import { RiskSettingsStore } from './security/risk-settings.store.js';
 import { TokenRiskService } from './security/token-risk.service.js';
 import { closeDatabase, migrate } from './storage/database.js';
+import { IgnoredAssetRepository } from './storage/ignored-asset.repository.js';
 import {
   CheckpointRepository,
   DiscoveredTokenRepository,
@@ -62,6 +64,7 @@ async function main(): Promise<void> {
   const reports = new RiskReportRepository();
   const discovered = new DiscoveredTokenRepository();
   const checkpoints = new CheckpointRepository();
+  const ignoredAssets = new IgnoredAssetRepository();
   const riskSettings = new RiskSettingsStore();
   const heartbeat = new HeartbeatService(
     checkpoints,
@@ -77,19 +80,40 @@ async function main(): Promise<void> {
   const executor = new TradeExecutor(trades);
   const engine = new SessionEngine(sessions, reports, risk, executor);
   const monitors = new Map<string, SwapListener>();
+  const activeSessionsByToken = new Map<string, TokenSession>();
+  const activeTokenByPair = new Map<string, string>();
+
+  const removeMonitor = (pair: Address): void => {
+    const pairKey = pair.toLowerCase();
+    const tokenKey = activeTokenByPair.get(pairKey);
+    monitors.delete(pairKey);
+    activeTokenByPair.delete(pairKey);
+    if (tokenKey) activeSessionsByToken.delete(tokenKey);
+  };
+
+  const stopMonitor = (pair: Address): void => {
+    const key = pair.toLowerCase();
+    monitors.get(key)?.stop();
+    removeMonitor(pair);
+  };
+
+  const dashboardActions = new DashboardActionService(
+    ignoredAssets,
+    engine,
+    (token) => activeSessionsByToken.get(token.toLowerCase()) ?? null,
+    stopMonitor,
+  );
   const dashboard = config.dashboardEnabled
-    ? new WritableDashboardServer(
+    ? new ActionDashboardServer(
       new DashboardService(new DashboardRepository(), heartbeat),
       riskSettings,
+      dashboardActions,
     )
     : null;
 
-  const removeMonitor = (pair: Address): void => {
-    monitors.delete(pair.toLowerCase());
-  };
-
   const startMonitor = async (session: TokenSession): Promise<void> => {
     const key = session.pair.pair.toLowerCase();
+    const tokenKey = session.pair.token.toLowerCase();
     if (monitors.has(key)) return;
     if (monitors.size >= config.maxActivePairMonitors) {
       logger.warn(
@@ -106,10 +130,12 @@ async function main(): Promise<void> {
       removeMonitor,
     );
     monitors.set(key, listener);
+    activeSessionsByToken.set(tokenKey, session);
+    activeTokenByPair.set(key, tokenKey);
     try {
       await listener.start();
     } catch (error) {
-      monitors.delete(key);
+      removeMonitor(session.pair.pair);
       throw error;
     }
   };
@@ -117,6 +143,13 @@ async function main(): Promise<void> {
   const onPair = async (pair: PairInfo): Promise<void> => {
     const key = pair.pair.toLowerCase();
     if (monitors.has(key)) return;
+    if (await ignoredAssets.isIgnored(pair.token)) {
+      logger.info(
+        { pair: pair.pair, token: pair.token },
+        'Paire ignorée: le token figure dans la liste d’ignorance.',
+      );
+      return;
+    }
 
     await discovered.upsert({ pair, source: 'PAIR_CREATED' });
     let metadata;
@@ -160,6 +193,10 @@ async function main(): Promise<void> {
 
   const restored = await sessions.loadActive();
   for (const session of restored) {
+    if (await ignoredAssets.isIgnored(session.pair.token)) {
+      await engine.ignoreManually(session);
+      continue;
+    }
     await startMonitor(session);
   }
 
