@@ -11,7 +11,8 @@ import { TokenMetadataService } from './discovery/token-metadata.service.js';
 import { TradeExecutor } from './execution/trade-executor.js';
 import { PairCreatedListener } from './listeners/pair-created.listener.js';
 import { SwapListener } from './listeners/swap.listener.js';
-import { publicClient } from './rpc/clients.js';
+import { HeartbeatService } from './heartbeat/heartbeat.js';
+import { publicClient, wsClient } from './rpc/clients.js';
 import { TokenRiskService } from './security/token-risk.service.js';
 import { closeDatabase, migrate } from './storage/database.js';
 import {
@@ -60,13 +61,22 @@ async function main(): Promise<void> {
   const reports = new RiskReportRepository();
   const discovered = new DiscoveredTokenRepository();
   const checkpoints = new CheckpointRepository();
+  const heartbeat = new HeartbeatService(
+    checkpoints,
+    sessions,
+    {
+      getHttpLatestBlock: () => publicClient.getBlockNumber(),
+      getWsLatestBlock: () => wsClient.getBlockNumber(),
+    },
+    config.executionMode,
+  );
   const metadataService = new TokenMetadataService(publicClient);
   const risk = new TokenRiskService(publicClient);
   const executor = new TradeExecutor(trades);
   const engine = new SessionEngine(sessions, reports, risk, executor);
   const monitors = new Map<string, SwapListener>();
   const dashboard = config.dashboardEnabled
-    ? new DashboardServer(new DashboardService(new DashboardRepository()))
+    ? new DashboardServer(new DashboardService(new DashboardRepository(), heartbeat))
     : null;
 
   const removeMonitor = (pair: Address): void => {
@@ -151,6 +161,29 @@ async function main(): Promise<void> {
   const pairListener = new PairCreatedListener(checkpoints, onPair);
   await pairListener.start();
 
+  const refreshHeartbeat = async (): Promise<void> => {
+    const snapshot = await heartbeat.refresh(monitors.size);
+    logger.info(
+      {
+        latestBlock: snapshot.latestBlock,
+        pairCreatedCheckpoint: snapshot.pairCreatedCheckpoint,
+        activeSwapMonitors: snapshot.activeSwapMonitors,
+        activeSessions: snapshot.activeSessions,
+        executionMode: snapshot.executionMode,
+        httpStatus: snapshot.http.status,
+        wsStatus: snapshot.webSocket.status,
+      },
+      'Heartbeat.',
+    );
+  };
+  await refreshHeartbeat().catch((error: unknown) =>
+    logger.error({ reason: errorMessage(error) }, 'Heartbeat initial échoué.'),
+  );
+  const heartbeatInterval = setInterval(() => {
+    void refreshHeartbeat().catch((error: unknown) =>
+      logger.error({ reason: errorMessage(error) }, 'Heartbeat échoué.'));
+  }, 60_000);
+
   if (dashboard) {
     try {
       await dashboard.start();
@@ -187,6 +220,7 @@ async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info({ signal }, 'Arrêt du bot.');
+    clearInterval(heartbeatInterval);
     pairListener.stop();
     for (const listener of monitors.values()) listener.stop();
     try {

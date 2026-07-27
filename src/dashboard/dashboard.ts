@@ -24,6 +24,7 @@ import {
   applyBasisPointReduction,
   calculatePnl,
 } from './dashboard-metrics.js';
+import { HeartbeatService } from '../heartbeat/heartbeat.js';
 import { renderDashboardPage } from './dashboard.page.js';
 
 const OPEN_STATUSES = new Set<SessionStatus>([
@@ -186,6 +187,24 @@ interface DashboardSnapshot {
     realizedPnlBnb: string;
     valuationComplete: boolean;
   };
+  heartbeat: {
+    generatedAt: string;
+    executionMode: 'dry-run' | 'live';
+    latestBlock: string | null;
+    pairCreatedCheckpoint: string | null;
+    activeSwapMonitors: number;
+    activeSessions: number;
+    http: {
+      status: 'up' | 'down';
+      blockNumber: string | null;
+      error: string | null;
+    };
+    webSocket: {
+      status: 'up' | 'down';
+      blockNumber: string | null;
+      error: string | null;
+    };
+  } | null;
   tokens: DashboardTokenView[];
 }
 
@@ -353,7 +372,10 @@ export class DashboardService {
   private cache: { expiresAtMs: number; snapshot: DashboardSnapshot } | null = null;
   private inFlight: Promise<DashboardSnapshot> | null = null;
 
-  constructor(private readonly repository: DashboardRepository) {}
+  constructor(
+    private readonly repository: DashboardRepository,
+    private readonly heartbeatService: HeartbeatService,
+  ) {}
 
   async getSnapshot(): Promise<DashboardSnapshot> {
     const now = Date.now();
@@ -400,6 +422,7 @@ export class DashboardService {
       riskPolicy: config.riskPolicy,
       walletAddress: account?.address ?? null,
       readOnly: true,
+      heartbeat: this.heartbeatService.currentSnapshot,
       feeNote: 'PnL en BNB. La taxe de vente estimée est appliquée au PnL latent quand elle est connue; les frais de gas réseau ne sont pas encore persistés et ne sont donc pas déduits.',
       summary: {
         detectedTokens: counters.detectedTokens,
