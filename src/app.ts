@@ -4,15 +4,16 @@ import { chain } from './config/chain.js';
 import { config } from './config/env.js';
 import {
   DashboardRepository,
-  DashboardServer,
   DashboardService,
 } from './dashboard/dashboard.js';
+import { WritableDashboardServer } from './dashboard/writable-dashboard.js';
 import { TokenMetadataService } from './discovery/token-metadata.service.js';
 import { TradeExecutor } from './execution/trade-executor.js';
 import { PairCreatedListener } from './listeners/pair-created.listener.js';
 import { SwapListener } from './listeners/swap.listener.js';
 import { HeartbeatService } from './heartbeat/heartbeat.js';
 import { publicClient, wsClient } from './rpc/clients.js';
+import { RiskSettingsStore } from './security/risk-settings.store.js';
 import { TokenRiskService } from './security/token-risk.service.js';
 import { closeDatabase, migrate } from './storage/database.js';
 import {
@@ -61,6 +62,7 @@ async function main(): Promise<void> {
   const reports = new RiskReportRepository();
   const discovered = new DiscoveredTokenRepository();
   const checkpoints = new CheckpointRepository();
+  const riskSettings = new RiskSettingsStore();
   const heartbeat = new HeartbeatService(
     checkpoints,
     sessions,
@@ -71,12 +73,15 @@ async function main(): Promise<void> {
     config.executionMode,
   );
   const metadataService = new TokenMetadataService(publicClient);
-  const risk = new TokenRiskService(publicClient);
+  const risk = new TokenRiskService(publicClient, riskSettings);
   const executor = new TradeExecutor(trades);
   const engine = new SessionEngine(sessions, reports, risk, executor);
   const monitors = new Map<string, SwapListener>();
   const dashboard = config.dashboardEnabled
-    ? new DashboardServer(new DashboardService(new DashboardRepository(), heartbeat))
+    ? new WritableDashboardServer(
+      new DashboardService(new DashboardRepository(), heartbeat),
+      riskSettings,
+    )
     : null;
 
   const removeMonitor = (pair: Address): void => {
@@ -195,11 +200,14 @@ async function main(): Promise<void> {
     }
   }
 
+  const currentRiskSettings = await riskSettings.get();
   logger.info(
     {
       network: config.network,
       executionMode: config.executionMode,
       riskPolicy: config.riskPolicy,
+      allowUnknownReviews: currentRiskSettings.allowUnknownReviews,
+      allowUnknownMinScore: currentRiskSettings.allowUnknownMinScore,
       factory: config.factory,
       router: config.router,
       wbnb: config.wbnb,
