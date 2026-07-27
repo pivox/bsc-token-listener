@@ -1,108 +1,179 @@
-import { formatEther, getAddress, isAddressEqual } from 'viem';
+import type { Address } from 'viem';
 import { pancakeRouterAbi } from './abi/pancake-router.abi.js';
-import { BscTokenListenerBot } from './bot.js';
-import { loadConfig } from './config/env.js';
-import { getPancakeV2Contracts } from './config/network.js';
-import { assertExpectedChain, createRpcClients } from './rpc/clients.js';
-import { RpcHealthMonitor } from './rpc/health-monitor.js';
-import { createStore } from './storage/create-store.js';
-import { Logger, redactSensitiveText } from './utils/logger.js';
+import { chain } from './config/chain.js';
+import { config } from './config/env.js';
+import { TokenMetadataService } from './discovery/token-metadata.service.js';
+import { TradeExecutor } from './execution/trade-executor.js';
+import { PairCreatedListener } from './listeners/pair-created.listener.js';
+import { SwapListener } from './listeners/swap.listener.js';
+import { publicClient } from './rpc/clients.js';
+import { TokenRiskService } from './security/token-risk.service.js';
+import { closeDatabase, migrate } from './storage/database.js';
+import {
+  CheckpointRepository,
+  DiscoveredTokenRepository,
+  RiskReportRepository,
+  SessionRepository,
+  SwapEventRepository,
+  TradeRepository,
+} from './storage/repositories.js';
+import { SessionEngine } from './strategy/session-engine.js';
+import type { PairInfo, TokenSession } from './types/domain.js';
+import { errorMessage } from './utils/error.js';
+import { logger } from './utils/logger.js';
 
 async function main(): Promise<void> {
-  const config = loadConfig();
-  const logger = new Logger(config.logLevel, { service: 'bsc-token-listener-bot' });
-  const contracts = getPancakeV2Contracts(config.network);
-  const clients = createRpcClients(config);
-  await assertExpectedChain(clients);
+  const chainId = await publicClient.getChainId();
+  if (chainId !== chain.id) {
+    throw new Error(`RPC sur le mauvais réseau: attendu ${chain.id}, reçu ${chainId}.`);
+  }
 
   const [routerFactory, routerWbnb] = await Promise.all([
-    clients.publicClient.readContract({
-      address: contracts.router,
+    publicClient.readContract({
+      address: config.router,
       abi: pancakeRouterAbi,
       functionName: 'factory',
     }),
-    clients.publicClient.readContract({
-      address: contracts.router,
+    publicClient.readContract({
+      address: config.router,
       abi: pancakeRouterAbi,
       functionName: 'WETH',
     }),
   ]);
-  if (!isAddressEqual(routerFactory, contracts.factory)) {
-    throw new Error(
-      `Le routeur ${contracts.router} annonce la factory ${routerFactory}, pas ${contracts.factory}.`,
-    );
+  if (routerFactory.toLowerCase() !== config.factory.toLowerCase()) {
+    throw new Error('La Factory configurée ne correspond pas au Router.');
   }
-  const wbnb = getAddress(routerWbnb);
-
-  if (config.executionMode === 'live' && clients.traderAddress !== undefined) {
-    const balance = await clients.publicClient.getBalance({ address: clients.traderAddress });
-    if (balance <= config.buyAmountWei) {
-      throw new Error(
-        `Solde trader insuffisant: ${formatEther(balance)} BNB pour un achat de ${formatEther(config.buyAmountWei)} BNB, hors gas.`,
-      );
-    }
-    logger.warn('MODE LIVE ACTIVÉ: des transactions réelles pourront être signées.', {
-      traderAddress: clients.traderAddress,
-      balanceBnb: formatEther(balance),
-      buyAmountBnb: formatEther(config.buyAmountWei),
-    });
-  } else {
-    logger.info('Mode dry-run: aucune transaction ne sera envoyée.');
+  if (routerWbnb.toLowerCase() !== config.wbnb.toLowerCase()) {
+    throw new Error('WBNB configuré ne correspond pas au Router.');
   }
 
-  const store = createStore(config);
-  await store.initialize();
-  const bot = new BscTokenListenerBot(
-    config,
-    clients,
-    contracts,
-    wbnb,
-    store,
-    logger,
-  );
-  const httpHealthMonitor = new RpcHealthMonitor(clients.publicClient, logger, 'http');
-  const websocketHealthMonitor = new RpcHealthMonitor(
-    clients.subscriptionClient,
-    logger,
-    'websocket',
-  );
-  httpHealthMonitor.start();
-  websocketHealthMonitor.start();
-  await bot.start();
+  if (config.autoMigrate) await migrate();
 
-  let stopping = false;
-  const shutdown = async (signal: string): Promise<void> => {
-    if (stopping) {
-      return;
-    }
-    stopping = true;
-    logger.info('Arrêt demandé.', { signal });
-    httpHealthMonitor.stop();
-    websocketHealthMonitor.stop();
-    await bot.stop();
+  const sessions = new SessionRepository();
+  const events = new SwapEventRepository();
+  const trades = new TradeRepository();
+  const reports = new RiskReportRepository();
+  const discovered = new DiscoveredTokenRepository();
+  const checkpoints = new CheckpointRepository();
+  const metadataService = new TokenMetadataService(publicClient);
+  const risk = new TokenRiskService(publicClient);
+  const executor = new TradeExecutor(trades);
+  const engine = new SessionEngine(sessions, reports, risk, executor);
+  const monitors = new Map<string, SwapListener>();
+
+  const removeMonitor = (pair: Address): void => {
+    monitors.delete(pair.toLowerCase());
   };
 
-  process.once('SIGINT', () => {
-    void shutdown('SIGINT').finally(() => process.exit(0));
-  });
-  process.once('SIGTERM', () => {
-    void shutdown('SIGTERM').finally(() => process.exit(0));
-  });
+  const startMonitor = async (session: TokenSession): Promise<void> => {
+    const key = session.pair.pair.toLowerCase();
+    if (monitors.has(key)) return;
+    if (monitors.size >= config.maxActivePairMonitors) {
+      logger.warn(
+        { pair: session.pair.pair, max: config.maxActivePairMonitors },
+        'Moniteur ignoré: capacité maximale atteinte.',
+      );
+      return;
+    }
+    const listener = new SwapListener(
+      session,
+      checkpoints,
+      events,
+      engine,
+      removeMonitor,
+    );
+    monitors.set(key, listener);
+    try {
+      await listener.start();
+    } catch (error) {
+      monitors.delete(key);
+      throw error;
+    }
+  };
+
+  const onPair = async (pair: PairInfo): Promise<void> => {
+    const key = pair.pair.toLowerCase();
+    if (monitors.has(key)) return;
+
+    await discovered.upsert({ pair, source: 'PAIR_CREATED' });
+    let metadata;
+    try {
+      metadata = await metadataService.read(pair.token);
+    } catch (error) {
+      logger.warn(
+        { pair: pair.pair, token: pair.token, reason: errorMessage(error) },
+        'Nouvelle paire ignorée: contrat non compatible BEP-20 minimal.',
+      );
+      return;
+    }
+    await discovered.upsert({ pair, metadata, source: 'PAIR_CREATED' });
+
+    const now = Date.now();
+    const session: TokenSession = {
+      pair,
+      metadata,
+      status: 'WAITING_FIRST_BUY',
+      subsequentBuyCount: 0,
+      targetBuysAfterEntry: config.targetBuysAfterEntry,
+      countedBuyTransactionHashes: [],
+      sellAttempts: 0,
+      createdAtMs: now,
+      updatedAtMs: now,
+    };
+    await sessions.save(session);
+    logger.info(
+      {
+        pair: pair.pair,
+        token: pair.token,
+        name: metadata.name,
+        symbol: metadata.symbol,
+        blockNumber: pair.createdBlock.toString(),
+        transactionHash: pair.createdTransactionHash,
+      },
+      'Nouvelle paire Token/WBNB enregistrée.',
+    );
+    await startMonitor(session);
+  };
+
+  const restored = await sessions.loadActive();
+  for (const session of restored) {
+    await startMonitor(session);
+  }
+
+  const pairListener = new PairCreatedListener(checkpoints, onPair);
+  await pairListener.start();
+
+  logger.info(
+    {
+      network: config.network,
+      executionMode: config.executionMode,
+      riskPolicy: config.riskPolicy,
+      factory: config.factory,
+      router: config.router,
+      wbnb: config.wbnb,
+      activePairMonitors: monitors.size,
+      targetBuysAfterEntry: config.targetBuysAfterEntry,
+    },
+    config.executionMode === 'dry-run'
+      ? 'Bot démarré en dry-run: aucune transaction ne sera envoyée.'
+      : 'Bot démarré en mode live.',
+  );
+
+  let shuttingDown = false;
+  const shutdown = async (signal: string): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logger.info({ signal }, 'Arrêt du bot.');
+    pairListener.stop();
+    for (const listener of monitors.values()) listener.stop();
+    await closeDatabase();
+  };
+
+  process.once('SIGINT', () => void shutdown('SIGINT'));
+  process.once('SIGTERM', () => void shutdown('SIGTERM'));
 }
 
 main().catch((error: unknown) => {
-  console.error(
-    JSON.stringify({
-      timestamp: new Date().toISOString(),
-      level: 'error',
-      message: 'Arrêt fatal du bot.',
-      error: error instanceof Error
-        ? {
-            message: redactSensitiveText(error.message),
-            stack: error.stack === undefined ? undefined : redactSensitiveText(error.stack),
-          }
-        : redactSensitiveText(String(error)),
-    }),
-  );
+  logger.fatal({ error: errorMessage(error) }, 'Démarrage impossible.');
   process.exitCode = 1;
 });

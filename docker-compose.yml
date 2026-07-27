@@ -6,26 +6,14 @@ services:
       POSTGRES_USER: bscbot
       POSTGRES_PASSWORD: bscbot
     ports:
-      - "5439:5432"
+      - "5432:5432"
     volumes:
       - bscbot_postgres:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U bscbot -d bscbot"]
       interval: 5s
-      timeout: 3s
+      timeout: 5s
       retries: 10
-
-  bot:
-    build: .
-    env_file: .env
-    environment:
-      STORAGE_DRIVER: postgres
-      DATABASE_URL: postgresql://bscbot:bscbot@postgres:5439/bscbot
-    depends_on:
-      postgres:
-        condition: service_healthy
-    restart: unless-stopped
-    profiles: ["bot"]
 
 volumes:
   bscbot_postgres:
