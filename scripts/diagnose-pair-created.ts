@@ -84,11 +84,15 @@ for (let cursor = fromBlock; cursor <= toBlock; cursor += chunkSize) {
   }
 }
 
+const decodedPairCreated = totalPairCreated - incompleteLogs;
+const nonWbnbPairs = decodedPairCreated - directWbnbPairs;
 const diagnosis = totalPairCreated === 0
   ? 'Aucun PairCreated retourné: vérifier le provider RPC ou confirmer l’absence réelle d’événement avec un second provider.'
-  : directWbnbPairs === 0
-    ? 'Des paires V2 ont été créées, mais aucune paire directe Token/WBNB: les tables vides sont cohérentes avec le filtre actuel.'
-    : 'Des paires Token/WBNB existent dans la plage: si les tables sont vides, le traitement après PairCreated doit être corrigé.';
+  : incompleteLogs === totalPairCreated
+    ? 'Tous les événements PairCreated sont incomplets: le décodage ABI est défectueux; ne pas conclure sur le filtre WBNB.'
+    : directWbnbPairs === 0
+      ? 'Des paires V2 ont été décodées, mais aucune paire directe Token/WBNB dans cette plage.'
+      : 'Des paires Token/WBNB existent dans la plage: si les tables sont vides, le traitement après PairCreated doit être corrigé.';
 
 console.log(JSON.stringify({
   network: config.network,
@@ -99,8 +103,9 @@ console.log(JSON.stringify({
   toBlock: toBlock.toString(),
   scannedBlocks: (toBlock - fromBlock + 1n).toString(),
   totalPairCreated,
+  decodedPairCreated,
   directWbnbPairs,
-  nonWbnbPairs: totalPairCreated - directWbnbPairs,
+  nonWbnbPairs,
   incompleteLogs,
   diagnosis,
   samples,
