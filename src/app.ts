@@ -80,20 +80,27 @@ async function main(): Promise<void> {
   const executor = new TradeExecutor(trades);
   const engine = new SessionEngine(sessions, reports, risk, executor);
   const monitors = new Map<string, SwapListener>();
+  const activeSessionsByToken = new Map<string, TokenSession>();
+  const activeTokenByPair = new Map<string, string>();
 
   const removeMonitor = (pair: Address): void => {
-    monitors.delete(pair.toLowerCase());
+    const pairKey = pair.toLowerCase();
+    const tokenKey = activeTokenByPair.get(pairKey);
+    monitors.delete(pairKey);
+    activeTokenByPair.delete(pairKey);
+    if (tokenKey) activeSessionsByToken.delete(tokenKey);
   };
 
   const stopMonitor = (pair: Address): void => {
     const key = pair.toLowerCase();
     monitors.get(key)?.stop();
-    monitors.delete(key);
+    removeMonitor(pair);
   };
 
   const dashboardActions = new DashboardActionService(
     ignoredAssets,
     engine,
+    (token) => activeSessionsByToken.get(token.toLowerCase()) ?? null,
     stopMonitor,
   );
   const dashboard = config.dashboardEnabled
@@ -106,6 +113,7 @@ async function main(): Promise<void> {
 
   const startMonitor = async (session: TokenSession): Promise<void> => {
     const key = session.pair.pair.toLowerCase();
+    const tokenKey = session.pair.token.toLowerCase();
     if (monitors.has(key)) return;
     if (monitors.size >= config.maxActivePairMonitors) {
       logger.warn(
@@ -122,10 +130,12 @@ async function main(): Promise<void> {
       removeMonitor,
     );
     monitors.set(key, listener);
+    activeSessionsByToken.set(tokenKey, session);
+    activeTokenByPair.set(key, tokenKey);
     try {
       await listener.start();
     } catch (error) {
-      monitors.delete(key);
+      removeMonitor(session.pair.pair);
       throw error;
     }
   };
