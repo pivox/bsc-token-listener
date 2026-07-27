@@ -5,6 +5,7 @@ import {
   encodeAbiParameters,
   encodeEventTopics,
   type Address,
+  type Hex,
 } from 'viem';
 import { pancakeFactoryAbi } from '../src/abi/pancake-factory.abi.js';
 
@@ -17,7 +18,7 @@ test('décode PairCreated avec des arguments nommés', () => {
     abi: pancakeFactoryAbi,
     eventName: 'PairCreated',
     args: { token0, token1 },
-  });
+  }) as [Hex, ...Hex[]];
   const data = encodeAbiParameters(
     [
       { name: 'pair', type: 'address' },
