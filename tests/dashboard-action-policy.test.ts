@@ -5,7 +5,7 @@ import { canIgnoreAsset, canManuallySell } from '../src/dashboard/action-policy.
 import type { TokenSession } from '../src/types/domain.js';
 
 function session(status: TokenSession['status'], withEntry = false): TokenSession {
-  return {
+  const value: TokenSession = {
     pair: {
       factory: '0x0000000000000000000000000000000000000001' as Address,
       router: '0x0000000000000000000000000000000000000002' as Address,
@@ -28,15 +28,6 @@ function session(status: TokenSession['status'], withEntry = false): TokenSessio
       codeSizeBytes: 1,
     },
     status,
-    entry: withEntry
-      ? {
-        mode: 'dry-run',
-        amountInWei: 1n,
-        amountOutToken: 10n,
-        confirmedAtMs: 2,
-        cursor: { blockNumber: 2n, transactionIndex: 0, logIndex: 0 },
-      }
-      : undefined,
     subsequentBuyCount: 0,
     targetBuysAfterEntry: 10,
     countedBuyTransactionHashes: [],
@@ -44,6 +35,16 @@ function session(status: TokenSession['status'], withEntry = false): TokenSessio
     createdAtMs: 1,
     updatedAtMs: 1,
   };
+  if (withEntry) {
+    value.entry = {
+      mode: 'dry-run',
+      amountInWei: 1n,
+      amountOutToken: 10n,
+      confirmedAtMs: 2,
+      cursor: { blockNumber: 2n, transactionIndex: 0, logIndex: 0 },
+    };
+  }
+  return value;
 }
 
 test('autorise la vente manuelle uniquement pour une position ouverte', () => {
