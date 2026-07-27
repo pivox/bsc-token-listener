@@ -5,7 +5,21 @@ export interface RiskEvaluation {
   verdict: RiskVerdict;
 }
 
-export function evaluateRisk(checks: RiskCheck[], minimumScore: number): RiskEvaluation {
+export interface RiskEvaluationSettings {
+  allowUnknownReviews: boolean;
+  allowUnknownMinScore: number;
+}
+
+const STRICT_SETTINGS: RiskEvaluationSettings = {
+  allowUnknownReviews: false,
+  allowUnknownMinScore: 100,
+};
+
+export function evaluateRisk(
+  checks: RiskCheck[],
+  minimumScore: number,
+  settings: RiskEvaluationSettings = STRICT_SETTINGS,
+): RiskEvaluation {
   const score = Math.max(
     0,
     Math.min(100, 100 - checks.reduce((sum, check) => sum + check.penalty, 0)),
@@ -16,10 +30,14 @@ export function evaluateRisk(checks: RiskCheck[], minimumScore: number): RiskEva
   );
   if (criticalFailure || score < 40) return { score, verdict: 'BLOCK' };
 
-  const uncertain = checks.some(
-    (check) => check.status === 'WARN' || check.status === 'UNKNOWN',
-  );
-  if (uncertain || score < minimumScore) return { score, verdict: 'REVIEW' };
+  const warning = checks.some((check) => check.status === 'WARN');
+  if (warning) return { score, verdict: 'REVIEW' };
 
+  const unknown = checks.some((check) => check.status === 'UNKNOWN');
+  if (unknown && (!settings.allowUnknownReviews || score < settings.allowUnknownMinScore)) {
+    return { score, verdict: 'REVIEW' };
+  }
+
+  if (score < minimumScore) return { score, verdict: 'REVIEW' };
   return { score, verdict: 'ALLOW' };
 }
