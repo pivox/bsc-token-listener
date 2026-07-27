@@ -236,7 +236,7 @@ export class SessionEngine {
     try {
       session.exit = await this.executor.sell(session);
       session.status = 'CLOSED';
-      session.rejectionReason = undefined;
+      delete session.rejectionReason;
       session.updatedAtMs = Date.now();
       await this.sessions.save(session);
       logger.info(
