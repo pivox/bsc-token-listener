@@ -17,6 +17,7 @@ export class DashboardActionService {
   constructor(
     private readonly ignoredAssets: IgnoredAssetRepository,
     private readonly engine: SessionEngine,
+    private readonly findActiveSession: (token: Address) => TokenSession | null,
     private readonly stopMonitor: (pair: Address) => void,
   ) {}
 
@@ -76,6 +77,9 @@ export class DashboardActionService {
   }
 
   private async findSession(token: Address): Promise<TokenSession | null> {
+    const active = this.findActiveSession(token);
+    if (active) return active;
+
     const result = await pool.query<{ payload: unknown }>(
       `SELECT payload
        FROM token_sessions
