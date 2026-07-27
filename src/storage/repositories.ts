@@ -46,6 +46,14 @@ export class SessionRepository {
     );
     return Number(result.rows[0]?.count ?? '0');
   }
+
+  async countActive(): Promise<number> {
+    const result = await pool.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM token_sessions
+       WHERE status IN ('WAITING_FIRST_BUY', 'RISK_CHECKING', 'BUY_PENDING', 'HOLDING', 'SELL_PENDING', 'MANUAL_REVIEW')`,
+    );
+    return Number(result.rows[0]?.count ?? '0');
+  }
 }
 
 export class SwapEventRepository {

@@ -103,7 +103,10 @@ export function renderDashboardPage(nonce: string, refreshSeconds: number): stri
 
     <div class="error-banner" id="error-banner" role="alert"></div>
 
-    <section class="cards" aria-label="Synthèse">
+  <section class="cards" aria-label="Synthèse">
+      <article class="card"><div class="card-label">Dernier bloc BSC</div><div class="card-value" id="heartbeat-latest-block">—</div><div class="card-note" id="heartbeat-pair-created">Checkpoint pair-created: —</div></article>
+      <article class="card"><div class="card-label">Moniteurs / Sessions</div><div class="card-value" id="heartbeat-swap-monitors">—</div><div class="card-note" id="heartbeat-active-sessions">Sessions actives: —</div></article>
+      <article class="card"><div class="card-label">Etat RPC</div><div class="card-value" id="heartbeat-http-status">—</div><div class="card-note" id="heartbeat-ws-status">WS : —</div></article>
       <article class="card"><div class="card-label">Solde wallet</div><div class="card-value" id="wallet-balance">—</div><div class="card-note" id="wallet-address">Wallet non configuré</div></article>
       <article class="card"><div class="card-label">Positions ouvertes</div><div class="card-value" id="open-positions">—</div><div class="card-note" id="detected-count">— tokens détectés</div></article>
       <article class="card"><div class="card-label">PnL latent estimé</div><div class="card-value" id="unrealized-pnl">—</div><div class="card-note" id="valuation-note">Cotation PancakeSwap V2</div></article>
@@ -201,6 +204,23 @@ export function renderDashboardPage(nonce: string, refreshSeconds: number): stri
       byId('valuation-note').textContent = snapshot.summary.valuationComplete ? 'Toutes les positions cotées' : 'Valorisation partielle ou indisponible';
       byId('realized-pnl').innerHTML = pnlHtml(snapshot.summary.realizedPnlBnb, null);
       byId('closed-count').textContent = String(snapshot.summary.closedPositions) + ' positions clôturées';
+      byId('heartbeat-latest-block').textContent = snapshot.heartbeat && snapshot.heartbeat.latestBlock
+        ? snapshot.heartbeat.latestBlock
+        : '—';
+      byId('heartbeat-pair-created').textContent = 'Checkpoint pair-created: '
+        + (snapshot.heartbeat && snapshot.heartbeat.pairCreatedCheckpoint
+          ? snapshot.heartbeat.pairCreatedCheckpoint
+          : '—');
+      byId('heartbeat-swap-monitors').textContent = String(snapshot.heartbeat ? snapshot.heartbeat.activeSwapMonitors : 0);
+      byId('heartbeat-active-sessions').textContent = 'Sessions actives: '
+        + String(snapshot.heartbeat ? snapshot.heartbeat.activeSessions : 0);
+      byId('heartbeat-http-status').textContent = snapshot.heartbeat
+        ? (snapshot.heartbeat.http.status === 'up' ? 'HTTP: OK' : 'HTTP: KO')
+        : 'HTTP: —';
+      byId('heartbeat-ws-status').textContent = snapshot.heartbeat
+        ? (snapshot.heartbeat.webSocket.status === 'up' ? 'WS: OK' : 'WS: KO')
+        : 'WS: —';
+      byId('bot-status').title = snapshot.heartbeat ? snapshot.heartbeat.generatedAt : '';
       byId('fee-note').textContent = snapshot.feeNote + ' Le dashboard est strictement en lecture seule.';
       byId('sync-label').textContent = 'Actualisé le ' + formatDate(snapshot.generatedAt);
     }
