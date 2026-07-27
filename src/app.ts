@@ -2,6 +2,11 @@ import type { Address } from 'viem';
 import { pancakeRouterAbi } from './abi/pancake-router.abi.js';
 import { chain } from './config/chain.js';
 import { config } from './config/env.js';
+import {
+  DashboardRepository,
+  DashboardServer,
+  DashboardService,
+} from './dashboard/dashboard.js';
 import { TokenMetadataService } from './discovery/token-metadata.service.js';
 import { TradeExecutor } from './execution/trade-executor.js';
 import { PairCreatedListener } from './listeners/pair-created.listener.js';
@@ -60,6 +65,9 @@ async function main(): Promise<void> {
   const executor = new TradeExecutor(trades);
   const engine = new SessionEngine(sessions, reports, risk, executor);
   const monitors = new Map<string, SwapListener>();
+  const dashboard = config.dashboardEnabled
+    ? new DashboardServer(new DashboardService(new DashboardRepository()))
+    : null;
 
   const removeMonitor = (pair: Address): void => {
     monitors.delete(pair.toLowerCase());
@@ -143,6 +151,17 @@ async function main(): Promise<void> {
   const pairListener = new PairCreatedListener(checkpoints, onPair);
   await pairListener.start();
 
+  if (dashboard) {
+    try {
+      await dashboard.start();
+    } catch (error) {
+      logger.error(
+        { reason: errorMessage(error), host: config.dashboardHost, port: config.dashboardPort },
+        'Dashboard non démarré; le bot continue sans interface.',
+      );
+    }
+  }
+
   logger.info(
     {
       network: config.network,
@@ -153,6 +172,10 @@ async function main(): Promise<void> {
       wbnb: config.wbnb,
       activePairMonitors: monitors.size,
       targetBuysAfterEntry: config.targetBuysAfterEntry,
+      dashboardEnabled: config.dashboardEnabled,
+      dashboardUrl: config.dashboardEnabled
+        ? `http://${config.dashboardHost}:${config.dashboardPort}/dashboard`
+        : null,
     },
     config.executionMode === 'dry-run'
       ? 'Bot démarré en dry-run: aucune transaction ne sera envoyée.'
@@ -166,6 +189,11 @@ async function main(): Promise<void> {
     logger.info({ signal }, 'Arrêt du bot.');
     pairListener.stop();
     for (const listener of monitors.values()) listener.stop();
+    try {
+      await dashboard?.stop();
+    } catch (error) {
+      logger.warn({ reason: errorMessage(error) }, 'Arrêt du dashboard incomplet.');
+    }
     await closeDatabase();
   };
 
