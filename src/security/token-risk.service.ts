@@ -16,6 +16,7 @@ import type { PairInfo, TokenMetadata } from '../types/domain.js';
 import { errorMessage } from '../utils/error.js';
 import { scanSensitiveSelectors } from './bytecode-scanner.js';
 import { evaluateRisk } from './risk-evaluator.js';
+import { RiskSettingsStore } from './risk-settings.store.js';
 import type { RiskCheck, TokenRiskReport } from './token-risk.types.js';
 
 const EIP1967_IMPLEMENTATION_SLOT =
@@ -46,7 +47,10 @@ function storageAddress(storage: Hex | undefined): Address | null {
 }
 
 export class TokenRiskService {
-  constructor(private readonly client: PublicClient) {}
+  constructor(
+    private readonly client: PublicClient,
+    private readonly riskSettings: RiskSettingsStore,
+  ) {}
 
   async analyze(input: {
     pair: PairInfo;
@@ -233,7 +237,8 @@ export class TokenRiskService {
       });
     }
 
-    const evaluation = evaluateRisk(checks, config.riskMinScore);
+    const runtimeSettings = await this.riskSettings.get();
+    const evaluation = evaluateRisk(checks, config.riskMinScore, runtimeSettings);
     return {
       id: randomUUID(),
       token: input.pair.token,
