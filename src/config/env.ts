@@ -111,6 +111,11 @@ export const config = {
   wsRpcUrl: read('BSC_WS_RPC_URL', firstUrl('BSC_WSS_URLS')),
   databaseUrl: read('DATABASE_URL'),
   autoMigrate: readBoolean('POSTGRES_AUTO_MIGRATE', true),
+  dashboardEnabled: readBoolean('DASHBOARD_ENABLED', true),
+  dashboardHost: read('DASHBOARD_HOST', '127.0.0.1'),
+  dashboardPort: readInteger('DASHBOARD_PORT', 3000, 1, 65_535),
+  dashboardRefreshSeconds: readInteger('DASHBOARD_REFRESH_SECONDS', 5, 2, 300),
+  dashboardMaxRows: readInteger('DASHBOARD_MAX_ROWS', 250, 25, 5_000),
   factory: readAddress(
     'PANCAKE_FACTORY_ADDRESS',
     network === 'mainnet' ? '0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73' : undefined,
