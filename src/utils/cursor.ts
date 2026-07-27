@@ -5,10 +5,11 @@ export function compareCursor(left: ChainCursor, right: ChainCursor): number {
     return left.blockNumber < right.blockNumber ? -1 : 1;
   }
   if (left.transactionIndex !== right.transactionIndex) {
-    return left.transactionIndex < right.transactionIndex ? -1 : 1;
+    return left.transactionIndex - right.transactionIndex;
   }
-  if (left.logIndex !== right.logIndex) {
-    return left.logIndex < right.logIndex ? -1 : 1;
-  }
-  return 0;
+  return left.logIndex - right.logIndex;
+}
+
+export function cursorAfter(left: ChainCursor, right: ChainCursor): boolean {
+  return compareCursor(left, right) > 0;
 }

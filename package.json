@@ -1,31 +1,32 @@
 {
   "name": "bsc-token-listener-bot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "BSC/PancakeSwap V2 listener: enter after the first confirmed buy and exit after N subsequent unique buys.",
   "type": "module",
-  "engines": {
-    "node": ">=22.0.0"
-  },
   "scripts": {
     "dev": "tsx watch src/app.ts",
     "start": "node dist/src/app.js",
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "check": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --test tests/*.test.ts",
-    "check": "npm run typecheck && npm test",
     "rpc:check": "tsx scripts/check-rpc.ts",
     "db:migrate": "tsx scripts/migrate.ts",
-    "contract:build": "forge build"
+    "deploy:probe": "tsx scripts/deploy-safety-probe.ts"
   },
   "dependencies": {
-    "pg": "8.22.0",
-    "viem": "2.55.8"
+    "dotenv": "^17.4.2",
+    "pg": "^8.22.0",
+    "pino": "^10.3.1",
+    "viem": "^2.55.8"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "@types/pg": "8.20.0",
-    "tsx": "4.23.1",
-    "typescript": "7.0.2"
+    "@types/node": "^24.0.0",
+    "@types/pg": "^8.15.0",
+    "solc": "^0.8.36",
+    "tsx": "^4.23.1",
+    "typescript": "^5.8.0"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }

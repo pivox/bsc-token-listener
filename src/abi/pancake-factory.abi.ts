@@ -1,6 +1,13 @@
-import { parseAbi } from 'viem';
-
-export const pancakeFactoryAbi = parseAbi([
-  'event PairCreated(address indexed token0, address indexed token1, address pair, uint256 allPairsLength)',
-  'function getPair(address tokenA, address tokenB) view returns (address pair)',
-]);
+export const pancakeFactoryAbi = [
+  {
+    type: 'event',
+    name: 'PairCreated',
+    anonymous: false,
+    inputs: [
+      { indexed: true, name: 'token0', type: 'address' },
+      { indexed: true, name: 'token1', type: 'address' },
+      { indexed: false, name: 'pair', type: 'address' },
+      { indexed: false, name: '', type: 'uint256' },
+    ],
+  },
+] as const;

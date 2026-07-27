@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.24;
+pragma solidity ^0.8.20;
 
 interface IERC20Probe {
     function balanceOf(address account) external view returns (uint256);
@@ -7,7 +7,12 @@ interface IERC20Probe {
 }
 
 interface IPancakeRouterProbe {
-    function WETH() external view returns (address);
+    function WETH() external pure returns (address);
+
+    function getAmountsOut(
+        uint256 amountIn,
+        address[] calldata path
+    ) external view returns (uint256[] memory amounts);
 
     function swapExactETHForTokensSupportingFeeOnTransferTokens(
         uint256 amountOutMin,
@@ -25,73 +30,64 @@ interface IPancakeRouterProbe {
     ) external;
 }
 
-/// @notice Simule un aller-retour BNB -> token -> BNB.
-/// @dev La fonction termine TOUJOURS par un revert ProbeResult. Une transaction réelle
-///      ne peut donc pas laisser de fonds ou d'approbations dans ce contrat; seul le gas serait perdu.
+/// @notice Destiné à être appelé avec eth_call pour simuler un aller-retour.
+/// Une transaction réelle rembourse le BNB récupéré à l'appelant, mais elle ne doit pas être utilisée par le bot.
 contract SafetyProbe {
-    error InvalidInput();
     error BuyReturnedZeroToken();
-    error ApproveFailed();
-    error ProbeResult(uint256 tokensBought, uint256 bnbRecovered);
+    error NativeRefundFailed();
 
     receive() external payable {}
 
-    function probe(address routerAddress, address token, uint256 deadline) external payable {
-        if (routerAddress == address(0) || token == address(0) || msg.value == 0) {
-            revert InvalidInput();
-        }
-
+    function probe(
+        address routerAddress,
+        address token,
+        uint256 deadline
+    ) external payable returns (
+        uint256 quotedTokens,
+        uint256 receivedTokens,
+        uint256 quotedNative,
+        uint256 recoveredNative
+    ) {
+        require(msg.value > 0, "ZERO_VALUE");
         IPancakeRouterProbe router = IPancakeRouterProbe(routerAddress);
-        address wrappedBnb = router.WETH();
+        IERC20Probe erc20 = IERC20Probe(token);
 
         address[] memory buyPath = new address[](2);
-        buyPath[0] = wrappedBnb;
+        buyPath[0] = router.WETH();
         buyPath[1] = token;
+        quotedTokens = router.getAmountsOut(msg.value, buyPath)[1];
 
-        uint256 tokenBefore = IERC20Probe(token).balanceOf(address(this));
+        uint256 tokenBefore = erc20.balanceOf(address(this));
         router.swapExactETHForTokensSupportingFeeOnTransferTokens{value: msg.value}(
             0,
             buyPath,
             address(this),
             deadline
         );
-        uint256 tokensBought = IERC20Probe(token).balanceOf(address(this)) - tokenBefore;
-        if (tokensBought == 0) {
-            revert BuyReturnedZeroToken();
-        }
+        receivedTokens = erc20.balanceOf(address(this)) - tokenBefore;
+        if (receivedTokens == 0) revert BuyReturnedZeroToken();
 
-        _forceApprove(token, routerAddress, tokensBought);
+        erc20.approve(routerAddress, 0);
+        erc20.approve(routerAddress, receivedTokens);
 
         address[] memory sellPath = new address[](2);
         sellPath[0] = token;
-        sellPath[1] = wrappedBnb;
+        sellPath[1] = router.WETH();
+        quotedNative = router.getAmountsOut(receivedTokens, sellPath)[1];
 
-        uint256 bnbBefore = address(this).balance;
+        uint256 nativeBefore = address(this).balance;
         router.swapExactTokensForETHSupportingFeeOnTransferTokens(
-            tokensBought,
+            receivedTokens,
             0,
             sellPath,
             address(this),
             deadline
         );
-        uint256 bnbRecovered = address(this).balance - bnbBefore;
+        recoveredNative = address(this).balance - nativeBefore;
 
-        revert ProbeResult(tokensBought, bnbRecovered);
-    }
-
-    function _forceApprove(address token, address spender, uint256 amount) private {
-        if (_callApprove(token, spender, amount)) {
-            return;
+        if (address(this).balance > 0) {
+            (bool sent, ) = payable(msg.sender).call{value: address(this).balance}("");
+            if (!sent) revert NativeRefundFailed();
         }
-        if (!_callApprove(token, spender, 0) || !_callApprove(token, spender, amount)) {
-            revert ApproveFailed();
-        }
-    }
-
-    function _callApprove(address token, address spender, uint256 amount) private returns (bool) {
-        (bool success, bytes memory data) = token.call(
-            abi.encodeCall(IERC20Probe.approve, (spender, amount))
-        );
-        return success && (data.length == 0 || abi.decode(data, (bool)));
     }
 }

@@ -1,236 +1,116 @@
-# BSC Token Listener Bot
+# BSC Token Listener — TokenRiskReport
 
-V1 TypeScript/viem pour BNB Smart Chain et PancakeSwap V2.
+Bot TypeScript/viem qui :
 
-Le bot :
+1. écoute les nouvelles paires PancakeSwap V2 `Token/WBNB` ;
+2. ouvre une écoute `Swap` séparée par paire ;
+3. attend le premier achat ;
+4. calcule et persiste un `TokenRiskReport` ;
+5. autorise ou bloque l’entrée selon la politique ;
+6. compte les achats suivants ;
+7. vend après le nombre cible d’achats.
 
-1. écoute `PairCreated` sur la factory PancakeSwap V2 ;
-2. conserve uniquement les nouvelles paires contenant WBNB ;
-3. ouvre une session et une écoute `Swap` dédiées à chaque paire ;
-4. attend le premier achat confirmé ;
-5. exécute les contrôles BEP-20, liquidité et achat/revente simulé ;
-6. achète en mode `live`, ou simule l’entrée en `dry-run` ;
-7. compte les transactions d’achat uniques strictement postérieures à notre entrée ;
-8. vend après le nombre configuré, `10` par défaut.
+Le mode par défaut est **`dry-run`**. Aucun argent réel n’est envoyé.
 
-> Le mode par défaut est `dry-run`. Aucun ordre réel n’est envoyé tant que `EXECUTION_MODE=live` n’est pas configuré.
+## Ce que vérifie TokenRiskReport V1
 
-## Périmètre exact de cette V1
+- présence du bytecode ;
+- interface BEP-20 minimale ;
+- réserve WBNB minimale ;
+- propriétaire actif via `owner()` ;
+- proxy EIP-1967 ou minimal proxy EIP-1167 ;
+- sélecteurs de fonctions sensibles : mint, blacklist, taxes, limites, pause, upgrade ;
+- proportion de LP envoyée aux adresses de burn ;
+- simulation complète achat puis revente avec `SafetyProbe` ;
+- estimation de la taxe d’achat, taxe de vente et perte aller-retour.
 
-- BSC mainnet ou testnet.
-- PancakeSwap **V2** seulement.
-- Paires directes `Token/WBNB` seulement.
-- Détection basée sur les logs confirmés, pas sur le mempool.
-- WebSocket pour la faible latence, avec rattrapage HTTP périodique et déduplication.
-- Au démarrage frais, seules les paires créées dans le bloc courant ou après sont éligibles : aucun achat tardif sur un historique ancien.
-- Un « achat » correspond à un événement `Swap` où WBNB entre dans la paire et le token en sort.
-- Les 10 achats sont 10 **hashes de transaction uniques**, pas 10 événements issus d’une même transaction multi-route.
-- Le premier achat déclencheur et notre propre achat ne sont pas comptés.
+Ces contrôles réduisent le risque mais ne garantissent jamais qu’un token restera revendable. Un propriétaire peut modifier le comportement après le rapport, retirer la liquidité ou utiliser une logique non reconnue.
 
-La détection optionnelle des déploiements directs (`to = null`) journalise les contrats BEP-20 probables. Elle ne détecte pas toutes les créations internes via `CREATE`/`CREATE2`.
+## Politique de décision
+
+```env
+RISK_POLICY=allow-only
+```
+
+- `allow-only` : seuls les rapports `ALLOW` peuvent acheter ;
+- `block-only` : les rapports `REVIEW` sont acceptés, seuls les `BLOCK` sont refusés.
+
+Le mode live impose automatiquement `allow-only`.
 
 ## Installation
-
-Prérequis : Node.js 22+, npm et un provider RPC BSC avec HTTP + WebSocket.
 
 ```bash
 cp .env.example .env
 npm install
-npm run check
-npm run rpc:check
-npm run dev
-```
-
-Renseigner au minimum dans `.env` :
-
-```dotenv
-BSC_HTTP_URLS=https://votre-endpoint-http
-BSC_WSS_URLS=wss://votre-endpoint-websocket
-EXECUTION_MODE=dry-run
-```
-
-Les listes RPC acceptent plusieurs URLs séparées par des virgules. viem utilise un transport de secours en cas d’échec. Le bot force les souscriptions WebSocket et relit périodiquement les blocs par HTTP pour récupérer un éventuel trou de connexion. Les logs reçus pendant la synchronisation initiale sont tamponnés puis traités dans l’ordre `(bloc, transaction, log)`.
-
-## PostgreSQL
-
-Le stockage mémoire suffit pour observer le fonctionnement, mais il ne survit pas à un redémarrage.
-
-```bash
-docker compose up -d postgres
-```
-
-Puis :
-
-```dotenv
-STORAGE_DRIVER=postgres
-DATABASE_URL=postgresql://bscbot:bscbot@127.0.0.1:5439/bscbot
-POSTGRES_AUTO_MIGRATE=true
-```
-
-Lancer :
-
-```bash
+docker compose up -d
 npm run db:migrate
+npm run rpc:check
+npm run check
+npm test
 npm run dev
 ```
 
-Les tables enregistrent les sessions, swaps dédupliqués, trades et déploiements directs détectés.
+## SafetyProbe
 
-## Sonde de sécurité achat/revente
+Le probe doit être déployé une fois. Commencer sur testnet :
 
-`contracts/SafetyProbe.sol` effectue, dans un appel simulé :
-
-```text
-BNB -> token -> approve -> token -> BNB
+```env
+BSC_NETWORK=testnet
+BSC_HTTP_RPC_URL=https://...
+PRIVATE_KEY=0x...
+CONFIRM_PROBE_DEPLOYMENT=I_UNDERSTAND_TESTNET
 ```
-
-La fonction termine toujours par l’erreur Solidity `ProbeResult`. C’est volontaire :
-
-- `eth_call` récupère le résultat sans modifier la chaîne ;
-- une transaction réelle envoyée par erreur est entièrement annulée, hors frais de gas.
-
-Compilation :
 
 ```bash
-forge build
+npm run deploy:probe
 ```
 
-Déploiement exemple :
+Reporter ensuite les deux valeurs affichées :
 
-```bash
-forge create contracts/SafetyProbe.sol:SafetyProbe \
-  --rpc-url "https://votre-endpoint-http" \
-  --private-key "$DEPLOYER_PRIVATE_KEY" \
-  --broadcast
-```
-
-Reporter ensuite l’adresse :
-
-```dotenv
+```env
 SAFETY_PROBE_ADDRESS=0x...
-REQUIRE_SAFETY_PROBE=true
-MAX_ROUND_TRIP_LOSS_BPS=3500
+RISK_PROBE_CALLER=0x...
+RISK_PROBE_REQUIRED=true
 ```
 
-En `dry-run`, renseigner aussi `SIMULATION_ACCOUNT` avec une adresse BSC publique disposant d’un solde suffisant pour que le nœud accepte la valeur simulée.
+`RISK_PROBE_CALLER` doit posséder au moins `RISK_PROBE_AMOUNT_BNB` sur le réseau, même pour `eth_call`, car le nœud valide le solde simulé.
 
-La sonde réduit certains risques évidents, mais ne garantit jamais la revente future. Un contrat malveillant peut reconnaître l’adresse de la sonde, modifier ses règles après l’achat, blacklister le wallet, retirer la liquidité ou changer ses taxes.
+## Tables PostgreSQL
 
-## Passage en mode live
+- `discovered_tokens` : tous les tokens trouvés via `PairCreated` ;
+- `token_sessions` : état de chaque paire suivie ;
+- `swap_events` : événements dédupliqués ;
+- `trades` : achats et ventes simulés ou réels ;
+- `token_risk_reports` : rapports complets ;
+- `listener_checkpoints` : reprise après coupure.
 
-N’activer le live qu’après une longue observation en `dry-run` :
+Exemple :
 
-```dotenv
+```sql
+SELECT token_address, pair_address, score, verdict, created_at
+FROM token_risk_reports
+ORDER BY created_at DESC;
+```
+
+## Passage en live
+
+Le live reste verrouillé tant que toutes ces conditions ne sont pas réunies :
+
+```env
 EXECUTION_MODE=live
 PRIVATE_KEY=0x...
+CONFIRM_LIVE_TRADING=I_UNDERSTAND_REAL_FUNDS
+RISK_POLICY=allow-only
 SAFETY_PROBE_ADDRESS=0x...
-STORAGE_DRIVER=postgres
-MAX_CONCURRENT_POSITIONS=1
-BUY_AMOUNT_BNB=0.001
 ```
 
-Règles de sécurité recommandées :
+Tester longuement en dry-run avant toute activation.
 
-- wallet dédié avec un faible solde ;
-- aucune seed phrase dans le projet ;
-- clé privée uniquement dans `.env`, jamais dans Git ;
-- endpoint d’envoi séparé possible via `BSC_TX_HTTP_URL` ;
-- montant très faible pendant les premiers essais ;
-- surveillance manuelle du wallet et des transactions.
+## Limites connues de la V1
 
-## Configuration principale
-
-| Variable | Rôle |
-|---|---|
-| `EXECUTION_MODE` | `dry-run` ou `live` |
-| `BUY_AMOUNT_BNB` | montant de chaque entrée |
-| `TARGET_BUYS_AFTER_ENTRY` | nombre d’achats uniques avant vente |
-| `MIN_WBNB_LIQUIDITY` | réserve WBNB minimale |
-| `BUY_SLIPPAGE_BPS` | tolérance d’achat en points de base |
-| `SELL_SLIPPAGE_BPS` | tolérance de vente en points de base |
-| `MAX_ROUND_TRIP_LOSS_BPS` | perte maximale acceptée par la sonde |
-| `PAIR_WAIT_FIRST_BUY_SECONDS` | expiration avant premier achat |
-| `MAX_ACTIVE_PAIR_MONITORS` | plafond de souscriptions dynamiques |
-| `MAX_CONCURRENT_POSITIONS` | plafond de positions ouvertes |
-| `EVENT_BACKFILL_BLOCKS` | fenêtre maximale de reprise après redémarrage |
-| `EVENT_RECONCILE_SECONDS` | fréquence du rattrapage HTTP pendant l’exécution |
-
-`100 bps = 1 %`.
-
-## Machine d’état
-
-```text
-WAITING_FIRST_BUY
-        |
-        v
-     CHECKING ------> REJECTED
-        |
-        v
-    BUY_PENDING ----> ERROR
-        |
-        v
-      HOLDING -- compte 1..10 achats uniques
-        |
-        v
-    SELL_PENDING
-       |     \
-       |      \ échec: retour HOLDING et nouvelle tentative
-       v
-      CLOSED
-```
-
-## Commandes
-
-```bash
-npm run dev          # écoute avec rechargement
-npm run build        # compilation TypeScript
-npm run typecheck    # contrôle des types
-npm test             # tests unitaires
-npm run check        # typecheck + tests
-npm run rpc:check    # vérifie chainId, router, factory et WBNB
-npm run db:migrate   # crée les tables PostgreSQL
-npm run contract:build
-```
-
-## Structure
-
-```text
-src/
-├── abi/           ABI PancakeSwap, ERC-20 et SafetyProbe
-├── config/        environnement, réseau, adresses officielles
-├── discovery/     résolution des paires Token/WBNB
-├── execution/     approve, achat, vente, nonce et reçus
-├── listeners/     PairCreated, Swap par paire, déploiements directs
-├── rpc/           clients HTTP/WSS, fallback, santé, nonce
-├── security/      BEP-20, liquidité, sonde aller-retour
-├── storage/       mémoire et PostgreSQL
-├── strategy/      machine d’état et classification des swaps
-└── types/         modèle métier
-```
-
-## Codex CLI
-
-- `AGENTS.md` contient les consignes réellement découvertes par Codex CLI.
-- `agent.md` est conservé comme alias lisible conformément à la demande.
-
-## Limites connues avant production
-
-- Une entrée basée sur un log confirmé arrivera normalement dans un bloc ultérieur au premier acheteur.
-- Les réorganisations sont signalées, mais une réconciliation automatique complète n’est pas encore implémentée.
-- Une position dont la coupure dépasse `EVENT_BACKFILL_BLOCKS` passe en `ERROR` au lieu de continuer avec un compteur incomplet.
-- Un arrêt pendant `BUY_PENDING`, ou un reçu RPC ambigu après diffusion, exige une vérification manuelle du wallet avant reprise. Le hash est persisté dès sa diffusion lorsque cela est possible.
-- Les proxies, launchpads, PancakeSwap V3/Infinity et les routes multi-hop ne sont pas couverts.
-- Le nombre de souscriptions WebSocket autorisé dépend du provider RPC.
-- Le projet ne constitue ni une garantie de profit ni une protection complète contre les honeypots/rug pulls.
-
-Voir `docs/roadmap.md` avant toute utilisation avec un capital significatif. Les contrôles réellement exécutés sur cette archive sont détaillés dans `docs/validation.md`.
-
-## Sources techniques
-
-- PancakeSwap V2 — adresses officielles : https://developer.pancakeswap.finance/contracts/v2/addresses
-- PancakeSwap Router V2 : https://github.com/pancakeswap/pancake-swap-periphery/blob/master/contracts/interfaces/IPancakeRouter02.sol
-- viem — `watchContractEvent` : https://viem.sh/docs/contract/watchContractEvent
-- viem — `simulateContract` : https://viem.sh/docs/contract/simulateContract
-- viem — WebSocket transport : https://viem.sh/docs/clients/transports/websocket
-- BNB Smart Chain : https://docs.bnbchain.org/
-- Codex CLI et `AGENTS.md` : https://developers.openai.com/codex/agent-configuration/agents-md
+- pas d’analyse de source BscScan ;
+- pas de liste complète des détenteurs ;
+- pas d’intégration aux lockers LP ;
+- détection de sélecteurs basée sur le bytecode, donc faux positifs et faux négatifs possibles ;
+- pas de surveillance continue des changements de paramètres après l’achat ;
+- pas de mempool ni d’exécution dans le même bloc.
