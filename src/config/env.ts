@@ -11,20 +11,35 @@ import type { ExecutionMode } from '../types/domain.js';
 function read(name: string, fallback?: string): string {
   const value = process.env[name]?.trim();
   if (value) return value;
-  if (fallback !== undefined) return fallback;
+  if (fallback !== undefined && fallback.length > 0) return fallback;
   throw new Error(`Variable d'environnement obligatoire manquante: ${name}`);
 }
 
-function readBoolean(name: string, fallback: boolean): boolean {
-  const value = process.env[name]?.trim().toLowerCase();
+function firstUrl(name: string): string | undefined {
+  return process.env[name]
+    ?.split(',')
+    .map((value) => value.trim())
+    .find((value) => value.length > 0);
+}
+
+function readBoolean(name: string, fallback: boolean, legacyName?: string): boolean {
+  const raw = process.env[name]?.trim() ?? (legacyName ? process.env[legacyName]?.trim() : undefined);
+  const value = raw?.toLowerCase();
   if (!value) return fallback;
   if (['1', 'true', 'yes', 'on'].includes(value)) return true;
   if (['0', 'false', 'no', 'off'].includes(value)) return false;
   throw new Error(`${name} doit être un booléen.`);
 }
 
-function readInteger(name: string, fallback: number, min: number, max: number): number {
-  const value = Number(read(name, String(fallback)));
+function readInteger(
+  name: string,
+  fallback: number,
+  min: number,
+  max: number,
+  legacyName?: string,
+): number {
+  const raw = process.env[name]?.trim() ?? (legacyName ? process.env[legacyName]?.trim() : undefined);
+  const value = Number(raw ?? String(fallback));
   if (!Number.isInteger(value) || value < min || value > max) {
     throw new Error(`${name} doit être un entier entre ${min} et ${max}.`);
   }
@@ -39,8 +54,8 @@ function readAddress(name: string, fallback?: string): Address {
   return getAddress(value.toLowerCase());
 }
 
-function readOptionalAddress(name: string): Address | undefined {
-  const value = process.env[name]?.trim();
+function readOptionalAddress(name: string, legacyName?: string): Address | undefined {
+  const value = process.env[name]?.trim() ?? (legacyName ? process.env[legacyName]?.trim() : undefined);
   if (!value) return undefined;
   if (!isAddress(value, { strict: false })) {
     throw new Error(`${name} n'est pas une adresse EVM valide.`);
@@ -75,7 +90,7 @@ if (riskPolicy !== 'allow-only' && riskPolicy !== 'block-only') {
 
 const privateKey = readPrivateKey();
 const safetyProbeAddress = readOptionalAddress('SAFETY_PROBE_ADDRESS');
-const riskProbeCaller = readOptionalAddress('RISK_PROBE_CALLER');
+const riskProbeCaller = readOptionalAddress('RISK_PROBE_CALLER', 'SIMULATION_ACCOUNT');
 
 if (executionMode === 'live') {
   if (!privateKey) throw new Error('PRIVATE_KEY est obligatoire en mode live.');
@@ -92,8 +107,8 @@ if (executionMode === 'live') {
 
 export const config = {
   network,
-  httpRpcUrl: read('BSC_HTTP_RPC_URL'),
-  wsRpcUrl: read('BSC_WS_RPC_URL'),
+  httpRpcUrl: read('BSC_HTTP_RPC_URL', firstUrl('BSC_HTTP_URLS')),
+  wsRpcUrl: read('BSC_WS_RPC_URL', firstUrl('BSC_WSS_URLS')),
   databaseUrl: read('DATABASE_URL'),
   autoMigrate: readBoolean('POSTGRES_AUTO_MIGRATE', true),
   factory: readAddress(
@@ -111,21 +126,27 @@ export const config = {
   executionMode,
   privateKey,
   buyAmountWei: parseEther(read('BUY_AMOUNT_BNB', '0.01')),
-  slippageBps: readInteger('SLIPPAGE_BPS', 1500, 0, 5000),
+  slippageBps: readInteger('SLIPPAGE_BPS', 1500, 0, 5000, 'BUY_SLIPPAGE_BPS'),
   txDeadlineSeconds: readInteger('TX_DEADLINE_SECONDS', 90, 15, 600),
   targetBuysAfterEntry: readInteger('TARGET_BUYS_AFTER_ENTRY', 10, 1, 1000),
   maxConcurrentPositions: readInteger('MAX_CONCURRENT_POSITIONS', 1, 1, 100),
   maxActivePairMonitors: readInteger('MAX_ACTIVE_PAIR_MONITORS', 50, 1, 1000),
   pairMonitorTtlMinutes: readInteger('PAIR_MONITOR_TTL_MINUTES', 90, 1, 1440),
-  reconcileSeconds: readInteger('RECONCILE_SECONDS', 15, 5, 300),
+  reconcileSeconds: readInteger('RECONCILE_SECONDS', 15, 5, 300, 'EVENT_RECONCILE_SECONDS'),
   riskPolicy,
   riskMinScore: readInteger('RISK_MIN_SCORE', 80, 0, 100),
   minWbnbLiquidityWei: parseEther(read('MIN_WBNB_LIQUIDITY', '0.25')),
-  riskProbeRequired: readBoolean('RISK_PROBE_REQUIRED', true),
+  riskProbeRequired: readBoolean('RISK_PROBE_REQUIRED', true, 'REQUIRE_SAFETY_PROBE'),
   safetyProbeAddress,
   riskProbeCaller,
   riskProbeAmountWei: parseEther(read('RISK_PROBE_AMOUNT_BNB', '0.005')),
   riskMaxBuyTaxBps: readInteger('RISK_MAX_BUY_TAX_BPS', 1500, 0, 10000),
   riskMaxSellTaxBps: readInteger('RISK_MAX_SELL_TAX_BPS', 1500, 0, 10000),
-  riskMaxRoundTripLossBps: readInteger('RISK_MAX_ROUNDTRIP_LOSS_BPS', 3000, 0, 10000),
+  riskMaxRoundTripLossBps: readInteger(
+    'RISK_MAX_ROUNDTRIP_LOSS_BPS',
+    3000,
+    0,
+    10000,
+    'MAX_ROUND_TRIP_LOSS_BPS',
+  ),
 } as const;

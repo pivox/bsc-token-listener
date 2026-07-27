@@ -13,12 +13,12 @@ import type { TokenRiskReport } from '../security/token-risk.types.js';
 export class SessionRepository {
   async save(session: TokenSession): Promise<void> {
     await pool.query(
-      `INSERT INTO token_sessions(pair_address, token_address, status, data, created_at, updated_at)
+      `INSERT INTO token_sessions(pair_address, token_address, status, payload, created_at, updated_at)
        VALUES ($1, $2, $3, $4::jsonb, to_timestamp($5 / 1000.0), to_timestamp($6 / 1000.0))
        ON CONFLICT (pair_address) DO UPDATE SET
          token_address = EXCLUDED.token_address,
          status = EXCLUDED.status,
-         data = EXCLUDED.data,
+         payload = EXCLUDED.payload,
          updated_at = EXCLUDED.updated_at`,
       [
         session.pair.pair.toLowerCase(),
@@ -32,11 +32,11 @@ export class SessionRepository {
   }
 
   async loadActive(): Promise<TokenSession[]> {
-    const result = await pool.query<{ data: unknown }>(
-      `SELECT data FROM token_sessions
+    const result = await pool.query<{ payload: unknown }>(
+      `SELECT payload FROM token_sessions
        WHERE status IN ('WAITING_FIRST_BUY', 'RISK_CHECKING', 'BUY_PENDING', 'HOLDING', 'SELL_PENDING', 'MANUAL_REVIEW')`,
     );
-    return result.rows.map((row) => parseJson<TokenSession>(row.data));
+    return result.rows.map((row) => parseJson<TokenSession>(row.payload));
   }
 
   async countOpenPositions(): Promise<number> {
@@ -56,8 +56,9 @@ export class SwapEventRepository {
       await client.query(
         `INSERT INTO swap_events(
            event_id, pair_address, transaction_hash, block_number,
-           transaction_index, log_index, kind, data, observed_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, to_timestamp($9 / 1000.0))
+           transaction_index, log_index, kind, payload, created_at, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb,
+           to_timestamp($9 / 1000.0), NOW())
          ON CONFLICT (event_id) DO NOTHING`,
         [
           event.id,
@@ -115,14 +116,14 @@ export class TradeRepository {
   async save(trade: TradeRecord): Promise<void> {
     await pool.query(
       `INSERT INTO trades(
-         id, pair_address, token_address, side, mode, status,
-         transaction_hash, data, created_at, updated_at
+         trade_id, pair_address, token_address, side, mode, status,
+         transaction_hash, payload, created_at, updated_at
        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb,
          to_timestamp($9 / 1000.0), to_timestamp($10 / 1000.0))
-       ON CONFLICT (id) DO UPDATE SET
+       ON CONFLICT (trade_id) DO UPDATE SET
          status = EXCLUDED.status,
          transaction_hash = EXCLUDED.transaction_hash,
-         data = EXCLUDED.data,
+         payload = EXCLUDED.payload,
          updated_at = EXCLUDED.updated_at`,
       [
         trade.id,
@@ -169,22 +170,34 @@ export class DiscoveredTokenRepository {
     metadata?: TokenMetadata;
     source?: 'PAIR_CREATED' | 'DIRECT_DEPLOYMENT';
   }): Promise<void> {
+    const source = input.source ?? 'PAIR_CREATED';
+    const payload = {
+      pair: input.pair,
+      metadata: input.metadata ?? null,
+      source,
+    };
     await pool.query(
       `INSERT INTO discovered_tokens(
-         token_address, pair_address, source, discovered_block,
-         transaction_hash, metadata, discovered_at, updated_at
-       ) VALUES ($1, $2, $3, $4, $5, $6::jsonb,
-         to_timestamp($7 / 1000.0), NOW())
+         token_address, pair_address, source,
+         deployment_transaction_hash, deployment_block,
+         probable_bep20, payload, metadata, created_at, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb,
+         to_timestamp($9 / 1000.0), NOW())
        ON CONFLICT (token_address) DO UPDATE SET
          pair_address = COALESCE(EXCLUDED.pair_address, discovered_tokens.pair_address),
+         source = EXCLUDED.source,
+         probable_bep20 = EXCLUDED.probable_bep20,
+         payload = EXCLUDED.payload,
          metadata = COALESCE(EXCLUDED.metadata, discovered_tokens.metadata),
          updated_at = NOW()`,
       [
         input.pair.token.toLowerCase(),
         input.pair.pair.toLowerCase(),
-        input.source ?? 'PAIR_CREATED',
-        input.pair.createdBlock.toString(),
+        source,
         input.pair.createdTransactionHash.toLowerCase(),
+        input.pair.createdBlock.toString(),
+        Boolean(input.metadata),
+        stringifyJson(payload),
         input.metadata ? stringifyJson(input.metadata) : null,
         input.pair.discoveredAtMs,
       ],
