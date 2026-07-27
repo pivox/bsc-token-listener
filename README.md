@@ -92,6 +92,37 @@ FROM token_risk_reports
 ORDER BY created_at DESC;
 ```
 
+## Dashboard minimal
+
+Le bot expose une interface de supervision **strictement en lecture seule**. Elle affiche :
+
+- les tokens écoutés, achetés, vendus et en erreur ;
+- le solde du wallet public quand une clé est configurée ;
+- les positions ouvertes et leur progression vers le nombre cible d’achats ;
+- le PnL latent estimé et le profit réalisé en BNB ;
+- le score `TokenRiskReport`, les taxes estimées, les swaps observés et une chronologie ;
+- les liens vers BscScan pour le token, la paire et les transactions.
+
+Configuration par défaut :
+
+```env
+DASHBOARD_ENABLED=true
+DASHBOARD_HOST=127.0.0.1
+DASHBOARD_PORT=3000
+DASHBOARD_REFRESH_SECONDS=5
+DASHBOARD_MAX_ROWS=250
+```
+
+Après `npm run dev`, ouvrir :
+
+```text
+http://127.0.0.1:3000/dashboard
+```
+
+Le PnL latent utilise la cotation `getAmountsOut` de PancakeSwap V2 et applique l’estimation de taxe de vente du rapport de risque lorsqu’elle est disponible. Le profit réalisé correspond au montant de sortie moins le montant d’entrée. Les frais de gas ne sont pas encore persistés : ils ne sont donc pas déduits et l’interface le signale explicitement.
+
+Le serveur reste lié à `127.0.0.1` par défaut. Ne définir `DASHBOARD_HOST=0.0.0.0` que derrière un pare-feu ou un reverse proxy correctement protégé.
+
 ## Passage en live
 
 Le live reste verrouillé tant que toutes ces conditions ne sont pas réunies :
