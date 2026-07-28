@@ -4,7 +4,11 @@ import { EntryAmountService } from '../execution/entry-amount.service.js';
 import { TradeExecutor } from '../execution/trade-executor.js';
 import { TokenRiskService } from '../security/token-risk.service.js';
 import { recordEntryObservationBuy } from './entry-observation.js';
-import { requiresExecutionManualReview } from './execution-failure-policy.js';
+import {
+  confirmedExecutionToReconcile,
+  hasUnreconciledConfirmedSell,
+  requiresExecutionManualReview,
+} from './execution-failure-policy.js';
 import {
   RiskReportRepository,
   SessionRepository,
@@ -36,6 +40,11 @@ export class SessionEngine {
     return this.withLock(session, async () => {
       if (!session.entry || session.exit) {
         throw new Error('Aucune position ouverte à vendre.');
+      }
+      if (hasUnreconciledConfirmedSell(session)) {
+        throw new Error(
+          'Une vente confirmée doit être réconciliée avant toute nouvelle tentative.',
+        );
       }
       if (session.status !== 'HOLDING' && session.status !== 'MANUAL_REVIEW') {
         throw new Error(`Vente manuelle impossible depuis le statut ${session.status}.`);
@@ -215,6 +224,7 @@ export class SessionEngine {
 
       try {
         session.entry = await this.executor.buy(session, amountInWei);
+        delete session.unreconciledExecution;
         session.status = 'HOLDING';
         session.updatedAtMs = Date.now();
         await this.sessions.save(session);
@@ -229,6 +239,8 @@ export class SessionEngine {
           'Entrée effectuée.',
         );
       } catch (error) {
+        const confirmedExecution = confirmedExecutionToReconcile(error);
+        if (confirmedExecution) session.unreconciledExecution = confirmedExecution;
         if (requiresExecutionManualReview(error)) {
           session.status = 'MANUAL_REVIEW';
           session.rejectionReason = `Achat à réconcilier: ${errorMessage(error)}`;
@@ -291,6 +303,7 @@ export class SessionEngine {
     await this.sessions.save(session);
     try {
       session.exit = await this.executor.sell(session);
+      delete session.unreconciledExecution;
       session.status = 'CLOSED';
       delete session.rejectionReason;
       session.updatedAtMs = Date.now();
@@ -305,6 +318,8 @@ export class SessionEngine {
         successMessage,
       );
     } catch (error) {
+      const confirmedExecution = confirmedExecutionToReconcile(error);
+      if (confirmedExecution) session.unreconciledExecution = confirmedExecution;
       session.status = 'MANUAL_REVIEW';
       session.rejectionReason = `Vente échouée: ${errorMessage(error)}`;
       session.updatedAtMs = Date.now();

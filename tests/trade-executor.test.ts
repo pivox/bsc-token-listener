@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { Address, Hash, Hex } from 'viem';
 import {
+  ExecutionMeasurementError,
   ExecutionOutcomeUnknownError,
   ExecutionRevertedError,
   TradeExecutor,
@@ -79,6 +80,9 @@ class MemoryTradeStore {
     trade: TradeRecord;
     transaction: TradeTransactionRecord;
   }> = [];
+  private lifecycleCallCount = 0;
+
+  constructor(private readonly failLifecycleFromCall?: number) {}
 
   async save(trade: TradeRecord): Promise<void> {
     this.trades.push(structuredClone(trade));
@@ -88,6 +92,13 @@ class MemoryTradeStore {
     trade: TradeRecord,
     transaction: TradeTransactionRecord,
   ): Promise<void> {
+    this.lifecycleCallCount += 1;
+    if (
+      this.failLifecycleFromCall !== undefined
+      && this.lifecycleCallCount >= this.failLifecycleFromCall
+    ) {
+      throw new Error('PostgreSQL indisponible après diffusion');
+    }
     this.trades.push(structuredClone(trade));
     this.lifecycles.push({
       trade: structuredClone(trade),
@@ -409,6 +420,36 @@ test('conserve le reçu confirmé quand la mesure post-achat échoue', async () 
   assert.equal(store.trades.at(-1)?.actualAmountOut, undefined);
 });
 
+test('expose la vente confirmée à réconcilier quand sa mesure échoue', async () => {
+  const store = new MemoryTradeStore();
+  const gateway = new FakeExecutionGateway();
+  gateway.tokenBalances = [100n, 100n, 0n];
+  gateway.nativeBalances = [1_000n, new Error('RPC balance indisponible')];
+  const openSession = session();
+  openSession.status = 'HOLDING';
+  openSession.entry = {
+    mode: 'live',
+    amountInWei: 90n,
+    amountOutToken: 100n,
+    confirmedAtMs: 3,
+    cursor: { blockNumber: 3n, transactionIndex: 0, logIndex: 0 },
+  };
+  const executor = new TradeExecutor(store, gateway, 'live');
+
+  await assert.rejects(
+    executor.sell(openSession),
+    (error: unknown) =>
+      error instanceof ExecutionMeasurementError
+      && error.confirmedExecution?.step === 'SELL'
+      && error.confirmedExecution.tradeId === store.trades[0]?.id
+      && error.confirmedExecution.transactionHash === HASH,
+  );
+
+  assert.equal(store.lifecycles.at(-1)?.transaction.status, 'CONFIRMED');
+  assert.equal(store.trades.at(-1)?.status, 'CONFIRMED');
+  assert.equal(store.trades.at(-1)?.actualAmountOut, undefined);
+});
+
 test('une mesure d’approval incomplète ne confirme pas la vente métier', async () => {
   const store = new MemoryTradeStore();
   const gateway = new FakeExecutionGateway();
@@ -466,4 +507,19 @@ test('persiste l’absence de wallet live comme un échec avant diffusion', asyn
 
   assert.equal(store.trades.at(-1)?.status, 'FAILED');
   assert.equal(store.lifecycles.length, 0);
+});
+
+test('conserve une erreur typée UNKNOWN si PostgreSQL échoue après diffusion', async () => {
+  const store = new MemoryTradeStore(2);
+  const gateway = new FakeExecutionGateway();
+  const executor = new TradeExecutor(store, gateway, 'live');
+
+  await assert.rejects(
+    executor.buy(session(), 100n),
+    (error: unknown) =>
+      error instanceof ExecutionOutcomeUnknownError
+      && error.message.includes('PostgreSQL indisponible après diffusion'),
+  );
+
+  assert.equal(store.lifecycles[0]?.transaction.status, 'CREATED');
 });

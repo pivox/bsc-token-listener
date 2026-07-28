@@ -84,6 +84,13 @@ export interface ExitExecution {
   transactionHash?: Hash;
 }
 
+export interface ConfirmedExecutionReference {
+  tradeId: string;
+  step: TradeTransactionStep;
+  transactionHash: Hash;
+  confirmedAtMs: number;
+}
+
 export interface TokenSession {
   pair: PairInfo;
   metadata: TokenMetadata;
@@ -92,6 +99,7 @@ export interface TokenSession {
   entryObservationBuys?: SwapEvent[];
   entry?: EntryExecution;
   exit?: ExitExecution;
+  unreconciledExecution?: ConfirmedExecutionReference;
   subsequentBuyCount: number;
   targetBuysAfterEntry: number;
   countedBuyTransactionHashes: Hash[];

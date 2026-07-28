@@ -156,6 +156,7 @@ function injectControls(page: string, nonce: string, minimumScore: number): stri
       }
       function canSell(token) {
         return Boolean(token && token.entry && !token.exit
+          && (!token.unreconciledExecution || token.unreconciledExecution.step !== 'SELL')
           && (token.status === 'HOLDING' || token.status === 'MANUAL_REVIEW'));
       }
       function canIgnore(token) {

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Hash } from 'viem';
 import { config } from '../config/env.js';
 import type {
+  ConfirmedExecutionReference,
   EntryExecution,
   ExecutionMode,
   ExitExecution,
@@ -47,9 +48,15 @@ export class ExecutionRevertedError extends Error {
 }
 
 export class ExecutionMeasurementError extends Error {
-  constructor(message: string, options?: ErrorOptions) {
+  readonly confirmedExecution: ConfirmedExecutionReference | undefined;
+
+  constructor(
+    message: string,
+    options?: ErrorOptions & { confirmedExecution?: ConfirmedExecutionReference },
+  ) {
     super(message, options);
     this.name = 'ExecutionMeasurementError';
+    this.confirmedExecution = options?.confirmedExecution;
   }
 }
 
@@ -186,7 +193,10 @@ export class TradeExecutor {
         await this.recordMeasurementFailure(trade, transaction, error);
         throw new ExecutionMeasurementError(
           `Achat confirmé mais mesure des soldes impossible: ${errorMessage(error)}`,
-          { cause: error },
+          {
+            cause: error,
+            confirmedExecution: this.confirmedExecution(trade, transaction),
+          },
         );
       }
     });
@@ -348,7 +358,10 @@ export class TradeExecutor {
         await this.recordMeasurementFailure(trade, transaction, error);
         throw new ExecutionMeasurementError(
           `Vente confirmée mais mesure des soldes impossible: ${errorMessage(error)}`,
-          { cause: error },
+          {
+            cause: error,
+            confirmedExecution: this.confirmedExecution(trade, transaction),
+          },
         );
       }
     });
@@ -381,7 +394,10 @@ export class TradeExecutor {
       await this.recordMeasurementFailure(trade, transaction, error, 'UNKNOWN');
       throw new ExecutionMeasurementError(
         `Approval confirmé mais mesure du solde impossible: ${errorMessage(error)}`,
-        { cause: error },
+        {
+          cause: error,
+          confirmedExecution: this.confirmedExecution(trade, transaction),
+        },
       );
     }
     return gasCostWei;
@@ -405,53 +421,55 @@ export class TradeExecutor {
         throw new Error(`Hash RPC inattendu: ${returnedHash}.`);
       }
     } catch (error) {
-      await this.markUnknown(trade, transaction, error);
-      throw new ExecutionOutcomeUnknownError(
-        `Statut de diffusion ${transaction.step} inconnu: ${errorMessage(error)}`,
-        { cause: error },
+      return this.raiseUnknown(
+        trade,
+        transaction,
+        `Statut de diffusion ${transaction.step} inconnu`,
+        error,
       );
     }
-
-    const submittedAtMs = Date.now();
-    transaction.status = 'SUBMITTED';
-    transaction.submittedAtMs = submittedAtMs;
-    transaction.updatedAtMs = submittedAtMs;
-    trade.status = 'SUBMITTED';
-    trade.updatedAtMs = submittedAtMs;
-    await this.trades.saveLifecycle(trade, transaction);
 
     let receipt: ExecutionReceipt;
     try {
+      const submittedAtMs = Date.now();
+      transaction.status = 'SUBMITTED';
+      transaction.submittedAtMs = submittedAtMs;
+      transaction.updatedAtMs = submittedAtMs;
+      trade.status = 'SUBMITTED';
+      trade.updatedAtMs = submittedAtMs;
+      await this.trades.saveLifecycle(trade, transaction);
+
       receipt = await this.gateway.waitForReceipt(prepared.hash);
+
+      const confirmedAtMs = Date.now();
+      const gasCostWei = calculateGasCost(receipt.gasUsed, receipt.effectiveGasPrice);
+      transaction.status = receipt.status === 'success' ? 'CONFIRMED' : 'REVERTED';
+      transaction.blockNumber = receipt.blockNumber;
+      transaction.gasUsed = receipt.gasUsed;
+      transaction.effectiveGasPrice = receipt.effectiveGasPrice;
+      transaction.gasCostWei = gasCostWei;
+      transaction.receiptStatus = receipt.status;
+      transaction.confirmedAtMs = confirmedAtMs;
+      transaction.updatedAtMs = confirmedAtMs;
+      trade.blockNumber = receipt.blockNumber;
+      trade.gasCostWei = (trade.gasCostWei ?? 0n) + gasCostWei;
+      trade.status = receipt.status === 'success'
+        ? (finalStep ? 'SUBMITTED' : 'CREATED')
+        : 'REVERTED';
+      trade.updatedAtMs = confirmedAtMs;
+      if (receipt.status === 'reverted') {
+        trade.error = `${transaction.step} revert: ${prepared.hash}`;
+        transaction.error = trade.error;
+      }
+      await this.trades.saveLifecycle(trade, transaction);
     } catch (error) {
-      await this.markUnknown(trade, transaction, error);
-      throw new ExecutionOutcomeUnknownError(
-        `Reçu ${transaction.step} indisponible: ${errorMessage(error)}`,
-        { cause: error },
+      return this.raiseUnknown(
+        trade,
+        transaction,
+        `État post-diffusion ${transaction.step} inconnu`,
+        error,
       );
     }
-
-    const confirmedAtMs = Date.now();
-    const gasCostWei = calculateGasCost(receipt.gasUsed, receipt.effectiveGasPrice);
-    transaction.status = receipt.status === 'success' ? 'CONFIRMED' : 'REVERTED';
-    transaction.blockNumber = receipt.blockNumber;
-    transaction.gasUsed = receipt.gasUsed;
-    transaction.effectiveGasPrice = receipt.effectiveGasPrice;
-    transaction.gasCostWei = gasCostWei;
-    transaction.receiptStatus = receipt.status;
-    transaction.confirmedAtMs = confirmedAtMs;
-    transaction.updatedAtMs = confirmedAtMs;
-    trade.blockNumber = receipt.blockNumber;
-    trade.gasCostWei = (trade.gasCostWei ?? 0n) + gasCostWei;
-    trade.status = receipt.status === 'success'
-      ? (finalStep ? 'SUBMITTED' : 'CREATED')
-      : 'REVERTED';
-    trade.updatedAtMs = confirmedAtMs;
-    if (receipt.status === 'reverted') {
-      trade.error = `${transaction.step} revert: ${prepared.hash}`;
-      transaction.error = trade.error;
-    }
-    await this.trades.saveLifecycle(trade, transaction);
 
     if (receipt.status === 'reverted') {
       throw new ExecutionRevertedError(`${transaction.step} échoué: ${prepared.hash}`);
@@ -459,20 +477,28 @@ export class TradeExecutor {
     return receipt;
   }
 
-  private async markUnknown(
+  private async raiseUnknown(
     trade: TradeRecord,
     transaction: TradeTransactionRecord,
+    context: string,
     error: unknown,
-  ): Promise<void> {
+  ): Promise<never> {
     const now = Date.now();
-    const reason = errorMessage(error);
+    let reason = errorMessage(error);
     trade.status = 'UNKNOWN';
     trade.error = reason;
     trade.updatedAtMs = now;
     transaction.status = 'UNKNOWN';
     transaction.error = reason;
     transaction.updatedAtMs = now;
-    await this.trades.saveLifecycle(trade, transaction);
+    try {
+      await this.trades.saveLifecycle(trade, transaction);
+    } catch (persistenceError) {
+      reason = `${reason}; persistance UNKNOWN impossible: ${errorMessage(persistenceError)}`;
+      trade.error = reason;
+      transaction.error = reason;
+    }
+    throw new ExecutionOutcomeUnknownError(`${context}: ${reason}`, { cause: error });
   }
 
   private async recordMeasurementFailure(
@@ -488,7 +514,14 @@ export class TradeExecutor {
     trade.updatedAtMs = now;
     transaction.measurementError = reason;
     transaction.updatedAtMs = now;
-    await this.trades.saveLifecycle(trade, transaction);
+    try {
+      await this.trades.saveLifecycle(trade, transaction);
+    } catch (persistenceError) {
+      const persistenceReason = errorMessage(persistenceError);
+      trade.error = `${trade.error}; persistance de la mesure impossible: ${persistenceReason}`;
+      transaction.measurementError =
+        `${transaction.measurementError}; persistance impossible: ${persistenceReason}`;
+    }
   }
 
   private async failTrade(trade: TradeRecord, error: unknown): Promise<void> {
@@ -559,6 +592,18 @@ export class TradeExecutor {
         : { tokenBalanceBefore: balances.tokenBalanceBefore }),
       createdAtMs: now,
       updatedAtMs: now,
+    };
+  }
+
+  private confirmedExecution(
+    trade: TradeRecord,
+    transaction: TradeTransactionRecord,
+  ): ConfirmedExecutionReference {
+    return {
+      tradeId: trade.id,
+      step: transaction.step,
+      transactionHash: transaction.transactionHash,
+      confirmedAtMs: transaction.confirmedAtMs ?? Date.now(),
     };
   }
 }
