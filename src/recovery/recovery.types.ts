@@ -21,8 +21,17 @@ export type TransactionRecoveryDecision =
 
 export interface ReconciliationGateway {
   observeTransaction(hash: Hash): Promise<ChainObservation>;
-  getNativeBalance(wallet: Address): Promise<bigint>;
-  getTokenBalance(token: Address, wallet: Address): Promise<bigint>;
+  getNativeBalance(wallet: Address, blockNumber: bigint): Promise<bigint>;
+  getTokenBalance(
+    token: Address,
+    wallet: Address,
+    blockNumber: bigint,
+  ): Promise<bigint>;
+  hasLaterWalletTransactionInBlock(
+    wallet: Address,
+    blockNumber: bigint,
+    transactionIndex: number,
+  ): Promise<boolean>;
 }
 
 export interface RecoverySnapshot {

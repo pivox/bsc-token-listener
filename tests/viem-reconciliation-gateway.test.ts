@@ -3,11 +3,13 @@ import test from 'node:test';
 import {
   TransactionNotFoundError,
   TransactionReceiptNotFoundError,
+  type Address,
   type Hash,
 } from 'viem';
 import { ViemReconciliationGateway } from '../src/recovery/viem-reconciliation.gateway.js';
 
 const HASH = `0x${'1'.repeat(64)}` as Hash;
+const WALLET = `0x${'2'.repeat(40)}` as Address;
 
 interface TestReceipt {
   status: 'success' | 'reverted';
@@ -20,6 +22,7 @@ interface TestReceipt {
 function client(input: {
   receipt?: TestReceipt | Error;
   transaction?: object | Error;
+  blockTransactions?: Array<Hash | { from: Address }>;
 }) {
   return {
     async getTransactionReceipt(): Promise<TestReceipt> {
@@ -33,6 +36,11 @@ function client(input: {
     },
     async getBalance(): Promise<bigint> {
       return 1n;
+    },
+    async getBlock(): Promise<{
+      transactions: Array<Hash | { from: Address }>;
+    }> {
+      return { transactions: input.blockTransactions ?? [] };
     },
     async readContract(): Promise<bigint> {
       return 2n;
@@ -87,4 +95,41 @@ test('ne conserve que le type d’une erreur RPC', async () => {
     kind: 'RPC_ERROR',
     errorType: 'HttpRequestError',
   });
+});
+
+test('lit les soldes au bloc du reçu et détecte un nonce wallet ultérieur', async () => {
+  const calls: Array<{ kind: string; blockNumber: bigint }> = [];
+  const gateway = new ViemReconciliationGateway({
+    ...client({
+      blockTransactions: [
+        { from: WALLET },
+        { from: WALLET },
+      ],
+    }),
+    async getBalance(input: {
+      address: Address;
+      blockNumber: bigint;
+    }): Promise<bigint> {
+      calls.push({ kind: 'native', blockNumber: input.blockNumber });
+      return 1n;
+    },
+    async readContract(input: {
+      blockNumber: bigint;
+    }): Promise<bigint> {
+      calls.push({ kind: 'token', blockNumber: input.blockNumber });
+      return 2n;
+    },
+  });
+
+  await gateway.getNativeBalance(WALLET, 10n);
+  await gateway.getTokenBalance(WALLET, WALLET, 10n);
+
+  assert.deepEqual(calls, [
+    { kind: 'native', blockNumber: 10n },
+    { kind: 'token', blockNumber: 10n },
+  ]);
+  assert.equal(
+    await gateway.hasLaterWalletTransactionInBlock(WALLET, 10n, 0),
+    true,
+  );
 });

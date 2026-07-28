@@ -289,10 +289,11 @@ export class SessionReconciler {
     transaction: TradeTransactionRecord,
     receipt: ExecutionReceipt,
   ): Promise<void> {
-    const [nativeAfter, tokenAfter] = await Promise.all([
-      this.gateway.getNativeBalance(transaction.walletAddress),
-      this.gateway.getTokenBalance(session.pair.token, transaction.walletAddress),
-    ]);
+    const [nativeAfter, tokenAfter] = await this.readPostTransactionBalances(
+      session,
+      transaction,
+      receipt,
+    );
     const gasCostWei = calculateGasCost(receipt.gasUsed, receipt.effectiveGasPrice);
     const amountOutToken =
       tokenAfter - requireBalance(transaction.tokenBalanceBefore, 'token avant achat');
@@ -348,10 +349,11 @@ export class SessionReconciler {
     transaction: TradeTransactionRecord,
     receipt: ExecutionReceipt,
   ): Promise<void> {
-    const [nativeAfter, tokenAfter] = await Promise.all([
-      this.gateway.getNativeBalance(transaction.walletAddress),
-      this.gateway.getTokenBalance(session.pair.token, transaction.walletAddress),
-    ]);
+    const [nativeAfter, tokenAfter] = await this.readPostTransactionBalances(
+      session,
+      transaction,
+      receipt,
+    );
     const sellGasWei = calculateGasCost(receipt.gasUsed, receipt.effectiveGasPrice);
     const amountInToken =
       requireBalance(transaction.tokenBalanceBefore, 'token avant vente') - tokenAfter;
@@ -432,6 +434,45 @@ export class SessionReconciler {
         reason: resumeReason,
       });
     }
+  }
+
+  private async readPostTransactionBalances(
+    session: TokenSession,
+    transaction: TradeTransactionRecord,
+    receipt: ExecutionReceipt,
+  ): Promise<readonly [bigint, bigint]> {
+    if (
+      transaction.nativeBalanceAfter !== undefined
+      && transaction.tokenBalanceAfter !== undefined
+    ) {
+      return [
+        transaction.nativeBalanceAfter,
+        transaction.tokenBalanceAfter,
+      ];
+    }
+    const contaminated =
+      await this.gateway.hasLaterWalletTransactionInBlock(
+        transaction.walletAddress,
+        receipt.blockNumber,
+        receipt.transactionIndex,
+      );
+    if (contaminated) {
+      throw new Error('Mesure contaminée par une transaction wallet ultérieure.');
+    }
+    const [nativeAfter, tokenAfter] = await Promise.all([
+      transaction.nativeBalanceAfter
+        ?? this.gateway.getNativeBalance(
+          transaction.walletAddress,
+          receipt.blockNumber,
+        ),
+      transaction.tokenBalanceAfter
+        ?? this.gateway.getTokenBalance(
+          session.pair.token,
+          transaction.walletAddress,
+          receipt.blockNumber,
+        ),
+    ]);
+    return [nativeAfter, tokenAfter];
   }
 
   private applyReceipt(

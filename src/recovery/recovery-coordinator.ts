@@ -89,13 +89,9 @@ export class RecoveryCoordinator {
 
   reconcilePeriodic(): Promise<void> {
     if (this.periodicPass) return this.periodicPass;
-    const pass = (async () => {
-      try {
-        await this.runPass();
-      } finally {
-        await this.options.onPeriodicPassCompleted?.();
-      }
-    })().finally(() => {
+    const pass = this.runPass(
+      this.options.onPeriodicPassCompleted,
+    ).then(() => undefined).finally(() => {
       this.periodicPass = null;
     });
     this.periodicPass = pass;
@@ -110,10 +106,12 @@ export class RecoveryCoordinator {
     await (this.periodicPass ?? this.currentPass)?.catch(() => undefined);
   }
 
-  private runPass(): Promise<RecoveryPassResult> {
+  private runPass(
+    beforeBarrierRelease?: () => Promise<void>,
+  ): Promise<RecoveryPassResult> {
     if (this.currentPass) return this.currentPass;
     this.status = { ...this.status, running: true, lastErrorType: null };
-    const pass = this.executePass()
+    const pass = this.executePass(beforeBarrierRelease)
       .then((result) => {
         this.status = {
           running: false,
@@ -149,11 +147,23 @@ export class RecoveryCoordinator {
     }
   }
 
-  private async executePass(): Promise<RecoveryPassResult> {
+  private async executePass(
+    beforeBarrierRelease?: () => Promise<void>,
+  ): Promise<RecoveryPassResult> {
     if (this.runtimeBarrier) {
-      return this.runtimeBarrier.runRecovery(() => this.executeLockedPass());
+      return this.runtimeBarrier.runRecovery(async () => {
+        try {
+          return await this.executeLockedPass();
+        } finally {
+          await beforeBarrierRelease?.();
+        }
+      });
     }
-    return this.executeLockedPass();
+    try {
+      return await this.executeLockedPass();
+    } finally {
+      await beforeBarrierRelease?.();
+    }
   }
 
   private async executeLockedPass(): Promise<RecoveryPassResult> {

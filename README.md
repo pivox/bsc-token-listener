@@ -135,7 +135,9 @@ qu’une nouvelle opération métier démarre pendant la reprise.
 La réconciliation observe la blockchain en lecture seule avant toute décision :
 
 - une transaction `pending` est laissée en attente sans rediffusion ;
-- un reçu confirmé reconstruit les montants depuis les soldes et le gas ;
+- un reçu confirmé reconstruit les montants depuis les snapshots persistés ou
+  les soldes historiques au bloc du reçu et le gas ; une transaction ultérieure
+  du même wallet dans ce bloc rend la mesure ambiguë ;
 - un revert applique un état métier sûr ;
 - un hash absent, une mesure impossible ou une exécution ambiguë passe en
   `MANUAL_REVIEW` ;

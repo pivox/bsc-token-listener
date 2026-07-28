@@ -211,3 +211,36 @@ test('la passe attend que les opérations listener actives soient drainées', as
   await initial;
   assert.equal(store.lockAcquired, 1);
 });
+
+test('la resynchronisation termine avant de réveiller un listener', async () => {
+  const store = new MemoryStore();
+  const barrier = new RuntimeRecoveryBarrier();
+  const synchronization = deferred();
+  const order: string[] = [];
+  const coordinator = new RecoveryCoordinator(
+    store,
+    { reconcile: async () => {} },
+    {
+      intervalMs: 30_000,
+      leaseMs: 60_000,
+      owner: 'worker',
+      onPeriodicPassCompleted: async () => {
+        order.push('sync-start');
+        await synchronization.promise;
+        order.push('sync-end');
+      },
+    },
+    barrier,
+  );
+
+  const periodic = coordinator.reconcilePeriodic();
+  const listener = barrier.runListener(async () => {
+    order.push('listener');
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(order, ['sync-start']);
+
+  synchronization.resolve();
+  await Promise.all([periodic, listener]);
+  assert.deepEqual(order, ['sync-start', 'sync-end', 'listener']);
+});

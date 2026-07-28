@@ -131,17 +131,32 @@ class FakeGateway implements ReconciliationGateway {
   };
   nativeBalance = 893n;
   tokenBalance = 170n;
+  laterWalletTransaction = false;
+  readonly balanceBlockNumbers: bigint[] = [];
 
   async observeTransaction(): Promise<ChainObservation> {
     return this.observation;
   }
 
-  async getNativeBalance(): Promise<bigint> {
+  async getNativeBalance(
+    _wallet: Address,
+    blockNumber: bigint,
+  ): Promise<bigint> {
+    this.balanceBlockNumbers.push(blockNumber);
     return this.nativeBalance;
   }
 
-  async getTokenBalance(): Promise<bigint> {
+  async getTokenBalance(
+    _token: Address,
+    _wallet: Address,
+    blockNumber: bigint,
+  ): Promise<bigint> {
+    this.balanceBlockNumbers.push(blockNumber);
     return this.tokenBalance;
+  }
+
+  async hasLaterWalletTransactionInBlock(): Promise<boolean> {
+    return this.laterWalletTransaction;
   }
 }
 
@@ -204,6 +219,7 @@ test('reconstruit un achat confirmé depuis les soldes réels', async () => {
   assert.equal(decision?.session.entry?.transactionHash, HASH);
   assert.equal(decision?.trade?.status, 'CONFIRMED');
   assert.equal(decision?.transaction?.status, 'CONFIRMED');
+  assert.deepEqual(gateway.balanceBlockNumbers, [10n, 10n]);
 });
 
 test('retente la mesure read-only d’une exécution en revue manuelle', async () => {
@@ -227,6 +243,25 @@ test('retente la mesure read-only d’une exécution en revue manuelle', async (
   assert.equal(store.applied.at(-1)?.session.status, 'HOLDING');
   assert.equal(store.applied.at(-1)?.action, 'BUY_CONFIRMED');
   assert.equal(store.applied.at(-1)?.session.unreconciledExecution, undefined);
+});
+
+test('refuse une mesure contaminée par une transaction wallet ultérieure du même bloc', async () => {
+  const store = new MemoryStore();
+  const gateway = new FakeGateway();
+  gateway.laterWalletTransaction = true;
+  const currentTrade = trade('BUY');
+  const current = claim(
+    session('BUY_PENDING'),
+    currentTrade,
+    transaction(currentTrade, 'BUY'),
+  );
+  const reconciler = new SessionReconciler(store, gateway, null, () => 20);
+
+  await reconciler.reconcile(current);
+
+  assert.equal(store.applied.at(-1)?.session.status, 'MANUAL_REVIEW');
+  assert.match(store.applied.at(-1)?.reason ?? '', /Mesure/u);
+  assert.deepEqual(gateway.balanceBlockNumbers, []);
 });
 
 test('reconstruit une vente confirmée sans doubler la vente', async () => {
