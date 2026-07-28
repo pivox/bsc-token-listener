@@ -111,7 +111,7 @@ export class TradeExecutor {
         };
       }
 
-      const wallet = this.requireWallet();
+      const wallet = await this.requireWalletForTrade(trade);
       let nativeBalanceBefore: bigint;
       let tokenBalanceBefore: bigint;
       let prepared: PreparedExecutionTransaction;
@@ -233,7 +233,7 @@ export class TradeExecutor {
         };
       }
 
-      const wallet = this.requireWallet();
+      const wallet = await this.requireWalletForTrade(trade);
       trade.walletAddress = wallet;
       try {
         const walletBalance = await this.gateway.getTokenBalance(session.pair.token, wallet);
@@ -503,6 +503,15 @@ export class TradeExecutor {
       throw new Error('Wallet live non initialisé.');
     }
     return this.gateway.walletAddress;
+  }
+
+  private async requireWalletForTrade(trade: TradeRecord): Promise<`0x${string}`> {
+    try {
+      return this.requireWallet();
+    } catch (error) {
+      await this.failTrade(trade, error);
+      throw error;
+    }
   }
 
   private newTrade(

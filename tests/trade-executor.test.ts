@@ -97,7 +97,8 @@ class MemoryTradeStore {
 }
 
 class FakeExecutionGateway implements ExecutionGateway {
-  readonly walletAddress = WALLET;
+  constructor(readonly walletAddress: Address | null = WALLET) {}
+
   quoteAmount = 200n;
   allowance = 1_000n;
   tokenBalances: Array<bigint | Error> = [10n, 170n];
@@ -453,5 +454,16 @@ test('dry-run reste simulé sans transaction enfant on-chain', async () => {
   assert.equal(entry.amountOutToken, gateway.quoteAmount);
   assert.equal(store.trades.at(-1)?.status, 'SIMULATED');
   assert.equal(store.trades.at(-1)?.actualAmountOut, undefined);
+  assert.equal(store.lifecycles.length, 0);
+});
+
+test('persiste l’absence de wallet live comme un échec avant diffusion', async () => {
+  const store = new MemoryTradeStore();
+  const gateway = new FakeExecutionGateway(null);
+  const executor = new TradeExecutor(store, gateway, 'live');
+
+  await assert.rejects(executor.buy(session(), 100n), /Wallet live non initialisé/u);
+
+  assert.equal(store.trades.at(-1)?.status, 'FAILED');
   assert.equal(store.lifecycles.length, 0);
 });
