@@ -82,6 +82,7 @@ export interface TokenSession {
   metadata: TokenMetadata;
   status: SessionStatus;
   firstBuy?: SwapEvent;
+  entryObservationBuys?: SwapEvent[];
   entry?: EntryExecution;
   exit?: ExitExecution;
   subsequentBuyCount: number;
