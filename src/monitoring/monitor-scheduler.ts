@@ -12,6 +12,10 @@ export interface MonitorSchedulerStatus {
   oldestWaitingAgeMs: number | null;
 }
 
+export interface MonitorReconcileResult {
+  failedPairs: Address[];
+}
+
 interface MonitorSchedulerDependencies {
   capacity: number;
   ttlMs: number;
@@ -51,7 +55,7 @@ export function compareMonitorPriority(
 
 export class MonitorScheduler {
   private readonly now: () => number;
-  private running: Promise<void> | null = null;
+  private running: Promise<MonitorReconcileResult> | null = null;
   private rerunRequested = false;
   private status: MonitorSchedulerStatus;
 
@@ -71,10 +75,10 @@ export class MonitorScheduler {
   }
 
   waitForIdle(): Promise<void> {
-    return this.running ?? Promise.resolve();
+    return this.running?.then(() => undefined) ?? Promise.resolve();
   }
 
-  reconcile(): Promise<void> {
+  reconcile(): Promise<MonitorReconcileResult> {
     if (this.running) {
       this.rerunRequested = true;
       return this.running;
@@ -84,18 +88,20 @@ export class MonitorScheduler {
     return this.running;
   }
 
-  private async runUntilStable(): Promise<void> {
+  private async runUntilStable(): Promise<MonitorReconcileResult> {
+    const failedPairs = new Set<Address>();
     try {
       do {
         this.rerunRequested = false;
-        await this.runPass();
+        for (const pair of await this.runPass()) failedPairs.add(pair);
       } while (this.rerunRequested);
+      return { failedPairs: [...failedPairs] };
     } finally {
       this.running = null;
     }
   }
 
-  private async runPass(): Promise<void> {
+  private async runPass(): Promise<Address[]> {
     const now = this.now();
     const sessions = await this.dependencies.loadSessions();
     const eligible: TokenSession[] = [];
@@ -159,6 +165,7 @@ export class MonitorScheduler {
     eligible.sort(compareMonitorPriority);
     let abandonedSessions = 0;
     let reservedFailedHoldingSlots = 0;
+    const failedPairs: Address[] = [];
     for (const session of eligible) {
       let activePairs = this.activePairKeys();
       const pairKey = session.pair.pair.toLowerCase();
@@ -195,6 +202,7 @@ export class MonitorScheduler {
         );
       } catch (error) {
         abandonedSessions += 1;
+        failedPairs.push(session.pair.pair);
         if (session.status === 'HOLDING') reservedFailedHoldingSlots += 1;
         logger.warn(
           {
@@ -235,6 +243,7 @@ export class MonitorScheduler {
         'Session en attente de capacité de monitoring.',
       );
     }
+    return failedPairs;
   }
 
   private activePairKeys(): Set<string> {

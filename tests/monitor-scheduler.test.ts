@@ -284,7 +284,7 @@ test('continue après une erreur de démarrage et expose l’abandon', async () 
   harness.startFailures.add(harness.sessions[0]!.pair.pair);
   const scheduler = harness.scheduler(1);
 
-  await scheduler.reconcile();
+  const result = await scheduler.reconcile();
 
   assert.deepEqual(harness.starts, [
     harness.sessions[0]!.pair.pair,
@@ -292,6 +292,7 @@ test('continue après une erreur de démarrage et expose l’abandon', async () 
   ]);
   assert.equal(scheduler.currentStatus.abandonedSessions, 1);
   assert.equal(scheduler.currentStatus.activeMonitors, 1);
+  assert.deepEqual(result.failedPairs, [harness.sessions[0]!.pair.pair]);
 });
 
 test('réserve la capacité après l’échec d’une position HOLDING', async () => {

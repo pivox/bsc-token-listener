@@ -259,6 +259,16 @@ async function main(): Promise<void> {
   const onPair = async (pair: PairInfo): Promise<void> => {
     const key = pair.pair.toLowerCase();
     if (monitors.has(key)) return;
+    const existing = await sessions.findByPair(pair.pair);
+    if (existing) {
+      const result = await monitorScheduler.reconcile();
+      if (result.failedPairs.length > 0) {
+        throw new Error(
+          `Démarrage de ${result.failedPairs.length} listener(s) Swap échoué.`,
+        );
+      }
+      return;
+    }
     if (await ignoredAssets.isIgnored(pair.token)) {
       logger.info(
         { pair: pair.pair, token: pair.token },
@@ -305,7 +315,12 @@ async function main(): Promise<void> {
       },
       'Nouvelle paire Token/WBNB enregistrée.',
     );
-    await monitorScheduler.reconcile();
+    const result = await monitorScheduler.reconcile();
+    if (result.failedPairs.length > 0) {
+      throw new Error(
+        `Démarrage de ${result.failedPairs.length} listener(s) Swap échoué.`,
+      );
+    }
   };
 
   const initialRecovery = await recovery.reconcileInitial();

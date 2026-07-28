@@ -203,6 +203,10 @@ après reprise alors que la capacité est pleine, elle préempte le listener
 obtenu de listener. Les actifs ignorés et les sessions terminales sont retirés
 de la file.
 
+Un échec RPC de démarrage reste visible par le listener `PairCreated` : la file
+continue à traiter les autres candidates, mais le checkpoint de découverte
+n’avance pas pour la plage concernée.
+
 Le heartbeat et le dashboard exposent la capacité totale, les moniteurs actifs,
 la profondeur de file, les admissions échouées lors de la dernière passe et
 l’âge de la plus ancienne attente.
