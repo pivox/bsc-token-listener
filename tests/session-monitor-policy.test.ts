@@ -86,7 +86,7 @@ test('laisse rejouable un swap arrivé après désactivation de la session', asy
     pair: '0x0000000000000000000000000000000000000001',
   } as unknown as TokenSession['pair'];
   const engine = new SessionEngine(
-    {} as never,
+    { findByPair: async () => structuredClone(current) } as never,
     {} as never,
     {} as never,
     {} as never,

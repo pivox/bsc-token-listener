@@ -60,6 +60,9 @@ class Harness {
   allowStart = true;
   startBarrier: Promise<void> | null = null;
   onStart: (() => void) | null = null;
+  stopBarrier: Promise<void> | null = null;
+  onStop: (() => void) | null = null;
+  onLoadSession: (() => void) | null = null;
 
   scheduler(capacity = 1, now = 10_000): MonitorScheduler {
     return new MonitorScheduler({
@@ -67,6 +70,13 @@ class Harness {
       ttlMs: 1_000,
       now: () => now,
       loadSessions: async () => this.sessions.map((value) => structuredClone(value)),
+      loadSession: async (pair) => {
+        this.onLoadSession?.();
+        const value = this.sessions.find(
+          (session) => session.pair.pair.toLowerCase() === pair.toLowerCase(),
+        );
+        return value ? structuredClone(value) : null;
+      },
       activePairs: () => [...this.active],
       isIgnored: async (token) => this.ignored.has(token.toLowerCase()),
       expire: async (value) => {
@@ -91,8 +101,10 @@ class Harness {
         }
         this.active.add(value.pair.pair);
       },
-      stop: (pair) => {
+      stop: async (pair) => {
         this.stops.push(pair);
+        this.onStop?.();
+        if (this.stopBarrier) await this.stopBarrier;
         this.active.delete(pair);
       },
     });
@@ -224,6 +236,21 @@ test('retire immédiatement un actif ignoré pendant l’attente', async () => {
   assert.equal(harness.starts.length, 0);
 });
 
+test('revalide un actif ignoré juste avant son admission', async () => {
+  const harness = new Harness();
+  const waiting = session('1', 'WAITING_FIRST_BUY', 9_500);
+  harness.sessions = [waiting];
+  harness.onLoadSession = () => {
+    harness.ignored.add(waiting.pair.token.toLowerCase());
+  };
+  const scheduler = harness.scheduler();
+
+  await scheduler.reconcile();
+
+  assert.deepEqual(harness.starts, []);
+  assert.deepEqual(harness.ignoredSessions, [waiting.pair.pair]);
+});
+
 test('retire immédiatement un moniteur dont la session est terminale', async () => {
   const harness = new Harness();
   const closed = session('1', 'CLOSED', 9_500);
@@ -326,6 +353,32 @@ test('préempte une observation pour une position HOLDING', async () => {
   assert.deepEqual(harness.starts, [holding.pair.pair]);
   assert.equal(scheduler.currentStatus.activeMonitors, 1);
   assert.equal(scheduler.currentStatus.waitingSessions, 1);
+});
+
+test('attend le drain du moniteur préempté avant de réutiliser sa place', async () => {
+  const harness = new Harness();
+  const observation = session('1', 'WAITING_FIRST_BUY', 9_500);
+  const holding = session('2', 'HOLDING', 9_600);
+  harness.sessions = [observation, holding];
+  harness.active.add(observation.pair.pair);
+  let releaseStop!: () => void;
+  let signalStop!: () => void;
+  const stopEntered = new Promise<void>((resolve) => {
+    signalStop = resolve;
+  });
+  harness.stopBarrier = new Promise<void>((resolve) => {
+    releaseStop = resolve;
+  });
+  harness.onStop = signalStop;
+  const scheduler = harness.scheduler(1);
+
+  const reconciliation = scheduler.reconcile();
+  await stopEntered;
+  assert.deepEqual(harness.starts, []);
+
+  releaseStop();
+  await reconciliation;
+  assert.deepEqual(harness.starts, [holding.pair.pair]);
 });
 
 test('attend la fin d’une admission déjà engagée', async () => {

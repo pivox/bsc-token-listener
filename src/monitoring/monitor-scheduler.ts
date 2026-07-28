@@ -21,6 +21,7 @@ interface MonitorSchedulerDependencies {
   ttlMs: number;
   now?: () => number;
   loadSessions: () => Promise<TokenSession[]>;
+  loadSession: (pair: Address) => Promise<TokenSession | null>;
   activePairs: () => readonly string[];
   isIgnored: (token: Address) => Promise<boolean>;
   expire: (session: TokenSession) => Promise<void>;
@@ -166,16 +167,16 @@ export class MonitorScheduler {
     let abandonedSessions = 0;
     let reservedFailedHoldingSlots = 0;
     const failedPairs: Address[] = [];
-    for (const session of eligible) {
+    for (const queuedSession of eligible) {
       let activePairs = this.activePairKeys();
-      const pairKey = session.pair.pair.toLowerCase();
+      const pairKey = queuedSession.pair.pair.toLowerCase();
       if (activePairs.has(pairKey)) continue;
       if (this.dependencies.canStart && !this.dependencies.canStart()) break;
       if (
         activePairs.size + reservedFailedHoldingSlots
         >= this.dependencies.capacity
       ) {
-        const preempted = session.status === 'HOLDING'
+        const preempted = queuedSession.status === 'HOLDING'
           ? this.lowestPriorityActiveObservation(eligible)
           : null;
         if (!preempted) break;
@@ -183,12 +184,33 @@ export class MonitorScheduler {
         logger.info(
           {
             pair: preempted.pair.pair,
-            preemptedBy: session.pair.pair,
+            preemptedBy: queuedSession.pair.pair,
           },
           'Moniteur d’observation libéré pour une position ouverte.',
         );
         this.rerunRequested = true;
         activePairs = this.activePairKeys();
+      }
+
+      const session = await this.dependencies.loadSession(
+        queuedSession.pair.pair,
+      );
+      if (!session || !isSessionMonitorable(session)) {
+        this.rerunRequested = true;
+        continue;
+      }
+      if (await this.dependencies.isIgnored(session.pair.token)) {
+        await this.dependencies.ignore(session);
+        this.rerunRequested = true;
+        continue;
+      }
+      if (
+        session.status === 'WAITING_FIRST_BUY'
+        && this.now() - session.createdAtMs >= this.dependencies.ttlMs
+      ) {
+        await this.dependencies.expire(session);
+        this.rerunRequested = true;
+        continue;
       }
 
       try {

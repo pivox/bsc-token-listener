@@ -43,7 +43,8 @@ priority observation.
 
 If an unmonitored `HOLDING` session appears while capacity is already occupied,
 the scheduler deterministically preempts the lowest-priority active
-`WAITING_FIRST_BUY` observation and admits the open position.
+`WAITING_FIRST_BUY` observation, drains its in-flight work, then admits the open
+position.
 
 The scheduler reserves a pair before awaiting listener startup. This prevents
 two local monitor starts for the same pair. Listener termination releases the
@@ -71,6 +72,9 @@ expiration, ignored removal, startup failure and capacity release.
 - Failed candidates remain persisted and become retryable on a later pass.
 - Ignored decisions reload the persisted session under the pair lock before
   mutating it, so an in-flight entry cannot be overwritten by a stale snapshot.
+- Every candidate is reloaded and rechecked for status, ignore state and
+  expiration immediately before admission. Swap processing also reloads the
+  persisted session under the pair lock.
 - Expiration is persisted before admission.
 - No RPC failure advances a blockchain checkpoint.
 - The monitor cap is never increased automatically.

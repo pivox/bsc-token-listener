@@ -32,6 +32,8 @@ export class SwapListener {
   private stopWatch?: () => void;
   private interval?: NodeJS.Timeout;
   private running = false;
+  private stopped = false;
+  private readonly inFlight = new Set<Promise<unknown>>();
 
   constructor(
     private readonly session: TokenSession,
@@ -47,7 +49,8 @@ export class SwapListener {
       abi: pancakePairAbi,
       eventName: 'Swap',
       onLogs: (logs: unknown[]) => {
-        void this.processLogs(logs as SwapLog[]).catch((error: unknown) =>
+        if (this.stopped) return;
+        void this.track(this.processLogs(logs as SwapLog[])).catch((error: unknown) =>
           logger.error(
             { pair: this.session.pair.pair, error: errorMessage(error) },
             'Erreur Swap WebSocket.',
@@ -60,10 +63,11 @@ export class SwapListener {
       ),
     });
 
-    await this.reconcile();
-    if (!isSessionMonitorable(this.session)) return;
+    await this.track(this.reconcile());
+    if (this.stopped || !isSessionMonitorable(this.session)) return;
     this.interval = setInterval(() => {
-      void this.tick().catch((error: unknown) =>
+      if (this.stopped) return;
+      void this.track(this.tick()).catch((error: unknown) =>
         logger.error(
           { pair: this.session.pair.pair, error: errorMessage(error) },
           'Réconciliation Swap échouée.',
@@ -82,8 +86,16 @@ export class SwapListener {
   }
 
   stop(): void {
+    this.stopped = true;
     this.stopWatch?.();
     if (this.interval) clearInterval(this.interval);
+  }
+
+  async stopAndDrain(): Promise<void> {
+    this.stop();
+    while (this.inFlight.size > 0) {
+      await Promise.allSettled([...this.inFlight]);
+    }
   }
 
   private async tick(): Promise<void> {
@@ -177,5 +189,13 @@ export class SwapListener {
       }
     }
     return true;
+  }
+
+  private track<T>(operation: Promise<T>): Promise<T> {
+    const tracked = operation.finally(() => {
+      this.inFlight.delete(tracked);
+    });
+    this.inFlight.add(tracked);
+    return tracked;
   }
 }

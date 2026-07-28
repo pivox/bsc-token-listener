@@ -18,7 +18,7 @@ export class DashboardActionService {
     private readonly ignoredAssets: IgnoredAssetRepository,
     private readonly engine: SessionEngine,
     private readonly findActiveSession: (token: Address) => TokenSession | null,
-    private readonly stopMonitor: (pair: Address) => void,
+    private readonly stopMonitor: (pair: Address) => void | Promise<void>,
   ) {}
 
   async listIgnored(): Promise<Address[]> {
@@ -41,7 +41,7 @@ export class DashboardActionService {
 
     if (session) {
       await this.engine.ignoreManually(session);
-      this.stopMonitor(session.pair.pair);
+      await this.stopMonitor(session.pair.pair);
     }
 
     return {
@@ -60,7 +60,7 @@ export class DashboardActionService {
     }
 
     const updated = await this.engine.sellManually(session!);
-    if (updated.status === 'CLOSED') this.stopMonitor(updated.pair.pair);
+    if (updated.status === 'CLOSED') await this.stopMonitor(updated.pair.pair);
     return {
       tokenAddress: updated.pair.token,
       pairAddress: updated.pair.pair,

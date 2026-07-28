@@ -37,6 +37,9 @@ export class SessionEngine {
 
   async onSwap(session: TokenSession, event: SwapEvent): Promise<boolean> {
     return this.withLock(session, async () => {
+      const current = await this.sessions.findByPair(session.pair.pair);
+      if (!current) return false;
+      this.replaceSession(session, current);
       if (!isSessionMonitorable(session)) return false;
       await this.handle(session, event);
       return true;

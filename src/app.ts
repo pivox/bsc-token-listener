@@ -153,13 +153,13 @@ async function main(): Promise<void> {
     if (scheduleNext && monitorSchedulingEnabled) requestMonitorReconcile();
   };
 
-  const stopMonitor = (
+  const stopMonitor = async (
     pair: Address,
     scheduleNext = true,
     logRelease = true,
-  ): void => {
+  ): Promise<void> => {
     const key = pair.toLowerCase();
-    monitors.get(key)?.stop();
+    await monitors.get(key)?.stopAndDrain();
     removeMonitor(pair, scheduleNext, logRelease);
   };
 
@@ -195,7 +195,7 @@ async function main(): Promise<void> {
     try {
       await listener.start();
     } catch (error) {
-      listener.stop();
+      await listener.stopAndDrain();
       removeMonitor(session.pair.pair, false, false);
       throw error;
     }
@@ -205,6 +205,7 @@ async function main(): Promise<void> {
     capacity: config.maxActivePairMonitors,
     ttlMs: config.pairMonitorTtlMinutes * 60_000,
     loadSessions: () => sessions.loadActive(),
+    loadSession: (pair) => sessions.findByPair(pair),
     activePairs: () => [...monitors.keys()],
     isIgnored: (token) => ignoredAssets.isIgnored(token),
     expire: async (session) => {
@@ -235,11 +236,11 @@ async function main(): Promise<void> {
     for (const [pairKey] of monitors) {
       const current = refreshedByPair.get(pairKey);
       if (!current) {
-        stopMonitor(pairKey as Address, false);
+        await stopMonitor(pairKey as Address, false);
         continue;
       }
       if (!isSessionMonitorable(current)) {
-        stopMonitor(pairKey as Address, false);
+        await stopMonitor(pairKey as Address, false);
         refreshedByPair.delete(pairKey);
         continue;
       }
@@ -419,7 +420,9 @@ async function main(): Promise<void> {
     await monitorScheduler.waitForIdle();
     clearInterval(heartbeatInterval);
     pairListener.stop();
-    for (const listener of monitors.values()) listener.stop();
+    await Promise.all(
+      [...monitors.values()].map((listener) => listener.stopAndDrain()),
+    );
     try {
       await dashboard?.stop();
     } catch (error) {
