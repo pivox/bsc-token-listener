@@ -91,6 +91,22 @@ if (riskPolicy !== 'allow-only' && riskPolicy !== 'block-only') {
 const privateKey = readPrivateKey();
 const safetyProbeAddress = readOptionalAddress('SAFETY_PROBE_ADDRESS');
 const riskProbeCaller = readOptionalAddress('RISK_PROBE_CALLER', 'SIMULATION_ACCOUNT');
+const minBuyAmountWei = parseEther(read('MIN_BUY_BNB', '0.002'));
+const maxBuyAmountWei = parseEther(read('MAX_BUY_BNB', '0.005'));
+if (maxBuyAmountWei < minBuyAmountWei) {
+  throw new Error('MAX_BUY_BNB doit être supérieur ou égal à MIN_BUY_BNB.');
+}
+const buyLiquidityShareBps = readInteger('BUY_LIQUIDITY_SHARE_BPS', 50, 1, 10_000);
+const buyMedianFactorBps = readInteger('BUY_MEDIAN_FACTOR_BPS', 5000, 1, 10_000);
+const buyWalletShareBps = readInteger('BUY_WALLET_SHARE_BPS', 1000, 1, 10_000);
+const gasReserveWei = parseEther(read('GAS_RESERVE_BNB', '0.005'));
+const buyAmountStepWei = parseEther(read('BUY_AMOUNT_STEP_BNB', '0.0001'));
+if (buyAmountStepWei <= 0n) {
+  throw new Error('BUY_AMOUNT_STEP_BNB doit être strictement positif.');
+}
+if (buyAmountStepWei > minBuyAmountWei) {
+  throw new Error('BUY_AMOUNT_STEP_BNB doit être inférieur ou égal à MIN_BUY_BNB.');
+}
 
 if (executionMode === 'live') {
   if (!privateKey) throw new Error('PRIVATE_KEY est obligatoire en mode live.');
@@ -134,6 +150,13 @@ export const config = {
   slippageBps: readInteger('SLIPPAGE_BPS', 1500, 0, 5000, 'BUY_SLIPPAGE_BPS'),
   txDeadlineSeconds: readInteger('TX_DEADLINE_SECONDS', 90, 15, 600),
   targetBuysAfterEntry: readInteger('TARGET_BUYS_AFTER_ENTRY', 10, 1, 1000),
+  minBuyAmountWei,
+  maxBuyAmountWei,
+  buyLiquidityShareBps,
+  buyMedianFactorBps,
+  buyWalletShareBps,
+  gasReserveWei,
+  buyAmountStepWei,
   maxConcurrentPositions: readInteger('MAX_CONCURRENT_POSITIONS', 1, 1, 100),
   maxActivePairMonitors: readInteger('MAX_ACTIVE_PAIR_MONITORS', 50, 1, 1000),
   pairMonitorTtlMinutes: readInteger('PAIR_MONITOR_TTL_MINUTES', 90, 1, 1440),
