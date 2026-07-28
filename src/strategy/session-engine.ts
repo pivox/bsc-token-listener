@@ -5,7 +5,7 @@ import { TradeExecutor } from '../execution/trade-executor.js';
 import { TokenRiskService } from '../security/token-risk.service.js';
 import { recordEntryObservationBuy } from './entry-observation.js';
 import {
-  confirmedExecutionToReconcile,
+  executionToReconcile,
   hasUnreconciledConfirmedSell,
   requiresExecutionManualReview,
 } from './execution-failure-policy.js';
@@ -239,8 +239,8 @@ export class SessionEngine {
           'Entrée effectuée.',
         );
       } catch (error) {
-        const confirmedExecution = confirmedExecutionToReconcile(error);
-        if (confirmedExecution) session.unreconciledExecution = confirmedExecution;
+        const unresolvedExecution = executionToReconcile(error);
+        if (unresolvedExecution) session.unreconciledExecution = unresolvedExecution;
         if (requiresExecutionManualReview(error)) {
           session.status = 'MANUAL_REVIEW';
           session.rejectionReason = `Achat à réconcilier: ${errorMessage(error)}`;
@@ -318,8 +318,8 @@ export class SessionEngine {
         successMessage,
       );
     } catch (error) {
-      const confirmedExecution = confirmedExecutionToReconcile(error);
-      if (confirmedExecution) session.unreconciledExecution = confirmedExecution;
+      const unresolvedExecution = executionToReconcile(error);
+      if (unresolvedExecution) session.unreconciledExecution = unresolvedExecution;
       session.status = 'MANUAL_REVIEW';
       session.rejectionReason = `Vente échouée: ${errorMessage(error)}`;
       session.updatedAtMs = Date.now();

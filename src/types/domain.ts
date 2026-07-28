@@ -84,11 +84,12 @@ export interface ExitExecution {
   transactionHash?: Hash;
 }
 
-export interface ConfirmedExecutionReference {
+export interface ExecutionReconciliationReference {
   tradeId: string;
   step: TradeTransactionStep;
+  outcome: 'CONFIRMED' | 'UNKNOWN';
   transactionHash: Hash;
-  confirmedAtMs: number;
+  recordedAtMs: number;
 }
 
 export interface TokenSession {
@@ -99,7 +100,7 @@ export interface TokenSession {
   entryObservationBuys?: SwapEvent[];
   entry?: EntryExecution;
   exit?: ExitExecution;
-  unreconciledExecution?: ConfirmedExecutionReference;
+  unreconciledExecution?: ExecutionReconciliationReference;
   subsequentBuyCount: number;
   targetBuysAfterEntry: number;
   countedBuyTransactionHashes: Hash[];

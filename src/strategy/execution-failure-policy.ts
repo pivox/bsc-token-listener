@@ -2,18 +2,19 @@ import {
   ExecutionMeasurementError,
   ExecutionOutcomeUnknownError,
 } from '../execution/trade-executor.js';
-import type { ConfirmedExecutionReference, TokenSession } from '../types/domain.js';
+import type { ExecutionReconciliationReference, TokenSession } from '../types/domain.js';
 
 export function requiresExecutionManualReview(error: unknown): boolean {
   return error instanceof ExecutionOutcomeUnknownError
     || error instanceof ExecutionMeasurementError;
 }
 
-export function confirmedExecutionToReconcile(
+export function executionToReconcile(
   error: unknown,
-): ConfirmedExecutionReference | undefined {
+): ExecutionReconciliationReference | undefined {
   return error instanceof ExecutionMeasurementError
-    ? error.confirmedExecution
+    || error instanceof ExecutionOutcomeUnknownError
+    ? error.executionToReconcile
     : undefined;
 }
 

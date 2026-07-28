@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Hash } from 'viem';
 import { config } from '../config/env.js';
 import type {
-  ConfirmedExecutionReference,
+  ExecutionReconciliationReference,
   EntryExecution,
   ExecutionMode,
   ExitExecution,
@@ -34,9 +34,17 @@ function deadline(): bigint {
 }
 
 export class ExecutionOutcomeUnknownError extends Error {
-  constructor(message: string, options?: ErrorOptions) {
+  readonly executionToReconcile: ExecutionReconciliationReference | undefined;
+
+  constructor(
+    message: string,
+    options?: ErrorOptions & {
+      executionToReconcile?: ExecutionReconciliationReference;
+    },
+  ) {
     super(message, options);
     this.name = 'ExecutionOutcomeUnknownError';
+    this.executionToReconcile = options?.executionToReconcile;
   }
 }
 
@@ -48,15 +56,17 @@ export class ExecutionRevertedError extends Error {
 }
 
 export class ExecutionMeasurementError extends Error {
-  readonly confirmedExecution: ConfirmedExecutionReference | undefined;
+  readonly executionToReconcile: ExecutionReconciliationReference | undefined;
 
   constructor(
     message: string,
-    options?: ErrorOptions & { confirmedExecution?: ConfirmedExecutionReference },
+    options?: ErrorOptions & {
+      executionToReconcile?: ExecutionReconciliationReference;
+    },
   ) {
     super(message, options);
     this.name = 'ExecutionMeasurementError';
-    this.confirmedExecution = options?.confirmedExecution;
+    this.executionToReconcile = options?.executionToReconcile;
   }
 }
 
@@ -195,7 +205,11 @@ export class TradeExecutor {
           `Achat confirmé mais mesure des soldes impossible: ${errorMessage(error)}`,
           {
             cause: error,
-            confirmedExecution: this.confirmedExecution(trade, transaction),
+            executionToReconcile: this.executionReference(
+              trade,
+              transaction,
+              'CONFIRMED',
+            ),
           },
         );
       }
@@ -360,7 +374,11 @@ export class TradeExecutor {
           `Vente confirmée mais mesure des soldes impossible: ${errorMessage(error)}`,
           {
             cause: error,
-            confirmedExecution: this.confirmedExecution(trade, transaction),
+            executionToReconcile: this.executionReference(
+              trade,
+              transaction,
+              'CONFIRMED',
+            ),
           },
         );
       }
@@ -396,7 +414,11 @@ export class TradeExecutor {
         `Approval confirmé mais mesure du solde impossible: ${errorMessage(error)}`,
         {
           cause: error,
-          confirmedExecution: this.confirmedExecution(trade, transaction),
+          executionToReconcile: this.executionReference(
+            trade,
+            transaction,
+            'CONFIRMED',
+          ),
         },
       );
     }
@@ -498,7 +520,10 @@ export class TradeExecutor {
       trade.error = reason;
       transaction.error = reason;
     }
-    throw new ExecutionOutcomeUnknownError(`${context}: ${reason}`, { cause: error });
+    throw new ExecutionOutcomeUnknownError(`${context}: ${reason}`, {
+      cause: error,
+      executionToReconcile: this.executionReference(trade, transaction, 'UNKNOWN'),
+    });
   }
 
   private async recordMeasurementFailure(
@@ -595,15 +620,17 @@ export class TradeExecutor {
     };
   }
 
-  private confirmedExecution(
+  private executionReference(
     trade: TradeRecord,
     transaction: TradeTransactionRecord,
-  ): ConfirmedExecutionReference {
+    outcome: ExecutionReconciliationReference['outcome'],
+  ): ExecutionReconciliationReference {
     return {
       tradeId: trade.id,
       step: transaction.step,
+      outcome,
       transactionHash: transaction.transactionHash,
-      confirmedAtMs: transaction.confirmedAtMs ?? Date.now(),
+      recordedAtMs: transaction.confirmedAtMs ?? Date.now(),
     };
   }
 }

@@ -222,7 +222,11 @@ test('classe une erreur de diffusion comme UNKNOWN sans la confondre avec un éc
 
   await assert.rejects(
     executor.buy(session(), 100n),
-    ExecutionOutcomeUnknownError,
+    (error: unknown) =>
+      error instanceof ExecutionOutcomeUnknownError
+      && error.executionToReconcile?.outcome === 'UNKNOWN'
+      && error.executionToReconcile.step === 'BUY'
+      && error.executionToReconcile.transactionHash === HASH,
   );
 
   assert.equal(store.trades.at(-1)?.status, 'UNKNOWN');
@@ -440,9 +444,10 @@ test('expose la vente confirmée à réconcilier quand sa mesure échoue', async
     executor.sell(openSession),
     (error: unknown) =>
       error instanceof ExecutionMeasurementError
-      && error.confirmedExecution?.step === 'SELL'
-      && error.confirmedExecution.tradeId === store.trades[0]?.id
-      && error.confirmedExecution.transactionHash === HASH,
+      && error.executionToReconcile?.outcome === 'CONFIRMED'
+      && error.executionToReconcile.step === 'SELL'
+      && error.executionToReconcile.tradeId === store.trades[0]?.id
+      && error.executionToReconcile.transactionHash === HASH,
   );
 
   assert.equal(store.lifecycles.at(-1)?.transaction.status, 'CONFIRMED');
