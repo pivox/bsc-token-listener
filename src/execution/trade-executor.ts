@@ -40,6 +40,11 @@ export class TradeExecutor {
       await this.trades.save(trade);
 
       if (config.executionMode === 'dry-run') {
+        const entryReference =
+          session.entryObservationBuys?.[session.entryObservationBuys.length - 1] ?? session.firstBuy;
+        if (!entryReference) {
+          throw new Error('Impossible de déterminer le curseur d\'entrée pour le dry-run.');
+        }
         trade.status = 'SIMULATED';
         trade.updatedAtMs = Date.now();
         await this.trades.save(trade);
@@ -49,7 +54,7 @@ export class TradeExecutor {
           amountOutToken: amountOut,
           confirmedAtMs: Date.now(),
           cursor: {
-            blockNumber: session.firstBuy!.cursor.blockNumber,
+            blockNumber: entryReference.cursor.blockNumber,
             transactionIndex: Number.MAX_SAFE_INTEGER,
             logIndex: Number.MAX_SAFE_INTEGER,
           },
