@@ -1,5 +1,6 @@
 import { formatEther } from 'viem';
 import { config } from '../config/env.js';
+import { EntryAmountService } from '../execution/entry-amount.service.js';
 import { TradeExecutor } from '../execution/trade-executor.js';
 import { TokenRiskService } from '../security/token-risk.service.js';
 import { recordEntryObservationBuy } from './entry-observation.js';
@@ -11,6 +12,7 @@ import type { SwapEvent, TokenSession } from '../types/domain.js';
 import { cursorAfter } from '../utils/cursor.js';
 import { errorMessage } from '../utils/error.js';
 import { logger } from '../utils/logger.js';
+import type { TokenRiskReport } from '../security/token-risk.types.js';
 
 const TERMINAL = new Set(['CLOSED', 'REJECTED', 'EXPIRED']);
 
@@ -22,6 +24,7 @@ export class SessionEngine {
     private readonly reports: RiskReportRepository,
     private readonly risk: TokenRiskService,
     private readonly executor: TradeExecutor,
+    private readonly amountService: EntryAmountService,
   ) {}
 
   async onSwap(session: TokenSession, event: SwapEvent): Promise<void> {
@@ -149,8 +152,9 @@ export class SessionEngine {
         return;
       }
 
+      let report: TokenRiskReport;
       try {
-        const report = await this.risk.analyze({
+        report = await this.risk.analyze({
           pair: session.pair,
           metadata: session.metadata,
           blockNumber: event.cursor.blockNumber,
@@ -195,8 +199,21 @@ export class SessionEngine {
       session.status = 'BUY_PENDING';
       session.updatedAtMs = Date.now();
       await this.sessions.save(session);
+
+      const amountInWei = await this.amountService.resolve(
+        session,
+        report.summary.liquidityWbnb ?? 0n,
+      );
+      if (amountInWei === null) {
+        await this.reject(
+          session,
+          'Aucun montant d\'entrée admissible (minimum non atteint).',
+        );
+        return;
+      }
+
       try {
-        session.entry = await this.executor.buy(session, config.buyAmountWei);
+        session.entry = await this.executor.buy(session, amountInWei);
         session.status = 'HOLDING';
         session.updatedAtMs = Date.now();
         await this.sessions.save(session);
@@ -205,7 +222,7 @@ export class SessionEngine {
             mode: session.entry.mode,
             pair: session.pair.pair,
             token: session.pair.token,
-            amountInWei: session.entry.amountInWei.toString(),
+            amountInWei: amountInWei.toString(),
             amountOutToken: session.entry.amountOutToken.toString(),
           },
           'Entrée effectuée.',

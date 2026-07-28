@@ -13,9 +13,10 @@ import { TradeExecutor } from './execution/trade-executor.js';
 import { HeartbeatService } from './heartbeat/heartbeat.js';
 import { PairCreatedListener } from './listeners/pair-created.listener.js';
 import { SwapListener } from './listeners/swap.listener.js';
-import { publicClient, wsClient } from './rpc/clients.js';
+import { account, publicClient, wsClient } from './rpc/clients.js';
 import { RiskSettingsStore } from './security/risk-settings.store.js';
 import { TokenRiskService } from './security/token-risk.service.js';
+import { EntryAmountService } from './execution/entry-amount.service.js';
 import { closeDatabase, migrate } from './storage/database.js';
 import { IgnoredAssetRepository } from './storage/ignored-asset.repository.js';
 import {
@@ -78,7 +79,13 @@ async function main(): Promise<void> {
   const metadataService = new TokenMetadataService(publicClient);
   const risk = new TokenRiskService(publicClient, riskSettings);
   const executor = new TradeExecutor(trades);
-  const engine = new SessionEngine(sessions, reports, risk, executor);
+  const amountService = new EntryAmountService({
+    getWalletBalanceWei: async () => {
+      if (!account) return null;
+      return publicClient.getBalance({ address: account.address });
+    },
+  });
+  const engine = new SessionEngine(sessions, reports, risk, executor, amountService);
   const monitors = new Map<string, SwapListener>();
   const activeSessionsByToken = new Map<string, TokenSession>();
   const activeTokenByPair = new Map<string, string>();
