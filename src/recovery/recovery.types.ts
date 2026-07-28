@@ -1,0 +1,83 @@
+import type { Address, Hash } from 'viem';
+import type { ExecutionReceipt } from '../execution/execution.types.js';
+import type {
+  TokenSession,
+  TradeRecord,
+  TradeTransactionRecord,
+} from '../types/domain.js';
+
+export type ChainObservation =
+  | { kind: 'PENDING' }
+  | { kind: 'ABSENT' }
+  | { kind: 'RPC_ERROR'; errorType: string }
+  | { kind: 'RECEIPT'; receipt: ExecutionReceipt };
+
+export type TransactionRecoveryDecision =
+  | { kind: 'RESUME_INTENT' }
+  | { kind: 'WAIT'; reason: string }
+  | { kind: 'MEASURE'; receipt: ExecutionReceipt }
+  | { kind: 'REVERT'; receipt: ExecutionReceipt }
+  | { kind: 'MANUAL_REVIEW'; reason: string };
+
+export interface ReconciliationGateway {
+  observeTransaction(hash: Hash): Promise<ChainObservation>;
+  getNativeBalance(wallet: Address, blockNumber: bigint): Promise<bigint>;
+  getTokenBalance(
+    token: Address,
+    wallet: Address,
+    blockNumber: bigint,
+  ): Promise<bigint>;
+  hasOtherWalletActivityInBlock(
+    wallet: Address,
+    token: Address,
+    blockNumber: bigint,
+    transactionIndex: number,
+  ): Promise<boolean>;
+}
+
+export interface RecoverySnapshot {
+  session: TokenSession;
+  trades: TradeRecord[];
+  transactions: TradeTransactionRecord[];
+}
+
+export interface ClaimedRecovery {
+  owner: string;
+  statusBefore: TokenSession['status'];
+  snapshot: RecoverySnapshot;
+}
+
+export interface RecoveryDecision {
+  idempotencyKey: string;
+  session: TokenSession;
+  action: string;
+  reason: string;
+  retainLease?: boolean;
+  trade?: TradeRecord;
+  transaction?: TradeTransactionRecord;
+}
+
+export interface ReconciliationStore {
+  claimNext(
+    owner: string,
+    leaseMs: number,
+    excludedPairs?: readonly string[],
+    staleAfterMs?: number,
+  ): Promise<ClaimedRecovery | null>;
+  applyDecision(claimed: ClaimedRecovery, decision: RecoveryDecision): Promise<void>;
+  tryAcquirePassLock(): Promise<boolean>;
+  releasePassLock(): Promise<void>;
+  getBacklogCounts(): Promise<{
+    pendingSessions: number;
+    manualReviewSessions: number;
+  }>;
+}
+
+export interface RecoveryIntentExecutor {
+  resumeRiskAndBuy(session: TokenSession): Promise<TokenSession>;
+  resumeBuy(session: TokenSession): Promise<TokenSession>;
+  resumeSell(
+    session: TokenSession,
+    recovered?: { trade: TradeRecord; approvalGasWei: bigint },
+  ): Promise<TokenSession>;
+}

@@ -55,6 +55,13 @@ export class ExecutionRevertedError extends Error {
   }
 }
 
+export class ExecutionRecoverySafetyError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'ExecutionRecoverySafetyError';
+  }
+}
+
 export class ExecutionMeasurementError extends Error {
   readonly executionToReconcile: ExecutionReconciliationReference | undefined;
 
@@ -216,14 +223,43 @@ export class TradeExecutor {
     });
   }
 
-  async sell(session: TokenSession): Promise<ExitExecution> {
+  async sell(
+    session: TokenSession,
+    recovered?: { trade: TradeRecord; approvalGasWei: bigint },
+  ): Promise<ExitExecution> {
     return this.queue.run(async () => {
       const positionAmount = session.entry?.amountOutToken ?? 0n;
       if (positionAmount <= 0n) throw new Error('Aucun token à vendre.');
 
-      const trade = this.newTrade(session, 'SELL', positionAmount);
+      const trade = recovered?.trade ?? this.newTrade(session, 'SELL', positionAmount);
+      if (
+        trade.side !== 'SELL'
+        || trade.mode !== this.mode
+        || trade.pair.toLowerCase() !== session.pair.pair.toLowerCase()
+        || trade.token.toLowerCase() !== session.pair.token.toLowerCase()
+      ) {
+        throw new Error('Trade de vente récupéré incompatible avec la session.');
+      }
+      trade.status = 'CREATED';
+      trade.amountIn = positionAmount;
+      if (recovered) trade.gasCostWei = recovered.approvalGasWei;
       if (session.entry?.tradeId) trade.relatedTradeId = session.entry.tradeId;
       await this.trades.save(trade);
+      let validatedRecoveredWallet: `0x${string}` | null = null;
+      if (recovered && this.mode === 'live') {
+        validatedRecoveredWallet = await this.requireWalletForTrade(trade);
+        if (
+          !trade.walletAddress
+          || trade.walletAddress.toLowerCase()
+            !== validatedRecoveredWallet.toLowerCase()
+        ) {
+          const error = new ExecutionRecoverySafetyError(
+            'Wallet du trade récupéré absent ou différent du wallet live.',
+          );
+          await this.failTrade(trade, error);
+          throw error;
+        }
+      }
       const path = [session.pair.token, session.pair.wbnb] as const;
 
       let quotedAmountOutWei: bigint;
@@ -257,7 +293,8 @@ export class TradeExecutor {
         };
       }
 
-      const wallet = await this.requireWalletForTrade(trade);
+      const wallet =
+        validatedRecoveredWallet ?? await this.requireWalletForTrade(trade);
       trade.walletAddress = wallet;
       try {
         const walletBalance = await this.gateway.getTokenBalance(session.pair.token, wallet);
@@ -271,7 +308,7 @@ export class TradeExecutor {
         throw error;
       }
 
-      let approvalGasWei = 0n;
+      let approvalGasWei = recovered?.approvalGasWei ?? 0n;
       try {
         const allowance = await this.gateway.getAllowance({
           token: session.pair.token,
@@ -279,6 +316,11 @@ export class TradeExecutor {
           spender: session.pair.router,
         });
         if (allowance < positionAmount) {
+          if (recovered) {
+            throw new Error(
+              'Allowance insuffisante après reprise d’un approval confirmé.',
+            );
+          }
           approvalGasWei = await this.approve(
             trade,
             session,

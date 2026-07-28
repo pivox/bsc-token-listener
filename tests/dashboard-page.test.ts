@@ -11,9 +11,13 @@ test('dashboard affiche les champs heartbeat dans la page', () => {
   assert.match(html, /id="heartbeat-active-sessions"/);
   assert.match(html, /id="heartbeat-http-status"/);
   assert.match(html, /id="heartbeat-ws-status"/);
+  assert.match(html, /id="recovery-pending-sessions"/);
+  assert.match(html, /id="recovery-manual-review"/);
+  assert.match(html, /id="recovery-last-completed"/);
   assert.match(html, /snapshot\.heartbeat\.latestBlock/);
   assert.match(html, /snapshot\.heartbeat\.activeSwapMonitors/);
   assert.match(html, /snapshot\.heartbeat\.http\.status/);
+  assert.match(html, /snapshot\.heartbeat\.recovery\.pendingSessions/);
 });
 
 test('dashboard distingue PnL brut, gas, PnL net et simulation', () => {

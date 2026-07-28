@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   ExecutionMeasurementError,
   ExecutionOutcomeUnknownError,
+  ExecutionRecoverySafetyError,
   ExecutionRevertedError,
 } from '../src/execution/trade-executor.js';
 import { requiresExecutionManualReview } from '../src/strategy/execution-failure-policy.js';
@@ -17,6 +18,15 @@ test('demande une revue manuelle pour une diffusion au résultat inconnu', () =>
 test('demande une revue manuelle pour une confirmation non mesurable', () => {
   assert.equal(
     requiresExecutionManualReview(new ExecutionMeasurementError('mesure impossible')),
+    true,
+  );
+});
+
+test('demande une revue manuelle pour une reprise incompatible', () => {
+  assert.equal(
+    requiresExecutionManualReview(
+      new ExecutionRecoverySafetyError('wallet de reprise différent'),
+    ),
     true,
   );
 });

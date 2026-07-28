@@ -107,6 +107,7 @@ export function renderDashboardPage(nonce: string, refreshSeconds: number): stri
       <article class="card"><div class="card-label">Dernier bloc BSC</div><div class="card-value" id="heartbeat-latest-block">—</div><div class="card-note" id="heartbeat-pair-created">Checkpoint pair-created: —</div></article>
       <article class="card"><div class="card-label">Moniteurs / Sessions</div><div class="card-value" id="heartbeat-swap-monitors">—</div><div class="card-note" id="heartbeat-active-sessions">Sessions actives: —</div></article>
       <article class="card"><div class="card-label">Etat RPC</div><div class="card-value" id="heartbeat-http-status">—</div><div class="card-note" id="heartbeat-ws-status">WS : —</div></article>
+      <article class="card"><div class="card-label">Réconciliation</div><div class="card-value" id="recovery-pending-sessions">—</div><div class="card-note" id="recovery-manual-review">Revue manuelle: —</div><div class="card-note" id="recovery-last-completed">Dernière passe: —</div></article>
       <article class="card"><div class="card-label">Solde wallet</div><div class="card-value" id="wallet-balance">—</div><div class="card-note" id="wallet-address">Wallet non configuré</div></article>
       <article class="card"><div class="card-label">Positions ouvertes</div><div class="card-value" id="open-positions">—</div><div class="card-note" id="detected-count">— tokens détectés</div></article>
       <article class="card"><div class="card-label">PnL latent estimé</div><div class="card-value" id="unrealized-pnl">—</div><div class="card-note" id="valuation-note">Cotation PancakeSwap V2</div></article>
@@ -224,6 +225,18 @@ export function renderDashboardPage(nonce: string, refreshSeconds: number): stri
       byId('heartbeat-ws-status').textContent = snapshot.heartbeat
         ? (snapshot.heartbeat.webSocket.status === 'up' ? 'WS: OK' : 'WS: KO')
         : 'WS: —';
+      byId('recovery-pending-sessions').textContent = snapshot.heartbeat
+        ? String(snapshot.heartbeat.recovery.pendingSessions)
+        : '—';
+      byId('recovery-manual-review').textContent = 'Revue manuelle: '
+        + String(snapshot.heartbeat ? snapshot.heartbeat.recovery.manualReviewSessions : 0);
+      byId('recovery-last-completed').textContent = 'Dernière passe: '
+        + (snapshot.heartbeat && snapshot.heartbeat.recovery.lastCompletedAt
+          ? formatDate(snapshot.heartbeat.recovery.lastCompletedAt)
+          : '—');
+      byId('recovery-last-completed').title = snapshot.heartbeat
+        ? (snapshot.heartbeat.recovery.lastErrorType || '')
+        : '';
       byId('bot-status').title = snapshot.heartbeat ? snapshot.heartbeat.generatedAt : '';
       byId('fee-note').textContent = snapshot.feeNote + ' Le dashboard est strictement en lecture seule.';
       byId('sync-label').textContent = 'Actualisé le ' + formatDate(snapshot.generatedAt);

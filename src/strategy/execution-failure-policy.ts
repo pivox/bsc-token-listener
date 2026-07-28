@@ -1,12 +1,14 @@
 import {
   ExecutionMeasurementError,
   ExecutionOutcomeUnknownError,
+  ExecutionRecoverySafetyError,
 } from '../execution/trade-executor.js';
 import type { ExecutionReconciliationReference, TokenSession } from '../types/domain.js';
 
 export function requiresExecutionManualReview(error: unknown): boolean {
   return error instanceof ExecutionOutcomeUnknownError
-    || error instanceof ExecutionMeasurementError;
+    || error instanceof ExecutionMeasurementError
+    || error instanceof ExecutionRecoverySafetyError;
 }
 
 export function executionToReconcile(

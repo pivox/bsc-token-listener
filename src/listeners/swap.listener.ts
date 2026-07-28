@@ -8,6 +8,7 @@ import {
 } from '../storage/repositories.js';
 import { classifySwap } from '../strategy/swap-classifier.js';
 import { SessionEngine } from '../strategy/session-engine.js';
+import { isSessionMonitorable } from '../strategy/session-monitor-policy.js';
 import type { TokenSession } from '../types/domain.js';
 import { errorMessage } from '../utils/error.js';
 import { logger } from '../utils/logger.js';
@@ -60,6 +61,7 @@ export class SwapListener {
     });
 
     await this.reconcile();
+    if (!isSessionMonitorable(this.session)) return;
     this.interval = setInterval(() => {
       void this.tick().catch((error: unknown) =>
         logger.error(
@@ -115,7 +117,8 @@ export class SwapListener {
           fromBlock,
           toBlock,
         });
-        await this.processLogs(logs as SwapLog[]);
+        const remainsActive = await this.processLogs(logs as SwapLog[]);
+        if (!remainsActive) return;
         await this.checkpoints.set(key, toBlock);
         fromBlock = toBlock + 1n;
       }
@@ -124,7 +127,7 @@ export class SwapListener {
     }
   }
 
-  private async processLogs(logs: SwapLog[]): Promise<void> {
+  private async processLogs(logs: SwapLog[]): Promise<boolean> {
     const sorted = [...logs].sort((a, b) => {
       if (a.blockNumber !== b.blockNumber) return (a.blockNumber ?? 0n) < (b.blockNumber ?? 0n) ? -1 : 1;
       if (a.transactionIndex !== b.transactionIndex) return (a.transactionIndex ?? 0) - (b.transactionIndex ?? 0);
@@ -155,12 +158,24 @@ export class SwapListener {
       });
       if (!(await this.events.claim(event))) continue;
       try {
-        await this.engine.onSwap(this.session, event);
+        const consumed = await this.engine.onSwap(this.session, event);
+        if (!consumed) {
+          await this.events.release(event.id);
+          this.stop();
+          this.onTerminal(this.session.pair.pair);
+          return false;
+        }
         await this.events.markProcessed(event.id);
+        if (!isSessionMonitorable(this.session)) {
+          this.stop();
+          this.onTerminal(this.session.pair.pair);
+          return false;
+        }
       } catch (error) {
         await this.events.markFailed(event.id, errorMessage(error));
         throw error;
       }
     }
+    return true;
   }
 }
