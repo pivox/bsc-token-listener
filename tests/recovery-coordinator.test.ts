@@ -162,8 +162,7 @@ test('la passe périodique resynchronise les sessions même après une erreur', 
   });
   const synchronized = deferred();
   let synchronizationCalls = 0;
-  let coordinator: RecoveryCoordinator;
-  coordinator = new RecoveryCoordinator(
+  const coordinator = new RecoveryCoordinator(
     store,
     {
       reconcile: async () => {
@@ -178,15 +177,14 @@ test('la passe périodique resynchronise les sessions même après une erreur', 
       owner: 'worker',
       onPeriodicPassCompleted: async () => {
         synchronizationCalls += 1;
-        coordinator.stop();
         synchronized.resolve();
       },
     },
   );
 
-  coordinator.start();
+  const periodic = coordinator.reconcilePeriodic().catch(() => undefined);
   await synchronized.promise;
-  await new Promise<void>((resolve) => setImmediate(resolve));
+  await periodic;
 
   assert.equal(synchronizationCalls, 1);
   assert.equal(coordinator.currentStatus.lastErrorType, 'RpcUnavailableError');

@@ -77,7 +77,7 @@ export class RecoveryCoordinator {
   start(): void {
     if (this.interval) return;
     this.interval = setInterval(() => {
-      void this.runPeriodicPass().catch((error: unknown) => {
+      void this.reconcilePeriodic().catch((error: unknown) => {
         logger.error(
           { errorType: safeErrorType(error) },
           'Passe périodique de réconciliation échouée.',
@@ -87,7 +87,7 @@ export class RecoveryCoordinator {
     this.interval.unref();
   }
 
-  private runPeriodicPass(): Promise<void> {
+  reconcilePeriodic(): Promise<void> {
     if (this.periodicPass) return this.periodicPass;
     const pass = (async () => {
       try {
