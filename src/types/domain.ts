@@ -92,6 +92,13 @@ export interface ExecutionReconciliationReference {
   recordedAtMs: number;
 }
 
+export interface SessionRecoveryDiagnostic {
+  attempts: number;
+  lastAction: string;
+  lastReason: string;
+  lastAttemptAtMs: number;
+}
+
 export interface TokenSession {
   pair: PairInfo;
   metadata: TokenMetadata;
@@ -101,6 +108,7 @@ export interface TokenSession {
   entry?: EntryExecution;
   exit?: ExitExecution;
   unreconciledExecution?: ExecutionReconciliationReference;
+  recovery?: SessionRecoveryDiagnostic;
   subsequentBuyCount: number;
   targetBuysAfterEntry: number;
   countedBuyTransactionHashes: Hash[];
