@@ -154,11 +154,15 @@ export class MonitorScheduler {
 
     eligible.sort(compareMonitorPriority);
     let abandonedSessions = 0;
+    let reservedFailedHoldingSlots = 0;
     for (const session of eligible) {
       const activePairs = this.activePairKeys();
       const pairKey = session.pair.pair.toLowerCase();
       if (activePairs.has(pairKey)) continue;
-      if (activePairs.size >= this.dependencies.capacity) break;
+      if (
+        activePairs.size + reservedFailedHoldingSlots
+        >= this.dependencies.capacity
+      ) break;
       if (this.dependencies.canStart && !this.dependencies.canStart()) break;
 
       try {
@@ -172,6 +176,7 @@ export class MonitorScheduler {
         );
       } catch (error) {
         abandonedSessions += 1;
+        if (session.status === 'HOLDING') reservedFailedHoldingSlots += 1;
         logger.warn(
           {
             pair: session.pair.pair,

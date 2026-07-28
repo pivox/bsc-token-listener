@@ -36,6 +36,11 @@ are not admitted.
 6. admits candidates while capacity remains;
 7. continues with the next candidate if one listener fails to start.
 
+A failed `WAITING_FIRST_BUY` admission does not reserve capacity, so the next
+waiting candidate is attempted. A failed `HOLDING` admission reserves its slot
+for the pass: an open position can never lose safety priority to a lower
+priority observation.
+
 The scheduler reserves a pair before awaiting listener startup. This prevents
 two local monitor starts for the same pair. Listener termination releases the
 reservation and triggers another serialized pass.
@@ -60,6 +65,8 @@ expiration, ignored removal, startup failure and capacity release.
 
 - A listener startup error never blocks the next candidate.
 - Failed candidates remain persisted and become retryable on a later pass.
+- Ignored decisions reload the persisted session under the pair lock before
+  mutating it, so an in-flight entry cannot be overwritten by a stale snapshot.
 - Expiration is persisted before admission.
 - No RPC failure advances a blockchain checkpoint.
 - The monitor cap is never increased automatically.

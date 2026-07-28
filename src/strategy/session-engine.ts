@@ -67,16 +67,19 @@ export class SessionEngine {
 
   async ignoreManually(session: TokenSession): Promise<TokenSession> {
     return this.withLock(session, async () => {
-      if (session.entry && !session.exit) {
+      const current = await this.sessions.findByPair(session.pair.pair);
+      if (!current) throw new Error('Session introuvable.');
+      if (current.entry && !current.exit) {
         throw new Error('Une position ouverte ne peut pas être ignorée; vendez-la d’abord.');
       }
-      if (!['WAITING_FIRST_BUY', 'REJECTED', 'EXPIRED'].includes(session.status)) {
-        throw new Error(`Actif impossible à ignorer depuis le statut ${session.status}.`);
+      if (!['WAITING_FIRST_BUY', 'REJECTED', 'EXPIRED'].includes(current.status)) {
+        throw new Error(`Actif impossible à ignorer depuis le statut ${current.status}.`);
       }
-      session.status = 'REJECTED';
-      session.rejectionReason = 'Actif ignoré manuellement depuis le dashboard local.';
-      session.updatedAtMs = Date.now();
-      await this.sessions.save(session);
+      current.status = 'REJECTED';
+      current.rejectionReason = 'Actif ignoré manuellement depuis le dashboard local.';
+      current.updatedAtMs = Date.now();
+      await this.sessions.save(current);
+      this.replaceSession(session, current);
       logger.warn(
         { pair: session.pair.pair, token: session.pair.token },
         'Actif placé dans la liste d’ignorance depuis le dashboard local.',
@@ -91,15 +94,22 @@ export class SessionEngine {
 
   async expireIfNeeded(session: TokenSession): Promise<boolean> {
     return this.withLock(session, async () => {
-      if (session.status !== 'WAITING_FIRST_BUY') return false;
+      const current = await this.sessions.findByPair(session.pair.pair);
+      if (!current || current.status !== 'WAITING_FIRST_BUY') return false;
       const ttlMs = config.pairMonitorTtlMinutes * 60_000;
-      if (Date.now() - session.createdAtMs < ttlMs) return false;
-      session.status = 'EXPIRED';
-      session.updatedAtMs = Date.now();
-      session.rejectionReason = 'Aucun premier achat avant expiration du moniteur.';
-      await this.sessions.save(session);
+      if (Date.now() - current.createdAtMs < ttlMs) return false;
+      current.status = 'EXPIRED';
+      current.updatedAtMs = Date.now();
+      current.rejectionReason = 'Aucun premier achat avant expiration du moniteur.';
+      await this.sessions.save(current);
+      this.replaceSession(session, current);
       return true;
     });
+  }
+
+  private replaceSession(target: TokenSession, source: TokenSession): void {
+    for (const key of Object.keys(target)) Reflect.deleteProperty(target, key);
+    Object.assign(target, structuredClone(source));
   }
 
   private async withLock<T>(session: TokenSession, operation: () => Promise<T>): Promise<T> {

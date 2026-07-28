@@ -193,10 +193,12 @@ déterministe et orientée sécurité :
 3. adresse de paire comme dernier critère stable.
 
 Le plafond n’est jamais augmenté automatiquement. Une erreur au démarrage d’un
-listener laisse la session en file pour une nouvelle tentative et n’empêche pas
-l’admission de la suivante. Les sessions `WAITING_FIRST_BUY` expirent après
-`PAIR_MONITOR_TTL_MINUTES`, même sans avoir obtenu de listener. Les actifs
-ignorés et les sessions terminales sont retirés de la file.
+listener laisse la session en file pour une nouvelle tentative. Un échec
+`WAITING_FIRST_BUY` n’empêche pas l’admission de la suivante ; un échec
+`HOLDING` réserve en revanche sa place afin qu’une position ouverte ne soit
+jamais évincée par une simple observation. Les sessions `WAITING_FIRST_BUY`
+expirent après `PAIR_MONITOR_TTL_MINUTES`, même sans avoir obtenu de listener.
+Les actifs ignorés et les sessions terminales sont retirés de la file.
 
 Le heartbeat et le dashboard exposent la capacité totale, les moniteurs actifs,
 la profondeur de file, les admissions échouées lors de la dernière passe et

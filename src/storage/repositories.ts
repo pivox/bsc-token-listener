@@ -57,6 +57,15 @@ export class SessionRepository {
     return result.rows.map((row) => parseJson<TokenSession>(row.payload));
   }
 
+  async findByPair(pair: Address): Promise<TokenSession | null> {
+    const result = await this.database.query<{ payload: unknown }>(
+      'SELECT payload FROM token_sessions WHERE pair_address = $1',
+      [pair.toLowerCase()],
+    );
+    const row = result.rows[0];
+    return row ? parseJson<TokenSession>(row.payload) : null;
+  }
+
   async countOpenPositions(): Promise<number> {
     const result = await this.database.query<{ count: string }>(
       `SELECT COUNT(*)::text AS count FROM token_sessions

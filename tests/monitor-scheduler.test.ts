@@ -289,3 +289,20 @@ test('continue après une erreur de démarrage et expose l’abandon', async () 
   assert.equal(scheduler.currentStatus.abandonedSessions, 1);
   assert.equal(scheduler.currentStatus.activeMonitors, 1);
 });
+
+test('réserve la capacité après l’échec d’une position HOLDING', async () => {
+  const harness = new Harness();
+  harness.sessions = [
+    session('1', 'HOLDING', 9_500),
+    session('2', 'WAITING_FIRST_BUY', 9_600),
+  ];
+  harness.startFailures.add(harness.sessions[0]!.pair.pair);
+  const scheduler = harness.scheduler(1);
+
+  await scheduler.reconcile();
+
+  assert.deepEqual(harness.starts, [harness.sessions[0]!.pair.pair]);
+  assert.equal(scheduler.currentStatus.abandonedSessions, 1);
+  assert.equal(scheduler.currentStatus.activeMonitors, 0);
+  assert.equal(scheduler.currentStatus.waitingSessions, 2);
+});
