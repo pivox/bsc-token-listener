@@ -6,6 +6,17 @@ export interface CanonicalBlock {
   parentHash: Hash;
 }
 
+export interface CanonicalBlockReader {
+  getBlockNumber(): Promise<bigint>;
+  getBlock(blockNumber: bigint): Promise<CanonicalBlock>;
+}
+
+export interface ConfirmedRangeRequest {
+  listenerKey: string;
+  startBlock: bigint;
+  processChunk(fromBlock: bigint, toBlock: bigint): Promise<boolean>;
+}
+
 export interface AnchoredListenerCheckpoint {
   blockNumber: bigint;
   blockHash: Hash;
