@@ -499,6 +499,9 @@ test('refuse de reprendre un approval appartenant à un autre wallet', async () 
   const otherWallet = `0x${'a'.repeat(40)}` as Address;
   const store = new MemoryTradeStore();
   const gateway = new FakeExecutionGateway(otherWallet);
+  gateway.quote = async () => {
+    throw new Error('quote RPC indisponible');
+  };
   const openSession = session();
   openSession.status = 'SELL_PENDING';
   openSession.entry = {

@@ -245,6 +245,21 @@ export class TradeExecutor {
       if (recovered) trade.gasCostWei = recovered.approvalGasWei;
       if (session.entry?.tradeId) trade.relatedTradeId = session.entry.tradeId;
       await this.trades.save(trade);
+      let validatedRecoveredWallet: `0x${string}` | null = null;
+      if (recovered && this.mode === 'live') {
+        validatedRecoveredWallet = await this.requireWalletForTrade(trade);
+        if (
+          !trade.walletAddress
+          || trade.walletAddress.toLowerCase()
+            !== validatedRecoveredWallet.toLowerCase()
+        ) {
+          const error = new ExecutionRecoverySafetyError(
+            'Wallet du trade récupéré absent ou différent du wallet live.',
+          );
+          await this.failTrade(trade, error);
+          throw error;
+        }
+      }
       const path = [session.pair.token, session.pair.wbnb] as const;
 
       let quotedAmountOutWei: bigint;
@@ -278,20 +293,8 @@ export class TradeExecutor {
         };
       }
 
-      const wallet = await this.requireWalletForTrade(trade);
-      if (
-        recovered
-        && (
-          !trade.walletAddress
-          || trade.walletAddress.toLowerCase() !== wallet.toLowerCase()
-        )
-      ) {
-        const error = new ExecutionRecoverySafetyError(
-          'Wallet du trade récupéré absent ou différent du wallet live.',
-        );
-        await this.failTrade(trade, error);
-        throw error;
-      }
+      const wallet =
+        validatedRecoveredWallet ?? await this.requireWalletForTrade(trade);
       trade.walletAddress = wallet;
       try {
         const walletBalance = await this.gateway.getTokenBalance(session.pair.token, wallet);
