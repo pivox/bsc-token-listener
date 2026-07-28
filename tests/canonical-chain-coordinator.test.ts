@@ -4,14 +4,18 @@ import type { Hash } from 'viem';
 import {
   CanonicalChainContinuityError,
   CanonicalChainCoordinator,
+  DeepReorgError,
   DEFAULT_CANONICAL_RETENTION,
 } from '../src/chain/canonical-chain.coordinator.js';
 import type {
   CanonicalChainCoordinatorOptions,
+  CanonicalReorgHandler,
+  ReorgReconciliation,
 } from '../src/chain/canonical-chain.coordinator.js';
 import type {
   CanonicalBlock,
   ListenerCheckpoint,
+  ReorgImpact,
 } from '../src/chain/canonical-chain.types.js';
 
 function hash(number: bigint): Hash {
@@ -44,6 +48,24 @@ class MemoryBlockReader {
       throw new Error(`RPC indisponible au bloc ${blockNumber}`);
     }
     return block(blockNumber);
+  }
+}
+
+class MemoryReorgHandler implements CanonicalReorgHandler {
+  readonly calls: ReorgReconciliation[] = [];
+  readonly events: string[] = [];
+  impact: ReorgImpact = {
+    depth: 0,
+    orphanedEvents: 0,
+    replayedEvents: 0,
+  };
+  onReconcile: ((reorg: ReorgReconciliation) => Promise<void>) | null = null;
+
+  async reconcileReorg(reorg: ReorgReconciliation): Promise<ReorgImpact> {
+    this.calls.push(reorg);
+    this.events.push('handler');
+    await this.onReconcile?.(reorg);
+    return { ...this.impact, depth: reorg.depth };
   }
 }
 
@@ -153,17 +175,38 @@ function coordinator(
   reader: MemoryBlockReader,
   canonicalStore = new MemoryCanonicalStore(),
   checkpoints = new MemoryCheckpoints(),
-  options: { confirmations?: number; chunkSize?: number } = {},
+  options: {
+    confirmations?: number;
+    chunkSize?: number;
+    reorgHandler?: CanonicalReorgHandler;
+  } = {},
 ): CanonicalChainCoordinator {
   return new CanonicalChainCoordinator({
     blockReader: reader,
     canonicalStore,
     checkpoints,
+    reorgHandler: options.reorgHandler ?? new MemoryReorgHandler(),
     confirmations: options.confirmations ?? 5,
     ...(options.chunkSize === undefined
       ? {}
       : { chunkSize: options.chunkSize }),
   });
+}
+
+function forkedBlock(
+  number: bigint,
+  ancestor: bigint,
+  salt = 10_000n,
+): CanonicalBlock {
+  if (number <= ancestor) return block(number);
+  return {
+    number,
+    hash: hash(salt + number),
+    parentHash:
+      number === ancestor + 1n
+        ? block(ancestor).hash
+        : hash(salt + number - 1n),
+  };
 }
 
 test('refuse des confirmations hors de la plage sûre 1 à 100', () => {
@@ -195,6 +238,7 @@ test('ignore toute ancienne option runtime et impose une rétention de 128', asy
     blockReader: reader,
     canonicalStore,
     checkpoints,
+    reorgHandler: new MemoryReorgHandler(),
     confirmations: 5,
     retention: 1,
   };
@@ -294,7 +338,7 @@ test('réutilise le journal partagé sans nouvelle persistence pour un second li
 
   assert.equal(
     reader.reads.length,
-    readsAfterFirstListener + 16,
+    readsAfterFirstListener + 1,
   );
   assert.equal(canonicalStore.saves.length, 1);
 });
@@ -447,6 +491,8 @@ test('sérialise strictement les listeners et conserve la queue après un échec
   assert.deepEqual(subject.currentStatus, {
     running: false,
     pendingRequests: 0,
+    state: 'HEALTHY',
+    lastReorg: null,
   });
 });
 
@@ -701,7 +747,7 @@ test('revalide par RPC les headers cachés du tip avant tout traitement', async 
   assert.deepEqual(checkpoints.writes, []);
 });
 
-test('revalide la fenêtre canonique même quand tip et checkpoint sont au head', async () => {
+test('fait confiance au hash du tip confirmé sans rescanner ses ancêtres', async () => {
   const reader = new MemoryBlockReader(20n);
   const originalGetBlock = reader.getBlock.bind(reader);
   reader.getBlock = async (number) => {
@@ -718,19 +764,13 @@ test('revalide la fenêtre canonique même quand tip et checkpoint sont au head'
   });
   const subject = coordinator(reader, canonicalStore, checkpoints);
 
-  await assert.rejects(
-    subject.reconcile({
-      listenerKey: 'pairs',
-      startBlock: 1n,
-      processChunk: async () => true,
-    }),
-    CanonicalChainContinuityError,
-  );
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 1n,
+    processChunk: async () => true,
+  });
 
-  assert.deepEqual(reader.reads, [
-    0n, 1n, 2n, 3n, 4n, 5n, 6n, 7n,
-    8n, 9n, 10n,
-  ]);
+  assert.deepEqual(reader.reads, [15n]);
   assert.deepEqual(canonicalStore.saves, []);
   assert.deepEqual(canonicalStore.pruneCalls, []);
   assert.deepEqual(checkpoints.writes, []);
@@ -776,6 +816,7 @@ test('préserve l’erreur RPC primaire malgré les erreurs de cleanup', async (
     blockReader: reader,
     canonicalStore,
     checkpoints,
+    reorgHandler: new MemoryReorgHandler(),
     confirmations: 5,
     headerSpoolFactory: factory,
     onCleanupError: (errorType: string) => {
@@ -811,6 +852,7 @@ test('une erreur de cleanup ne fait pas échouer un checkpoint déjà commité',
     blockReader: reader,
     canonicalStore,
     checkpoints,
+    reorgHandler: new MemoryReorgHandler(),
     confirmations: 5,
     headerSpoolFactory: factory,
     onCleanupError: (errorType: string) => {
@@ -853,5 +895,288 @@ test('rejette un header RPC sans numéro ou hash sans mutation', async () => {
   );
 
   assert.deepEqual(canonicalStore.saves, []);
+  assert.deepEqual(checkpoints.writes, []);
+});
+
+test('ignore un reorg limité aux blocs non confirmés', async () => {
+  const reader = new MemoryBlockReader(20n);
+  const originalGetBlock = reader.getBlock.bind(reader);
+  reader.getBlock = async (number) =>
+    number > 15n
+      ? forkedBlock(number, 15n)
+      : originalGetBlock(number);
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 16 }, (_, index) => block(BigInt(index))),
+  );
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', {
+    blockNumber: 15n,
+    blockHash: block(15n).hash,
+  });
+  const reorgHandler = new MemoryReorgHandler();
+  const subject = coordinator(reader, canonicalStore, checkpoints, {
+    reorgHandler,
+  });
+
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 1n,
+    processChunk: async () => true,
+  });
+
+  assert.equal(reorgHandler.calls.length, 0);
+  assert.equal(subject.currentStatus.state, 'HEALTHY');
+});
+
+test('réconcilie depuis l’ancêtre commun avant tout chunk ou checkpoint', async () => {
+  const reader = new MemoryBlockReader(115n);
+  const originalGetBlock = reader.getBlock.bind(reader);
+  reader.getBlock = async (number) =>
+    number > 106n
+      ? forkedBlock(number, 106n)
+      : originalGetBlock(number);
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 11 }, (_, index) => block(BigInt(100 + index))),
+  );
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', {
+    blockNumber: 110n,
+    blockHash: block(110n).hash,
+  });
+  const reorgHandler = new MemoryReorgHandler();
+  const events: string[] = [];
+  reorgHandler.onReconcile = async ({ ancestor }) => {
+    assert.equal(subject.currentStatus.state, 'RECONCILING');
+    assert.deepEqual(checkpoints.writes, []);
+    assert.equal(events.length, 0);
+    for (const number of canonicalStore.blocks.keys()) {
+      if (ancestor && number > ancestor.number) {
+        canonicalStore.blocks.delete(number);
+      }
+    }
+    if (ancestor) {
+      checkpoints.values.set('pairs', {
+        blockNumber: ancestor.number,
+        blockHash: ancestor.hash,
+      });
+    }
+  };
+  const subject = coordinator(reader, canonicalStore, checkpoints, {
+    reorgHandler,
+  });
+
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 100n,
+    processChunk: async () => {
+      events.push('chunk');
+      return true;
+    },
+  });
+
+  assert.equal(reorgHandler.calls.length, 1);
+  assert.deepEqual(reorgHandler.calls[0], {
+    ancestor: block(106n),
+    oldTip: block(110n),
+    newTip: forkedBlock(110n, 106n),
+    depth: 4,
+  });
+  assert.deepEqual(events, []);
+  assert.deepEqual(checkpoints.writes, []);
+  assert.equal(subject.currentStatus.state, 'HEALTHY');
+  assert.equal(subject.currentStatus.lastReorg?.depth, 4);
+});
+
+test('une erreur RPC pendant le préflight ou la recherche d’ancêtre ne mute rien', async () => {
+  for (const failure of [
+    { name: 'tip', failAt: 110n, latest: 115n },
+    { name: 'ancestor', failAt: 108n, latest: 115n },
+    { name: 'new-tip', failAt: 112n, latest: 117n },
+  ]) {
+    const reader = new MemoryBlockReader(failure.latest);
+    const originalGetBlock = reader.getBlock.bind(reader);
+    reader.getBlock = async (number) => {
+      if (number === failure.failAt) {
+        throw new Error(`RPC ${failure.name}`);
+      }
+      return number > 106n
+        ? forkedBlock(number, 106n)
+        : originalGetBlock(number);
+    };
+    const initial = Array.from(
+      { length: 11 },
+      (_, index) => block(BigInt(100 + index)),
+    );
+    const canonicalStore = new MemoryCanonicalStore(initial);
+    const checkpoints = new MemoryCheckpoints();
+    checkpoints.values.set('pairs', {
+      blockNumber: 110n,
+      blockHash: block(110n).hash,
+    });
+    const beforeBlocks = [...canonicalStore.blocks.entries()];
+    const beforeCheckpoints = [...checkpoints.values.entries()];
+    const reorgHandler = new MemoryReorgHandler();
+    const subject = coordinator(reader, canonicalStore, checkpoints, {
+      reorgHandler,
+    });
+
+    await assert.rejects(
+      subject.reconcile({
+        listenerKey: 'pairs',
+        startBlock: 100n,
+        processChunk: async () => true,
+      }),
+      new RegExp(`RPC ${failure.name}`, 'u'),
+    );
+
+    assert.equal(reorgHandler.calls.length, 0, failure.name);
+    assert.deepEqual([...canonicalStore.blocks.entries()], beforeBlocks);
+    assert.deepEqual([...checkpoints.values.entries()], beforeCheckpoints);
+    assert.deepEqual(canonicalStore.saves, []);
+    assert.deepEqual(canonicalStore.pruneCalls, []);
+    assert.deepEqual(checkpoints.writes, []);
+  }
+});
+
+test('refuse des headers RPC provenant de forks différents pendant le scan', async () => {
+  const reader = new MemoryBlockReader(117n);
+  reader.getBlock = async (number) =>
+    number <= 110n
+      ? forkedBlock(number, 106n, 10_000n)
+      : forkedBlock(number, 106n, 20_000n);
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 11 }, (_, index) => block(BigInt(100 + index))),
+  );
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', {
+    blockNumber: 110n,
+    blockHash: block(110n).hash,
+  });
+  const reorgHandler = new MemoryReorgHandler();
+  const subject = coordinator(reader, canonicalStore, checkpoints, {
+    reorgHandler,
+  });
+
+  await assert.rejects(
+    subject.reconcile({
+      listenerKey: 'pairs',
+      startBlock: 100n,
+      processChunk: async () => true,
+    }),
+    CanonicalChainContinuityError,
+  );
+
+  assert.equal(reorgHandler.calls.length, 0);
+  assert.deepEqual(canonicalStore.saves, []);
+  assert.deepEqual(canonicalStore.pruneCalls, []);
+  assert.deepEqual(checkpoints.writes, []);
+});
+
+test('passe en revue manuelle sans ancêtre et bloque les passes suivantes', async () => {
+  const reader = new MemoryBlockReader(132n);
+  reader.getBlock = async (number) => ({
+    number,
+    hash: hash(20_000n + number),
+    parentHash:
+      number === 0n ? ZERO_HASH : hash(20_000n + number - 1n),
+  });
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 128 }, (_, index) => block(BigInt(index))),
+  );
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', {
+    blockNumber: 127n,
+    blockHash: block(127n).hash,
+  });
+  const reorgHandler = new MemoryReorgHandler();
+  const subject = coordinator(reader, canonicalStore, checkpoints, {
+    reorgHandler,
+  });
+  let processCalls = 0;
+  const request = {
+    listenerKey: 'pairs',
+    startBlock: 0n,
+    processChunk: async () => {
+      processCalls += 1;
+      return true;
+    },
+  };
+
+  await assert.rejects(subject.reconcile(request), DeepReorgError);
+
+  assert.equal(reorgHandler.calls.length, 1);
+  assert.equal(reorgHandler.calls[0]?.ancestor, null);
+  assert.equal(reorgHandler.calls[0]?.depth, null);
+  assert.equal(subject.currentStatus.state, 'MANUAL_REVIEW');
+  const readsAfterDetection = reader.reads.length;
+
+  await subject.reconcile(request);
+
+  assert.equal(processCalls, 0);
+  assert.equal(reader.reads.length, readsAfterDetection);
+  assert.equal(reorgHandler.calls.length, 1);
+});
+
+test('un nouveau coordinator détecte un journal persistant divergent', async () => {
+  const reader = new MemoryBlockReader(115n);
+  const originalGetBlock = reader.getBlock.bind(reader);
+  reader.getBlock = async (number) =>
+    number > 106n
+      ? forkedBlock(number, 106n)
+      : originalGetBlock(number);
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 11 }, (_, index) => block(BigInt(100 + index))),
+  );
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', {
+    blockNumber: 110n,
+    blockHash: block(110n).hash,
+  });
+  const reorgHandler = new MemoryReorgHandler();
+
+  const restarted = coordinator(reader, canonicalStore, checkpoints, {
+    reorgHandler,
+  });
+  await restarted.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 100n,
+    processChunk: async () => {
+      assert.fail('aucun chunk avant le rewind au redémarrage');
+    },
+  });
+
+  assert.equal(reorgHandler.calls.length, 1);
+  assert.equal(reorgHandler.calls[0]?.ancestor?.number, 106n);
+  assert.equal(reorgHandler.calls[0]?.depth, 4);
+});
+
+test('ne déduit aucun reorg lorsque le tip stocké dépasse le head confirmé', async () => {
+  const reader = new MemoryBlockReader(110n);
+  const canonicalStore = new MemoryCanonicalStore([block(110n)]);
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', {
+    blockNumber: 100n,
+    blockHash: block(100n).hash,
+  });
+  const reorgHandler = new MemoryReorgHandler();
+  const subject = coordinator(reader, canonicalStore, checkpoints, {
+    reorgHandler,
+  });
+  let processCalls = 0;
+
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 1n,
+    processChunk: async () => {
+      processCalls += 1;
+      return true;
+    },
+  });
+
+  assert.equal(processCalls, 0);
+  assert.equal(reorgHandler.calls.length, 0);
+  assert.deepEqual(reader.reads, []);
+  assert.deepEqual(canonicalStore.saves, []);
+  assert.deepEqual(canonicalStore.pruneCalls, []);
   assert.deepEqual(checkpoints.writes, []);
 });

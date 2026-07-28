@@ -14,8 +14,12 @@ import type {
   AnchoredListenerCheckpoint,
   CanonicalBlock,
   CanonicalBlockReader,
+  CanonicalChainState,
+  CanonicalReorgHandler,
+  CanonicalReorgSummary,
   ConfirmedRangeRequest,
   ListenerCheckpoint,
+  ReorgReconciliation,
 } from './canonical-chain.types.js';
 import { confirmedHead } from './confirmed-blocks.js';
 import { logger } from '../utils/logger.js';
@@ -54,6 +58,7 @@ export interface CanonicalChainCoordinatorOptions {
   blockReader: CanonicalBlockReader;
   canonicalStore: CanonicalChainStore;
   checkpoints: ListenerCheckpointStore;
+  reorgHandler: CanonicalReorgHandler;
   confirmations?: number;
   chunkSize?: number;
   headerSpoolFactory?: CanonicalHeaderSpoolFactory;
@@ -63,12 +68,28 @@ export interface CanonicalChainCoordinatorOptions {
 export interface CanonicalChainCoordinatorStatus {
   running: boolean;
   pendingRequests: number;
+  state: CanonicalChainState;
+  lastReorg: CanonicalReorgSummary | null;
 }
+
+export type {
+  CanonicalReorgHandler,
+  ReorgReconciliation,
+} from './canonical-chain.types.js';
 
 export class CanonicalChainContinuityError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'CanonicalChainContinuityError';
+  }
+}
+
+export class DeepReorgError extends CanonicalChainContinuityError {
+  constructor() {
+    super(
+      `Aucun ancêtre canonique trouvé dans les ${DEFAULT_CANONICAL_RETENTION} derniers blocs.`,
+    );
+    this.name = 'DeepReorgError';
   }
 }
 
@@ -252,6 +273,7 @@ export class CanonicalChainCoordinator {
   private readonly blockReader: CanonicalBlockReader;
   private readonly canonicalStore: CanonicalChainStore;
   private readonly checkpoints: ListenerCheckpointStore;
+  private readonly reorgHandler: CanonicalReorgHandler;
   private readonly confirmations: number;
   private readonly chunkSize: bigint;
   private readonly headerSpoolFactory: CanonicalHeaderSpoolFactory;
@@ -260,12 +282,15 @@ export class CanonicalChainCoordinator {
   private status: CanonicalChainCoordinatorStatus = {
     running: false,
     pendingRequests: 0,
+    state: 'HEALTHY',
+    lastReorg: null,
   };
 
   constructor(options: CanonicalChainCoordinatorOptions) {
     this.blockReader = options.blockReader;
     this.canonicalStore = options.canonicalStore;
     this.checkpoints = options.checkpoints;
+    this.reorgHandler = options.reorgHandler;
     this.headerSpoolFactory =
       options.headerSpoolFactory ?? DEFAULT_HEADER_SPOOL_FACTORY;
     this.onCleanupError = options.onCleanupError;
@@ -300,6 +325,7 @@ export class CanonicalChainCoordinator {
         await this.execute(request);
       } finally {
         this.status = {
+          ...this.status,
           running: false,
           pendingRequests: this.status.pendingRequests - 1,
         };
@@ -314,9 +340,14 @@ export class CanonicalChainCoordinator {
   }
 
   private async execute(request: ConfirmedRangeRequest): Promise<void> {
+    if (this.status.state === 'MANUAL_REVIEW') return;
+
     const latestBlock = await this.blockReader.getBlockNumber();
     const head = confirmedHead(latestBlock, this.confirmations);
     if (head === null) return;
+
+    const tip = await this.canonicalStore.getCanonicalTip();
+    if (tip && tip.number > head) return;
 
     const checkpoint = await this.checkpoints.get(request.listenerKey);
     if (
@@ -326,13 +357,22 @@ export class CanonicalChainCoordinator {
       return;
     }
 
-    const [oldestCheckpointBefore, tip, descending] = await Promise.all([
+    const [oldestCheckpointBefore, descending] = await Promise.all([
       this.checkpoints.getOldestBlockNumber(),
-      this.canonicalStore.getCanonicalTip(),
       this.canonicalStore.listCanonicalDescending(
         DEFAULT_CANONICAL_RETENTION,
       ),
     ]);
+    if (tip) {
+      const remoteTip = validateHeader(
+        await this.blockReader.getBlock(tip.number),
+        tip.number,
+      );
+      if (remoteTip.hash.toLowerCase() !== tip.hash.toLowerCase()) {
+        await this.reconcileDivergence(tip, remoteTip, descending, head);
+        return;
+      }
+    }
     const knownHeaders = new Map<bigint, CanonicalBlock>();
     for (const header of descending) {
       knownHeaders.set(
@@ -428,6 +468,124 @@ export class CanonicalChainCoordinator {
     }
   }
 
+  private async reconcileDivergence(
+    oldTip: CanonicalBlock,
+    remoteOldTip: CanonicalBlock,
+    descending: CanonicalBlock[],
+    head: bigint,
+  ): Promise<void> {
+    const window = this.validateDescendingWindow(oldTip, descending);
+    const newTip =
+      head === oldTip.number
+        ? remoteOldTip
+        : validateHeader(await this.blockReader.getBlock(head), head);
+    const remoteHeaders = new Map<bigint, CanonicalBlock>([
+      [oldTip.number, remoteOldTip],
+      [head, newTip],
+    ]);
+    let newerRemote = newTip;
+    for (
+      let number = head - 1n;
+      number >= oldTip.number;
+      number -= 1n
+    ) {
+      const remote =
+        number === oldTip.number
+          ? remoteOldTip
+          : validateHeader(
+              await this.blockReader.getBlock(number),
+              number,
+            );
+      assertContinuous(remote, newerRemote);
+      remoteHeaders.set(number, remote);
+      newerRemote = remote;
+    }
+    let ancestor: CanonicalBlock | null = null;
+    for (const stored of window) {
+      const remote =
+        remoteHeaders.get(stored.number)
+        ?? validateHeader(
+              await this.blockReader.getBlock(stored.number),
+              stored.number,
+            );
+      if (stored.number < oldTip.number) {
+        assertContinuous(remote, newerRemote);
+      }
+      if (remote.hash.toLowerCase() === stored.hash.toLowerCase()) {
+        ancestor = stored;
+        break;
+      }
+      newerRemote = remote;
+    }
+
+    const depth = ancestor
+      ? this.reorgDepth(oldTip.number - ancestor.number)
+      : null;
+    const reorg: ReorgReconciliation = {
+      ancestor,
+      oldTip,
+      newTip,
+      depth,
+    };
+    this.status = { ...this.status, state: 'RECONCILING' };
+    try {
+      const impact = await this.reorgHandler.reconcileReorg(reorg);
+      this.status = {
+        ...this.status,
+        state: ancestor ? 'HEALTHY' : 'MANUAL_REVIEW',
+        lastReorg: { ...reorg, impact },
+      };
+    } catch (error: unknown) {
+      if (!ancestor) {
+        this.status = { ...this.status, state: 'MANUAL_REVIEW' };
+      }
+      throw error;
+    }
+    if (!ancestor) throw new DeepReorgError();
+  }
+
+  private validateDescendingWindow(
+    tip: CanonicalBlock,
+    descending: CanonicalBlock[],
+  ): CanonicalBlock[] {
+    if (descending.length === 0) {
+      return [validateHeader(tip, tip.number)];
+    }
+    const window = descending.map((header) =>
+      validateHeader(header, header.number));
+    if (!sameHeader(window[0] as CanonicalBlock, tip)) {
+      throw new CanonicalChainContinuityError(
+        'La fenêtre canonique ne commence pas au tip stocké.',
+      );
+    }
+    for (let index = 1; index < window.length; index += 1) {
+      const newer = window[index - 1] as CanonicalBlock;
+      const older = window[index] as CanonicalBlock;
+      if (
+        newer.number !== older.number + 1n
+        || newer.parentHash.toLowerCase() !== older.hash.toLowerCase()
+      ) {
+        throw new CanonicalChainContinuityError(
+          `Fenêtre canonique discontinue entre les blocs ${newer.number} et ${older.number}.`,
+        );
+      }
+    }
+    return window;
+  }
+
+  private reorgDepth(value: bigint): number {
+    if (
+      value < 0n
+      || value > BigInt(DEFAULT_CANONICAL_RETENTION)
+      || value > BigInt(Number.MAX_SAFE_INTEGER)
+    ) {
+      throw new CanonicalChainContinuityError(
+        `Profondeur de reorg hors limite: ${value}.`,
+      );
+    }
+    return Number(value);
+  }
+
   private async prepareCanonicalScan(
     checkpoint: ListenerCheckpoint | null,
     tip: CanonicalBlock | null,
@@ -439,11 +597,14 @@ export class CanonicalChainCoordinator {
     journalStart: bigint,
     journalNeedsPersistence: boolean,
   ): Promise<PreparedCanonicalScan> {
-    const scanCandidates: bigint[] = [
-      journalNeedsPersistence && tip && tip.number < journalStart
-        ? tip.number
-        : journalStart,
-    ];
+    const scanCandidates: bigint[] = [];
+    if (journalNeedsPersistence) {
+      scanCandidates.push(
+        tip && tip.number < journalStart
+          ? tip.number
+          : journalStart,
+      );
+    }
     if (fromBlock <= head) {
       scanCandidates.push(
         checkpoint?.blockHash === null

@@ -47,6 +47,21 @@ export interface ReorgImpact {
   replayedEvents: number;
 }
 
+export interface ReorgReconciliation {
+  ancestor: CanonicalBlock | null;
+  oldTip: CanonicalBlock;
+  newTip: CanonicalBlock;
+  depth: number | null;
+}
+
+export interface CanonicalReorgHandler {
+  reconcileReorg(reorg: ReorgReconciliation): Promise<ReorgImpact>;
+}
+
+export interface CanonicalReorgSummary extends ReorgReconciliation {
+  impact: ReorgImpact;
+}
+
 export interface ChainBlockReference {
   number: bigint;
   hash: Hash;
