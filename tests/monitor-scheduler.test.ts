@@ -26,6 +26,7 @@ function session(
       token0: TOKEN,
       token1: pair,
       createdBlock: 1n,
+      blockHash: HASH,
       createdTransactionHash: HASH,
       createdLogIndex: 0,
       discoveredAtMs: createdAtMs,

@@ -23,6 +23,7 @@ interface SwapLog {
     amount1Out?: bigint;
   };
   blockNumber: bigint | null;
+  blockHash: Hash | null;
   transactionHash: Hash | null;
   transactionIndex: number | null;
   logIndex: number | null;
@@ -152,12 +153,13 @@ export class SwapListener {
         !args.sender || !args.to ||
         args.amount0In === undefined || args.amount1In === undefined ||
         args.amount0Out === undefined || args.amount1Out === undefined ||
-        log.blockNumber === null || !log.transactionHash
+        log.blockNumber === null || !log.blockHash || !log.transactionHash
       ) continue;
 
       const event = classifySwap(this.session.pair, {
         pair: this.session.pair.pair,
         transactionHash: log.transactionHash,
+        blockHash: log.blockHash,
         blockNumber: log.blockNumber,
         transactionIndex: log.transactionIndex ?? 0,
         logIndex: log.logIndex ?? 0,

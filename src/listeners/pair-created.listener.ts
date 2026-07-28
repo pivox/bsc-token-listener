@@ -14,6 +14,7 @@ interface PairCreatedLog {
     pair?: Address;
   };
   blockNumber: bigint | null;
+  blockHash: Hash | null;
   transactionHash: Hash | null;
   logIndex: number | null;
 }
@@ -93,7 +94,10 @@ export class PairCreatedListener {
 
     for (const log of sorted) {
       const { token0, token1, pair } = log.args;
-      if (!token0 || !token1 || !pair || log.blockNumber === null || !log.transactionHash) continue;
+      if (
+        !token0 || !token1 || !pair || log.blockNumber === null ||
+        !log.blockHash || !log.transactionHash
+      ) continue;
       const token0IsWbnb = token0.toLowerCase() === config.wbnb.toLowerCase();
       const token1IsWbnb = token1.toLowerCase() === config.wbnb.toLowerCase();
       if (!token0IsWbnb && !token1IsWbnb) continue;
@@ -107,6 +111,7 @@ export class PairCreatedListener {
         token0,
         token1,
         createdBlock: log.blockNumber,
+        blockHash: log.blockHash,
         createdTransactionHash: log.transactionHash,
         createdLogIndex: log.logIndex ?? 0,
         discoveredAtMs: Date.now(),

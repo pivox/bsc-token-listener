@@ -14,6 +14,8 @@ const baseSession: TokenSession = {
     token0: '0x0000000000000000000000000000000000000006',
     token1: '0x0000000000000000000000000000000000000007',
     createdBlock: 1n,
+    blockHash:
+      '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
     createdTransactionHash:
       '0x0000000000000000000000000000000000000000000000000000000000000001',
     createdLogIndex: 0,
@@ -41,6 +43,8 @@ const baseBuy: SwapEvent = {
   pair: '0x0000000000000000000000000000000000000004',
   transactionHash:
     '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+  blockHash:
+    '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
   kind: 'BUY',
   sender: '0x0000000000000000000000000000000000000008',
   recipient: '0x0000000000000000000000000000000000000009',

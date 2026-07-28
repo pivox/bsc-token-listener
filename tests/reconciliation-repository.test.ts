@@ -16,6 +16,7 @@ function session(): TokenSession {
       token0: `0x${'5'.repeat(40)}` as Address,
       token1: `0x${'3'.repeat(40)}` as Address,
       createdBlock: 1n,
+      blockHash: `0x${'7'.repeat(64)}` as Hash,
       createdTransactionHash: `0x${'6'.repeat(64)}` as Hash,
       createdLogIndex: 0,
       discoveredAtMs: 1,

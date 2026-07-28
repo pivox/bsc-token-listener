@@ -13,6 +13,7 @@ function buy(id: number): SwapEvent {
     id: `event-${id}`,
     pair: ADDRESS,
     transactionHash: `0x${id.toString(16).padStart(64, '0')}` as Hash,
+    blockHash: `0x${id.toString(16).padStart(64, '0')}` as Hash,
     kind: 'BUY',
     sender: ADDRESS,
     recipient: ADDRESS,
@@ -97,6 +98,8 @@ test('laisse rejouable un swap arrivé après désactivation de la session', asy
     id: 'event',
     pair: '0x0000000000000000000000000000000000000001',
     transactionHash:
+      '0x0000000000000000000000000000000000000000000000000000000000000001',
+    blockHash:
       '0x0000000000000000000000000000000000000000000000000000000000000001',
     kind: 'BUY',
     sender: '0x0000000000000000000000000000000000000001',
