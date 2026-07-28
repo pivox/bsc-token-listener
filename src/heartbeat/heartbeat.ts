@@ -2,6 +2,7 @@ import { errorMessage } from '../utils/error.js';
 import type { CheckpointRepository, SessionRepository } from '../storage/repositories.js';
 import type { ExecutionMode } from '../types/domain.js';
 import type { RecoveryCoordinatorStatus } from '../recovery/recovery-coordinator.js';
+import type { MonitorSchedulerStatus } from '../monitoring/monitor-scheduler.js';
 
 export type RpcStatus = 'up' | 'down';
 
@@ -18,6 +19,7 @@ export interface HeartbeatSnapshot {
   pairCreatedCheckpoint: string | null;
   activeSwapMonitors: number;
   activeSessions: number;
+  monitoring: MonitorSchedulerStatus;
   http: RpcHealth;
   webSocket: RpcHealth;
   recovery: {
@@ -54,7 +56,10 @@ export class HeartbeatService {
     return this.snapshot;
   }
 
-  async refresh(activeSwapMonitors: number): Promise<HeartbeatSnapshot> {
+  async refresh(
+    activeSwapMonitors: number,
+    monitoring?: MonitorSchedulerStatus,
+  ): Promise<HeartbeatSnapshot> {
     const [
       pairCreatedCheckpoint,
       activeSessions,
@@ -76,6 +81,13 @@ export class HeartbeatService {
       pairCreatedCheckpoint: pairCreatedCheckpoint === null ? null : pairCreatedCheckpoint.toString(),
       activeSwapMonitors,
       activeSessions,
+      monitoring: monitoring ?? {
+        capacity: activeSwapMonitors,
+        activeMonitors: activeSwapMonitors,
+        waitingSessions: 0,
+        abandonedSessions: 0,
+        oldestWaitingAgeMs: null,
+      },
       http,
       webSocket,
       recovery: this.recoverySnapshot(),
