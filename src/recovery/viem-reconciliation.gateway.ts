@@ -3,6 +3,7 @@ import {
   TransactionReceiptNotFoundError,
   type Address,
   type Hash,
+  type Hex,
 } from 'viem';
 import { erc20Abi } from '../abi/erc20.abi.js';
 import { publicClient } from '../rpc/clients.js';
@@ -17,6 +18,11 @@ interface ReceiptLike {
   transactionIndex: number;
   gasUsed: bigint;
   effectiveGasPrice: bigint;
+  logs?: readonly {
+    address: Address;
+    topics: readonly Hash[];
+    data: Hex;
+  }[];
 }
 
 interface ReconciliationPublicClient {
@@ -29,7 +35,11 @@ interface ReconciliationPublicClient {
   }): Promise<{
     transactions: readonly (
       | Hash
-      | { from: Address }
+      | {
+        hash: Hash;
+        from: Address;
+        to: Address | null;
+      }
     )[];
   }>;
   readContract(input: {
@@ -39,6 +49,13 @@ interface ReconciliationPublicClient {
     args: readonly [Address];
     blockNumber: bigint;
   }): Promise<unknown>;
+}
+
+const TRANSFER_TOPIC =
+  '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+
+function topicContainsAddress(topic: Hash | undefined, address: Address): boolean {
+  return topic?.slice(-40).toLowerCase() === address.slice(2).toLowerCase();
 }
 
 function errorType(error: unknown): string {
@@ -104,7 +121,9 @@ export class ViemReconciliationGateway implements ReconciliationGateway {
     return balance;
   }
 
-  async hasLaterTransactionInBlock(
+  async hasLaterWalletActivityInBlock(
+    wallet: Address,
+    token: Address,
     blockNumber: bigint,
     transactionIndex: number,
   ): Promise<boolean> {
@@ -112,6 +131,28 @@ export class ViemReconciliationGateway implements ReconciliationGateway {
       blockNumber,
       includeTransactions: true,
     });
-    return block.transactions.length > transactionIndex + 1;
+    const walletKey = wallet.toLowerCase();
+    const tokenKey = token.toLowerCase();
+    for (const transaction of block.transactions.slice(transactionIndex + 1)) {
+      if (typeof transaction === 'string') return true;
+      if (
+        transaction.from.toLowerCase() === walletKey
+        || transaction.to?.toLowerCase() === walletKey
+      ) {
+        return true;
+      }
+      const receipt = await this.client.getTransactionReceipt({
+        hash: transaction.hash,
+      });
+      const affectsTokenBalance = (receipt.logs ?? []).some((log) =>
+        log.address.toLowerCase() === tokenKey
+        && log.topics[0]?.toLowerCase() === TRANSFER_TOPIC
+        && (
+          topicContainsAddress(log.topics[1], wallet)
+          || topicContainsAddress(log.topics[2], wallet)
+        ));
+      if (affectsTokenBalance) return true;
+    }
+    return false;
   }
 }

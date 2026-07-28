@@ -34,6 +34,7 @@ import {
   TradeRepository,
 } from './storage/repositories.js';
 import { SessionEngine } from './strategy/session-engine.js';
+import { isSessionMonitorable } from './strategy/session-monitor-policy.js';
 import type { PairInfo, TokenSession } from './types/domain.js';
 import { errorMessage } from './utils/error.js';
 import { logger } from './utils/logger.js';
@@ -159,6 +160,7 @@ async function main(): Promise<void> {
     : null;
 
   const startMonitor = async (session: TokenSession): Promise<void> => {
+    if (!isSessionMonitorable(session)) return;
     const key = session.pair.pair.toLowerCase();
     const tokenKey = session.pair.token.toLowerCase();
     if (monitors.has(key)) return;
@@ -196,6 +198,11 @@ async function main(): Promise<void> {
       const current = refreshedByPair.get(pairKey);
       if (!current) {
         stopMonitor(pairKey as Address);
+        continue;
+      }
+      if (!isSessionMonitorable(current)) {
+        stopMonitor(pairKey as Address);
+        refreshedByPair.delete(pairKey);
         continue;
       }
       const active = activeSessionsByToken.get(current.pair.token.toLowerCase());

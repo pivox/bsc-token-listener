@@ -458,7 +458,9 @@ export class SessionReconciler {
       ];
     }
     const contaminated =
-      await this.gateway.hasLaterTransactionInBlock(
+      await this.gateway.hasLaterWalletActivityInBlock(
+        transaction.walletAddress,
+        session.pair.token,
         receipt.blockNumber,
         receipt.transactionIndex,
       );

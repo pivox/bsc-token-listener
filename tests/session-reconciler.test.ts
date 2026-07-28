@@ -155,7 +155,7 @@ class FakeGateway implements ReconciliationGateway {
     return this.tokenBalance;
   }
 
-  async hasLaterTransactionInBlock(): Promise<boolean> {
+  async hasLaterWalletActivityInBlock(): Promise<boolean> {
     return this.laterBlockTransaction;
   }
 }
