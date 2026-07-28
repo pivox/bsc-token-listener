@@ -2,6 +2,7 @@ import { formatEther } from 'viem';
 import { config } from '../config/env.js';
 import { TradeExecutor } from '../execution/trade-executor.js';
 import { TokenRiskService } from '../security/token-risk.service.js';
+import { recordEntryObservationBuy } from './entry-observation.js';
 import {
   RiskReportRepository,
   SessionRepository,
@@ -107,8 +108,30 @@ export class SessionEngine {
     session.updatedAtMs = Date.now();
 
     if (session.status === 'WAITING_FIRST_BUY' && event.kind === 'BUY') {
+      const { added, count } = recordEntryObservationBuy(session, event);
+      await this.sessions.save(session);
+
+      if (!added) {
+        return;
+      }
+
+      if (count < config.entryObservationBuys) {
+        logger.info(
+          {
+            pair: session.pair.pair,
+            token: session.pair.token,
+            observedBuyCount: count,
+            requiredBuyCount: config.entryObservationBuys,
+            triggerTransaction: event.transactionHash,
+          },
+          'Achat observé en phase d\u00e9laboration, attente de la tranche d\u2019entr\u00e9e.',
+        );
+        return;
+      }
+
       session.firstBuy = event;
       session.status = 'RISK_CHECKING';
+      session.updatedAtMs = Date.now();
       await this.sessions.save(session);
       logger.info(
         {
