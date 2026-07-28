@@ -96,6 +96,16 @@ class MemoryCheckpoints {
     return this.values.get(listenerKey) ?? null;
   }
 
+  async getOldestBlockNumber(): Promise<bigint | null> {
+    let oldest: bigint | null = null;
+    for (const checkpoint of this.values.values()) {
+      if (oldest === null || checkpoint.blockNumber < oldest) {
+        oldest = checkpoint.blockNumber;
+      }
+    }
+    return oldest;
+  }
+
   async set(
     listenerKey: string,
     checkpoint: Exclude<ListenerCheckpoint, { blockHash: null }>,
@@ -235,7 +245,7 @@ test('bootstrappe au plus 128 vrais headers continus, y compris depuis le bloc z
     assert.equal(saved[index]?.parentHash, saved[index - 1]?.hash);
   }
   assert.equal(saved[0]?.parentHash, ZERO_HASH);
-  assert.deepEqual(canonicalStore.pruneCalls, []);
+  assert.deepEqual(canonicalStore.pruneCalls, [0n]);
 });
 
 test('réutilise le journal partagé au lieu de rescanner pour un second listener', async () => {
@@ -335,12 +345,17 @@ test('sérialise strictement les listeners et conserve la queue après un échec
   const firstGate = new Promise<void>((resolve) => {
     releaseFirst = resolve;
   });
+  let signalFirstStarted: (() => void) | undefined;
+  const firstStarted = new Promise<void>((resolve) => {
+    signalFirstStarted = resolve;
+  });
 
   const first = subject.reconcile({
     listenerKey: 'first',
     startBlock: 1n,
     processChunk: async () => {
       events.push('first:start');
+      signalFirstStarted?.();
       await firstGate;
       events.push('first:fail');
       throw new Error('first failed');
@@ -355,7 +370,7 @@ test('sérialise strictement les listeners et conserve la queue après un échec
     },
   });
 
-  await new Promise<void>((resolve) => setImmediate(resolve));
+  await firstStarted;
   assert.deepEqual(events, ['first:start']);
   assert.equal(subject.currentStatus.running, true);
   releaseFirst?.();
@@ -372,10 +387,11 @@ test('sérialise strictement les listeners et conserve la queue après un échec
 
 test('découpe par chunks et checkpoint chaque fin exacte', async () => {
   const checkpoints = new MemoryCheckpoints();
+  const canonicalStore = new MemoryCanonicalStore();
   const ranges: Array<[bigint, bigint]> = [];
   const subject = coordinator(
     new MemoryBlockReader(3_010n),
-    new MemoryCanonicalStore(),
+    canonicalStore,
     checkpoints,
   );
 
@@ -401,6 +417,9 @@ test('découpe par chunks et checkpoint chaque fin exacte', async () => {
       { blockNumber: 3_005n, blockHash: hash(3_006n) },
     ],
   );
+  assert.equal(canonicalStore.saves.length, 1);
+  assert.ok(canonicalStore.saves.every((saved) => saved.length <= 128));
+  assert.equal(canonicalStore.blocks.size, 128);
 });
 
 test('false stoppe sans checkpoint le chunk ni le remainder', async () => {
@@ -468,6 +487,163 @@ test('une erreur RPC durant une extension ne fait avancer ni journal ni checkpoi
   );
 
   assert.deepEqual(canonicalStore.saves, []);
+  assert.deepEqual(checkpoints.writes, []);
+});
+
+test('borne à 128 le rattrapage d’un tip très ancien puis élague sans accumulation', async () => {
+  const reader = new MemoryBlockReader(10_000n);
+  const canonicalStore = new MemoryCanonicalStore([block(0n)]);
+  const checkpoints = new MemoryCheckpoints();
+  const subject = coordinator(reader, canonicalStore, checkpoints);
+
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 20_000n,
+    processChunk: async () => true,
+  });
+
+  assert.ok(canonicalStore.saves.length > 0);
+  assert.ok(canonicalStore.saves.every((saved) => saved.length <= 128));
+  assert.deepEqual(canonicalStore.pruneCalls, [9_868n]);
+  assert.equal(canonicalStore.blocks.size, 128);
+  assert.equal(canonicalStore.blocks.has(9_868n), true);
+  assert.equal(canonicalStore.blocks.has(9_995n), true);
+});
+
+test('ne prune aucun header requis par le plus ancien checkpoint', async () => {
+  const reader = new MemoryBlockReader(300n);
+  const canonicalStore = new MemoryCanonicalStore([block(100n)]);
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('older-listener', {
+    blockNumber: 100n,
+    blockHash: hash(101n),
+  });
+  const subject = coordinator(reader, canonicalStore, checkpoints);
+
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 400n,
+    processChunk: async () => true,
+  });
+
+  assert.deepEqual(canonicalStore.pruneCalls, [100n]);
+  assert.equal(canonicalStore.blocks.has(100n), true);
+});
+
+test('prune après avancée d’un checkpoint même si le journal est déjà au head', async () => {
+  const reader = new MemoryBlockReader(205n);
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 201 }, (_, index) => block(BigInt(index))),
+  );
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', {
+    blockNumber: 100n,
+    blockHash: hash(101n),
+  });
+  const subject = coordinator(reader, canonicalStore, checkpoints);
+
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 1n,
+    processChunk: async () => true,
+  });
+
+  assert.deepEqual(canonicalStore.saves, []);
+  assert.deepEqual(canonicalStore.pruneCalls, [73n]);
+  assert.equal(canonicalStore.blocks.size, 128);
+});
+
+test('un mismatch historique hors fenêtre bloque avant toute mutation ou traitement', async () => {
+  const reader = new MemoryBlockReader(3_010n);
+  const originalGetBlock = reader.getBlock.bind(reader);
+  reader.getBlock = async (number) => {
+    const header = await originalGetBlock(number);
+    return number === 1_500n
+      ? { ...header, parentHash: hash(999n) }
+      : header;
+  };
+  const canonicalStore = new MemoryCanonicalStore();
+  const checkpoints = new MemoryCheckpoints();
+  let processCalls = 0;
+  const subject = coordinator(reader, canonicalStore, checkpoints);
+
+  await assert.rejects(
+    subject.reconcile({
+      listenerKey: 'swaps',
+      startBlock: 1n,
+      processChunk: async () => {
+        processCalls += 1;
+        return true;
+      },
+    }),
+    CanonicalChainContinuityError,
+  );
+
+  assert.equal(processCalls, 0);
+  assert.deepEqual(canonicalStore.saves, []);
+  assert.deepEqual(canonicalStore.pruneCalls, []);
+  assert.deepEqual(checkpoints.writes, []);
+});
+
+test('revalide par RPC les headers cachés du tip avant tout traitement', async () => {
+  const reader = new MemoryBlockReader(105n);
+  const originalGetBlock = reader.getBlock.bind(reader);
+  reader.getBlock = async (number) => {
+    const header = await originalGetBlock(number);
+    return number === 95n ? { ...header, hash: hash(999n) } : header;
+  };
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 10 }, (_, index) => block(BigInt(91 + index))),
+  );
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('swaps', {
+    blockNumber: 90n,
+    blockHash: hash(91n),
+  });
+  let processCalls = 0;
+  const subject = coordinator(reader, canonicalStore, checkpoints);
+
+  await assert.rejects(
+    subject.reconcile({
+      listenerKey: 'swaps',
+      startBlock: 1n,
+      processChunk: async () => {
+        processCalls += 1;
+        return true;
+      },
+    }),
+    CanonicalChainContinuityError,
+  );
+
+  assert.equal(processCalls, 0);
+  assert.deepEqual(canonicalStore.saves, []);
+  assert.deepEqual(canonicalStore.pruneCalls, []);
+  assert.deepEqual(checkpoints.writes, []);
+});
+
+test('une erreur RPC au milieu du scan historique ne produit aucune mutation', async () => {
+  const reader = new MemoryBlockReader(3_010n);
+  reader.failAt = 2_000n;
+  const canonicalStore = new MemoryCanonicalStore();
+  const checkpoints = new MemoryCheckpoints();
+  let processCalls = 0;
+  const subject = coordinator(reader, canonicalStore, checkpoints);
+
+  await assert.rejects(
+    subject.reconcile({
+      listenerKey: 'swaps',
+      startBlock: 1n,
+      processChunk: async () => {
+        processCalls += 1;
+        return true;
+      },
+    }),
+    /RPC indisponible/u,
+  );
+
+  assert.equal(processCalls, 0);
+  assert.deepEqual(canonicalStore.saves, []);
+  assert.deepEqual(canonicalStore.pruneCalls, []);
   assert.deepEqual(checkpoints.writes, []);
 });
 

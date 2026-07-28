@@ -1,3 +1,14 @@
+import { randomUUID } from 'node:crypto';
+import { once } from 'node:events';
+import { createReadStream } from 'node:fs';
+import {
+  open,
+  unlink,
+  type FileHandle,
+} from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createInterface } from 'node:readline';
 import { isHash } from 'viem';
 import type {
   AnchoredListenerCheckpoint,
@@ -15,10 +26,12 @@ export interface CanonicalChainStore {
   getCanonicalTip(): Promise<CanonicalBlock | null>;
   listCanonicalDescending(limit: number): Promise<CanonicalBlock[]>;
   saveCanonicalBlocks(blocks: CanonicalBlock[]): Promise<void>;
+  pruneCanonicalBefore(blockNumber: bigint): Promise<void>;
 }
 
 export interface ListenerCheckpointStore {
   get(listenerKey: string): Promise<ListenerCheckpoint | null>;
+  getOldestBlockNumber(): Promise<bigint | null>;
   set(
     listenerKey: string,
     checkpoint: AnchoredListenerCheckpoint,
@@ -91,6 +104,117 @@ function assertContinuous(
     throw new CanonicalChainContinuityError(
       `Discontinuité canonique entre les blocs ${previous.number} et ${next.number}.`,
     );
+  }
+}
+
+function sameHeader(left: CanonicalBlock, right: CanonicalBlock): boolean {
+  return (
+    left.number === right.number
+    && left.hash.toLowerCase() === right.hash.toLowerCase()
+    && left.parentHash.toLowerCase() === right.parentHash.toLowerCase()
+  );
+}
+
+function minimum(values: bigint[]): bigint | null {
+  let result: bigint | null = null;
+  for (const value of values) {
+    if (result === null || value < result) result = value;
+  }
+  return result;
+}
+
+interface PreparedCanonicalScan {
+  journalHeaders: CanonicalBlock[];
+  legacyHeader: CanonicalBlock | null;
+}
+
+class TemporaryChunkHeaderStore {
+  private handle: FileHandle | null;
+
+  private constructor(
+    private readonly path: string,
+    handle: FileHandle,
+  ) {
+    this.handle = handle;
+  }
+
+  static async create(): Promise<TemporaryChunkHeaderStore> {
+    const path = join(
+      tmpdir(),
+      `bsc-canonical-chunks-${randomUUID()}.tmp`,
+    );
+    return new TemporaryChunkHeaderStore(
+      path,
+      await open(path, 'wx', 0o600),
+    );
+  }
+
+  async append(header: CanonicalBlock): Promise<void> {
+    if (!this.handle) {
+      throw new Error('Stockage temporaire de chunks déjà fermé.');
+    }
+    await this.handle.appendFile(
+      `${header.number}\t${header.hash}\t${header.parentHash}\n`,
+      'utf8',
+    );
+  }
+
+  async finish(): Promise<void> {
+    if (!this.handle) return;
+    await this.handle.close();
+    this.handle = null;
+  }
+
+  async *headers(): AsyncGenerator<CanonicalBlock> {
+    await this.finish();
+    const input = createReadStream(this.path, { encoding: 'utf8' });
+    const lines = createInterface({
+      input,
+      crlfDelay: Infinity,
+    });
+    try {
+      for await (const line of lines) {
+        const [number, hash, parentHash, extra] = line.split('\t');
+        if (
+          number === undefined
+          || hash === undefined
+          || parentHash === undefined
+          || extra !== undefined
+        ) {
+          throw new Error('Header temporaire de chunk invalide.');
+        }
+        let blockNumber: bigint;
+        try {
+          blockNumber = BigInt(number);
+        } catch {
+          throw new Error('Numéro temporaire de chunk invalide.');
+        }
+        yield validateHeader(
+          { number: blockNumber, hash, parentHash } as CanonicalBlock,
+          blockNumber,
+        );
+      }
+    } finally {
+      lines.close();
+      if (!input.closed) {
+        const closed = once(input, 'close');
+        input.destroy();
+        await closed;
+      }
+    }
+  }
+
+  async dispose(): Promise<void> {
+    await this.finish().catch(() => undefined);
+    await unlink(this.path).catch((error: unknown) => {
+      if (
+        !(error instanceof Error)
+        || !('code' in error)
+        || error.code !== 'ENOENT'
+      ) {
+        throw error;
+      }
+    });
   }
 }
 
@@ -177,96 +301,163 @@ export class CanonicalChainCoordinator {
       knownHeaders.set(tip.number, validateHeader(tip, tip.number));
     }
 
-    const newHeaders = await this.readCanonicalExtension(tip, head);
-    for (const header of newHeaders) knownHeaders.set(header.number, header);
-
-    let legacyAnchor: AnchoredListenerCheckpoint | null = null;
-    if (checkpoint?.blockHash === null) {
-      const header = await this.readHeader(checkpoint.blockNumber, knownHeaders);
-      legacyAnchor = {
-        blockNumber: checkpoint.blockNumber,
-        blockHash: header.hash,
-      };
-    }
-
     const fromBlock = checkpoint
       ? checkpoint.blockNumber + 1n
       : request.startBlock;
-    const chunkEnds: bigint[] = [];
-    if (fromBlock <= head) {
-      for (
-        let chunkStart = fromBlock;
-        chunkStart <= head;
-        chunkStart += this.chunkSize
-      ) {
-        const candidate = chunkStart + this.chunkSize - 1n;
-        chunkEnds.push(candidate < head ? candidate : head);
+    const chunkHeaders = await TemporaryChunkHeaderStore.create();
+    try {
+      const prepared = await this.prepareCanonicalScan(
+        checkpoint,
+        tip,
+        knownHeaders,
+        fromBlock,
+        head,
+        chunkHeaders,
+      );
+      await chunkHeaders.finish();
+      const saved = prepared.journalHeaders.length > 0;
+      if (saved) {
+        await this.canonicalStore.saveCanonicalBlocks(
+          prepared.journalHeaders,
+        );
       }
-    }
-    for (const chunkEnd of chunkEnds) {
-      await this.readHeader(chunkEnd, knownHeaders);
-    }
-
-    if (newHeaders.length > 0) {
-      await this.canonicalStore.saveCanonicalBlocks(newHeaders);
-    }
-    if (legacyAnchor) {
-      await this.checkpoints.set(request.listenerKey, legacyAnchor);
-    }
-
-    let chunkStart = fromBlock;
-    for (const chunkEnd of chunkEnds) {
-      const processed = await request.processChunk(chunkStart, chunkEnd);
-      if (!processed) return;
-      const header = knownHeaders.get(chunkEnd);
-      if (!header) {
-        throw new Error(`Header préparé absent pour le bloc ${chunkEnd}.`);
+      let checkpointPersisted = false;
+      if (checkpoint?.blockHash === null) {
+        const legacyHeader = prepared.legacyHeader;
+        if (!legacyHeader) {
+          throw new Error(
+            `Header legacy préparé absent pour le bloc ${checkpoint.blockNumber}.`,
+          );
+        }
+        await this.checkpoints.set(request.listenerKey, {
+          blockNumber: checkpoint.blockNumber,
+          blockHash: legacyHeader.hash,
+        });
+        checkpointPersisted = true;
       }
-      await this.checkpoints.set(request.listenerKey, {
-        blockNumber: chunkEnd,
-        blockHash: header.hash,
-      });
-      chunkStart = chunkEnd + 1n;
+
+      let chunkStart = fromBlock;
+      for await (const header of chunkHeaders.headers()) {
+        const processed = await request.processChunk(
+          chunkStart,
+          header.number,
+        );
+        if (!processed) break;
+        await this.checkpoints.set(request.listenerKey, {
+          blockNumber: header.number,
+          blockHash: header.hash,
+        });
+        checkpointPersisted = true;
+        chunkStart = header.number + 1n;
+      }
+
+      if (saved || checkpointPersisted) {
+        const windowStart = this.canonicalWindowStart(head);
+        const oldestCheckpoint = await this.checkpoints.getOldestBlockNumber();
+        const cutoff =
+          oldestCheckpoint === null || windowStart < oldestCheckpoint
+            ? windowStart
+            : oldestCheckpoint;
+        await this.canonicalStore.pruneCanonicalBefore(cutoff);
+      }
+    } finally {
+      await chunkHeaders.dispose();
     }
   }
 
-  private async readCanonicalExtension(
+  private async prepareCanonicalScan(
+    checkpoint: ListenerCheckpoint | null,
     tip: CanonicalBlock | null,
+    knownHeaders: Map<bigint, CanonicalBlock>,
+    fromBlock: bigint,
     head: bigint,
-  ): Promise<CanonicalBlock[]> {
-    if (tip && tip.number >= head) return [];
-    const retention = BigInt(DEFAULT_CANONICAL_RETENTION);
-    const firstBlock = tip
-      ? tip.number + 1n
-      : head >= retention
-        ? head - retention + 1n
-        : 0n;
-    const headers: CanonicalBlock[] = [];
-    for (let number = firstBlock; number <= head; number += 1n) {
-      headers.push(
-        validateHeader(await this.blockReader.getBlock(number), number),
+    chunkHeaders: TemporaryChunkHeaderStore,
+  ): Promise<PreparedCanonicalScan> {
+    const scanCandidates: bigint[] = [];
+    const journalNeedsExtension = !tip || tip.number < head;
+    if (journalNeedsExtension) {
+      scanCandidates.push(tip ? tip.number : this.canonicalWindowStart(head));
+    }
+    if (fromBlock <= head) {
+      scanCandidates.push(
+        checkpoint?.blockHash === null
+          ? checkpoint.blockNumber
+          : fromBlock,
       );
     }
+    const scanStart = minimum(scanCandidates);
+    if (scanStart === null) {
+      return {
+        journalHeaders: [],
+        legacyHeader: null,
+      };
+    }
 
-    let previous = tip;
-    for (const header of headers) {
+    let previous: CanonicalBlock | null =
+      tip && scanStart === tip.number + 1n
+        ? tip
+        : checkpoint?.blockHash !== null
+          && checkpoint !== null
+          && scanStart === checkpoint.blockNumber + 1n
+          ? {
+              number: checkpoint.blockNumber,
+              hash: checkpoint.blockHash,
+              parentHash: checkpoint.blockHash,
+            }
+          : null;
+    const journalHeaders: CanonicalBlock[] = [];
+    let legacyHeader: CanonicalBlock | null = null;
+
+    for (let number = scanStart; number <= head; number += 1n) {
+      const stored = knownHeaders.get(number);
+      const header = validateHeader(
+        await this.blockReader.getBlock(number),
+        number,
+      );
+      if (stored && !sameHeader(stored, header)) {
+        throw new CanonicalChainContinuityError(
+          `Header canonique divergent au bloc ${number}.`,
+        );
+      }
       if (previous) assertContinuous(previous, header);
+      if (
+        checkpoint?.blockHash !== null
+        && checkpoint !== null
+        && number === checkpoint.blockNumber
+        && header.hash.toLowerCase() !== checkpoint.blockHash.toLowerCase()
+      ) {
+        throw new CanonicalChainContinuityError(
+          `Checkpoint divergent au bloc ${number}.`,
+        );
+      }
+      if (
+        journalNeedsExtension
+        && (!tip || number > tip.number)
+      ) {
+        journalHeaders.push(header);
+        if (journalHeaders.length > DEFAULT_CANONICAL_RETENTION) {
+          journalHeaders.shift();
+        }
+      }
+      if (
+        number >= fromBlock
+        && (
+          (number - fromBlock + 1n) % this.chunkSize === 0n
+          || number === head
+        )
+      ) {
+        await chunkHeaders.append(header);
+      }
+      if (checkpoint?.blockHash === null && number === checkpoint.blockNumber) {
+        legacyHeader = header;
+      }
       previous = header;
     }
-    return headers;
+    return { journalHeaders, legacyHeader };
   }
 
-  private async readHeader(
-    number: bigint,
-    knownHeaders: Map<bigint, CanonicalBlock>,
-  ): Promise<CanonicalBlock> {
-    const known = knownHeaders.get(number);
-    if (known) return known;
-    const header = validateHeader(
-      await this.blockReader.getBlock(number),
-      number,
-    );
-    knownHeaders.set(number, header);
-    return header;
+  private canonicalWindowStart(head: bigint): bigint {
+    const retainedDistance = BigInt(DEFAULT_CANONICAL_RETENTION - 1);
+    return head > retainedDistance ? head - retainedDistance : 0n;
   }
 }

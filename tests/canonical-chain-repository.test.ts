@@ -126,6 +126,21 @@ test('upsert le numéro et le hash du checkpoint', async () => {
   assert.match(database.calls[0]?.sql ?? '', /block_hash = EXCLUDED\.block_hash/u);
 });
 
+test('charge le plus ancien numéro de checkpoint sans conversion en number', async () => {
+  const database = new RecordingDatabase();
+  database.rows = [{ block_number: '9007199254740993' }];
+  const repository = new CheckpointRepository(database);
+
+  assert.equal(
+    await repository.getOldestBlockNumber(),
+    9_007_199_254_740_993n,
+  );
+  assert.match(database.calls[0]?.sql ?? '', /MIN\(block_number\)/u);
+
+  database.rows = [{ block_number: null }];
+  assert.equal(await repository.getOldestBlockNumber(), null);
+});
+
 test('charge la tête canonique et les blocs descendants avec bigint et hash intacts', async () => {
   const database = new RecordingDatabase();
   const repository = new CanonicalChainRepository(database);

@@ -490,6 +490,17 @@ export class CheckpointRepository {
     };
   }
 
+  async getOldestBlockNumber(): Promise<bigint | null> {
+    const result = await this.database.query<{
+      block_number: string | null;
+    }>(
+      `SELECT MIN(block_number)::text AS block_number
+       FROM listener_checkpoints`,
+    );
+    const blockNumber = result.rows[0]?.block_number ?? null;
+    return blockNumber === null ? null : BigInt(blockNumber);
+  }
+
   async set(
     key: string,
     checkpoint: AnchoredListenerCheckpoint,
