@@ -6,20 +6,34 @@ export interface CanonicalBlock {
   parentHash: Hash;
 }
 
-export interface ListenerCheckpoint {
+export interface AnchoredListenerCheckpoint {
   blockNumber: bigint;
   blockHash: Hash;
 }
+
+export interface LegacyListenerCheckpoint {
+  blockNumber: bigint;
+  blockHash: null;
+}
+
+export type ListenerCheckpoint =
+  | AnchoredListenerCheckpoint
+  | LegacyListenerCheckpoint;
 
 export type CanonicalChainState =
   | 'HEALTHY'
   | 'RECONCILING'
   | 'MANUAL_REVIEW';
 
+export type ChainReorgStatus =
+  | 'RECONCILING'
+  | 'RECOVERED'
+  | 'MANUAL_REVIEW';
+
 export interface ReorgImpact {
-  orphanedBlockCount: number;
-  orphanedEventCount: number;
-  affectedSessionCount: number;
+  depth: number | null;
+  orphanedEvents: number;
+  replayedEvents: number;
 }
 
 export interface ChainBlockReference {
@@ -30,9 +44,10 @@ export interface ChainBlockReference {
 export interface ChainReorgAudit {
   id: string;
   detectedAtMs: number;
-  commonAncestor: ChainBlockReference;
+  commonAncestor: ChainBlockReference | null;
   previousTip: ChainBlockReference;
   replacementTip: ChainBlockReference;
-  state: CanonicalChainState;
+  status: ChainReorgStatus;
   impact: ReorgImpact;
+  details: Record<string, unknown>;
 }

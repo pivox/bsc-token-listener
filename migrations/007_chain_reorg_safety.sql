@@ -11,16 +11,17 @@ CREATE INDEX IF NOT EXISTS idx_canonical_blocks_parent_hash
 CREATE TABLE IF NOT EXISTS chain_reorgs (
   reorg_id TEXT PRIMARY KEY,
   detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  common_ancestor_number NUMERIC(78, 0) NOT NULL,
-  common_ancestor_hash TEXT NOT NULL,
+  common_ancestor_number NUMERIC(78, 0),
+  common_ancestor_hash TEXT,
   previous_tip_number NUMERIC(78, 0) NOT NULL,
   previous_tip_hash TEXT NOT NULL,
   replacement_tip_number NUMERIC(78, 0) NOT NULL,
   replacement_tip_hash TEXT NOT NULL,
-  state TEXT NOT NULL CHECK (state IN ('HEALTHY', 'RECONCILING', 'MANUAL_REVIEW')),
-  orphaned_block_count INTEGER NOT NULL DEFAULT 0,
-  orphaned_event_count INTEGER NOT NULL DEFAULT 0,
-  affected_session_count INTEGER NOT NULL DEFAULT 0
+  status TEXT NOT NULL CHECK (status IN ('RECONCILING', 'RECOVERED', 'MANUAL_REVIEW')),
+  depth INTEGER,
+  orphaned_events INTEGER NOT NULL DEFAULT 0,
+  replayed_events INTEGER NOT NULL DEFAULT 0,
+  details JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
 CREATE INDEX IF NOT EXISTS idx_chain_reorgs_detected_at

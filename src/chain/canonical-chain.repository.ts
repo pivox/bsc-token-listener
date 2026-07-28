@@ -1,7 +1,7 @@
 import { isHash, type Hash } from 'viem';
 import type {
   CanonicalBlock,
-  CanonicalChainState,
+  ChainReorgStatus,
   ChainReorgAudit,
 } from './canonical-chain.types.js';
 import { pool } from '../storage/database.js';
@@ -22,16 +22,17 @@ interface CanonicalBlockRow {
 interface ChainReorgRow {
   reorg_id: string;
   detected_at_ms: string;
-  common_ancestor_number: string;
-  common_ancestor_hash: string;
+  common_ancestor_number: string | null;
+  common_ancestor_hash: string | null;
   previous_tip_number: string;
   previous_tip_hash: string;
   replacement_tip_number: string;
   replacement_tip_hash: string;
-  state: CanonicalChainState;
-  orphaned_block_count: string;
-  orphaned_event_count: string;
-  affected_session_count: string;
+  status: ChainReorgStatus;
+  depth: string | null;
+  orphaned_events: string;
+  replayed_events: string;
+  details: Record<string, unknown>;
 }
 
 function hash(value: string): Hash {
@@ -116,10 +117,11 @@ export class CanonicalChainRepository {
          previous_tip_hash,
          replacement_tip_number::text,
          replacement_tip_hash,
-         state,
-         orphaned_block_count::text,
-         orphaned_event_count::text,
-         affected_session_count::text
+         status,
+         depth::text,
+         orphaned_events::text,
+         replayed_events::text,
+         details
        FROM chain_reorgs
        ORDER BY detected_at DESC LIMIT 1`,
     );
@@ -128,10 +130,13 @@ export class CanonicalChainRepository {
     return {
       id: row.reorg_id,
       detectedAtMs: Number(row.detected_at_ms),
-      commonAncestor: {
-        number: BigInt(row.common_ancestor_number),
-        hash: hash(row.common_ancestor_hash),
-      },
+      commonAncestor:
+        row.common_ancestor_number === null || row.common_ancestor_hash === null
+          ? null
+          : {
+              number: BigInt(row.common_ancestor_number),
+              hash: hash(row.common_ancestor_hash),
+            },
       previousTip: {
         number: BigInt(row.previous_tip_number),
         hash: hash(row.previous_tip_hash),
@@ -140,12 +145,13 @@ export class CanonicalChainRepository {
         number: BigInt(row.replacement_tip_number),
         hash: hash(row.replacement_tip_hash),
       },
-      state: row.state,
+      status: row.status,
       impact: {
-        orphanedBlockCount: Number(row.orphaned_block_count),
-        orphanedEventCount: Number(row.orphaned_event_count),
-        affectedSessionCount: Number(row.affected_session_count),
+        depth: row.depth === null ? null : Number(row.depth),
+        orphanedEvents: Number(row.orphaned_events),
+        replayedEvents: Number(row.replayed_events),
       },
+      details: row.details,
     };
   }
 }

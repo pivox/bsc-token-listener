@@ -18,6 +18,16 @@ test('migration reorg reste idempotente et conserve les colonnes legacy nullable
 
   assert.match(migration, /CREATE TABLE IF NOT EXISTS canonical_blocks/u);
   assert.match(migration, /CREATE TABLE IF NOT EXISTS chain_reorgs/u);
+  assert.match(migration, /common_ancestor_number NUMERIC\(78, 0\),/u);
+  assert.match(migration, /common_ancestor_hash TEXT,/u);
+  assert.match(
+    migration,
+    /status TEXT NOT NULL CHECK \(status IN \('RECONCILING', 'RECOVERED', 'MANUAL_REVIEW'\)\)/u,
+  );
+  assert.match(migration, /depth INTEGER,/u);
+  assert.match(migration, /orphaned_events INTEGER NOT NULL DEFAULT 0/u);
+  assert.match(migration, /replayed_events INTEGER NOT NULL DEFAULT 0/u);
+  assert.match(migration, /details JSONB NOT NULL DEFAULT '\{\}'::jsonb/u);
   assert.match(
     migration,
     /ALTER TABLE listener_checkpoints\s+ADD COLUMN IF NOT EXISTS block_hash TEXT;/u,
@@ -74,12 +84,29 @@ test('charge un checkpoint avec son hash sans convertir le bigint en number', as
   assert.match(database.calls[0]?.sql ?? '', /block_hash/u);
 });
 
-test('retourne null pour une ligne legacy sans hash afin de forcer un bootstrap sûr', async () => {
+test('distingue une ligne legacy sans hash d’un checkpoint absent', async () => {
   const database = new RecordingDatabase();
   database.rows = [{ block_number: '42', block_hash: null }];
   const repository = new CheckpointRepository(database);
 
-  assert.equal(await repository.get('pair-created'), null);
+  assert.deepEqual(await repository.get('pair-created'), {
+    blockNumber: 42n,
+    blockHash: null,
+  });
+
+  database.rows = [];
+  assert.equal(await repository.get('missing'), null);
+});
+
+test('refuse explicitement un block_hash non-null invalide', async () => {
+  const database = new RecordingDatabase();
+  database.rows = [{ block_number: '42', block_hash: 'not-a-hash' }];
+  const repository = new CheckpointRepository(database);
+
+  await assert.rejects(
+    repository.get('pair-created'),
+    /Hash de checkpoint invalide/u,
+  );
 });
 
 test('upsert le numéro et le hash du checkpoint', async () => {
@@ -154,38 +181,77 @@ test('élague uniquement avant la borne canonique demandée', async () => {
   );
 });
 
-test('charge le dernier audit de reorg et son impact sans perdre les bigint', async () => {
+for (const status of [
+  'RECONCILING',
+  'RECOVERED',
+  'MANUAL_REVIEW',
+] as const) {
+  test(`mappe un audit ${status} avec profondeur, compteurs et détails`, async () => {
+    const database = new RecordingDatabase();
+    database.rows = [{
+      reorg_id: `reorg-${status}`,
+      detected_at_ms: '1753700000000',
+      common_ancestor_number: '10',
+      common_ancestor_hash: HASH_10,
+      previous_tip_number: '12',
+      previous_tip_hash: HASH_12,
+      replacement_tip_number: '11',
+      replacement_tip_hash: HASH_11,
+      status,
+      depth: '2',
+      orphaned_events: '3',
+      replayed_events: '1',
+      details: { affectedPairs: ['pair-1'] },
+    }];
+    const repository = new CanonicalChainRepository(database);
+
+    const audit = await repository.getLastReorg();
+
+    assert.deepEqual(audit, {
+      id: `reorg-${status}`,
+      detectedAtMs: 1_753_700_000_000,
+      commonAncestor: { number: 10n, hash: HASH_10 },
+      previousTip: { number: 12n, hash: HASH_12 },
+      replacementTip: { number: 11n, hash: HASH_11 },
+      status,
+      impact: {
+        depth: 2,
+        orphanedEvents: 3,
+        replayedEvents: 1,
+      },
+      details: { affectedPairs: ['pair-1'] },
+    });
+    assert.match(
+      database.calls[0]?.sql ?? '',
+      /ORDER BY detected_at DESC LIMIT 1/u,
+    );
+  });
+}
+
+test('mappe un audit encore sans ancêtre commun ni profondeur', async () => {
   const database = new RecordingDatabase();
   database.rows = [{
-    reorg_id: 'reorg-1',
+    reorg_id: 'reorg-pending',
     detected_at_ms: '1753700000000',
-    common_ancestor_number: '10',
-    common_ancestor_hash: HASH_10,
+    common_ancestor_number: null,
+    common_ancestor_hash: null,
     previous_tip_number: '12',
     previous_tip_hash: HASH_12,
     replacement_tip_number: '11',
     replacement_tip_hash: HASH_11,
-    state: 'RECONCILING',
-    orphaned_block_count: '2',
-    orphaned_event_count: '3',
-    affected_session_count: '1',
+    status: 'RECONCILING',
+    depth: null,
+    orphaned_events: '0',
+    replayed_events: '0',
+    details: {},
   }];
   const repository = new CanonicalChainRepository(database);
 
   const audit = await repository.getLastReorg();
 
-  assert.deepEqual(audit, {
-    id: 'reorg-1',
-    detectedAtMs: 1_753_700_000_000,
-    commonAncestor: { number: 10n, hash: HASH_10 },
-    previousTip: { number: 12n, hash: HASH_12 },
-    replacementTip: { number: 11n, hash: HASH_11 },
-    state: 'RECONCILING',
-    impact: {
-      orphanedBlockCount: 2,
-      orphanedEventCount: 3,
-      affectedSessionCount: 1,
-    },
-  });
-  assert.match(database.calls[0]?.sql ?? '', /ORDER BY detected_at DESC LIMIT 1/u);
+  assert.equal(audit?.commonAncestor, null);
+  assert.equal(audit?.impact.depth, null);
+  assert.equal(audit?.impact.orphanedEvents, 0);
+  assert.equal(audit?.impact.replayedEvents, 0);
+  assert.deepEqual(audit?.details, {});
 });

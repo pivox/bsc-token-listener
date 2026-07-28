@@ -37,6 +37,55 @@ class FakeClient {
   release(): void {}
 }
 
+class StatefulSwapClient extends FakeClient {
+  row: {
+    canonical: boolean;
+    processingStatus: 'PENDING' | 'PROCESSING' | 'PROCESSED' | 'FAILED';
+    blockHash: string;
+  } | null;
+
+  constructor(row: StatefulSwapClient['row']) {
+    super();
+    this.row = row;
+  }
+
+  override async query<T>(
+    sql: string,
+    values?: unknown[],
+  ): Promise<{ rows: T[] }> {
+    this.calls.push({ sql, ...(values ? { values } : {}) });
+    if (sql.includes('INSERT INTO swap_events')) {
+      assert.match(sql, /WHERE swap_events\.canonical = FALSE/u);
+      if (this.row === null) {
+        this.row = {
+          canonical: true,
+          processingStatus: 'PENDING',
+          blockHash: String(values?.[3]),
+        };
+      } else if (!this.row.canonical) {
+        this.row = {
+          canonical: true,
+          processingStatus: 'PENDING',
+          blockHash: String(values?.[3]),
+        };
+      }
+      return { rows: [] };
+    }
+    if (sql.includes('UPDATE swap_events') && sql.includes('RETURNING event_id')) {
+      assert.match(sql, /processing_status IN \('PENDING', 'FAILED'\)/u);
+      if (
+        this.row?.processingStatus === 'PENDING'
+        || this.row?.processingStatus === 'FAILED'
+      ) {
+        this.row.processingStatus = 'PROCESSING';
+        return { rows: [{ event_id: 'event-1' } as T] };
+      }
+      return { rows: [] };
+    }
+    return { rows: [] };
+  }
+}
+
 function pair(): PairInfo {
   return {
     factory: ADDRESS,
@@ -222,19 +271,31 @@ test('réclame atomiquement un swap avec hash et snapshot avant traitement', asy
 });
 
 test('ne réclame pas un doublon canonique déjà traité', async () => {
-  const client = new FakeClient();
-  client.updateRows = 0;
+  const client = new StatefulSwapClient({
+    canonical: true,
+    processingStatus: 'PROCESSED',
+    blockHash: HASH,
+  });
   const repository = new SwapEventRepository({
     query: client.query.bind(client),
     connect: async () => client,
   });
 
   assert.equal(await repository.claim(swapEvent(), session('HOLDING')), false);
+  assert.deepEqual(client.row, {
+    canonical: true,
+    processingStatus: 'PROCESSED',
+    blockHash: HASH,
+  });
   assert.equal(client.calls.at(-1)?.sql, 'COMMIT');
 });
 
 test('réactive uniquement un événement orphelin avec la nouvelle provenance et PENDING', async () => {
-  const client = new FakeClient();
+  const client = new StatefulSwapClient({
+    canonical: false,
+    processingStatus: 'PROCESSED',
+    blockHash: HASH,
+  });
   const repository = new SwapEventRepository({
     query: client.query.bind(client),
     connect: async () => client,
@@ -244,7 +305,10 @@ test('réactive uniquement un événement orphelin avec la nouvelle provenance e
     blockHash: `0x${'8'.repeat(64)}` as Hash,
   };
 
-  await repository.claim(event, session('WAITING_FIRST_BUY'));
+  assert.equal(
+    await repository.claim(event, session('WAITING_FIRST_BUY')),
+    true,
+  );
 
   const upsert = client.calls[1];
   assert.match(upsert?.sql ?? '', /block_hash = EXCLUDED\.block_hash/u);
@@ -254,6 +318,11 @@ test('réactive uniquement un événement orphelin avec la nouvelle provenance e
   assert.match(upsert?.sql ?? '', /processed_at = NULL/u);
   assert.match(upsert?.sql ?? '', /session_after = NULL/u);
   assert.equal(upsert?.values?.[3], event.blockHash.toLowerCase());
+  assert.deepEqual(client.row, {
+    canonical: true,
+    processingStatus: 'PROCESSING',
+    blockHash: event.blockHash.toLowerCase(),
+  });
 });
 
 test('finalise un swap avec le snapshot de session après traitement', async () => {

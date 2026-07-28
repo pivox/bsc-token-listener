@@ -1,7 +1,10 @@
 import { isHash, type Address } from 'viem';
 import { pool } from './database.js';
 import { parseJson, stringifyJson } from '../utils/json.js';
-import type { ListenerCheckpoint } from '../chain/canonical-chain.types.js';
+import type {
+  AnchoredListenerCheckpoint,
+  ListenerCheckpoint,
+} from '../chain/canonical-chain.types.js';
 import type {
   PairInfo,
   SwapEvent,
@@ -466,14 +469,26 @@ export class CheckpointRepository {
       [key],
     );
     const row = result.rows[0];
-    if (!row || row.block_hash === null || !isHash(row.block_hash)) return null;
+    if (!row) return null;
+    if (row.block_hash === null) {
+      return {
+        blockNumber: BigInt(row.block_number),
+        blockHash: null,
+      };
+    }
+    if (!isHash(row.block_hash)) {
+      throw new Error(`Hash de checkpoint invalide pour ${key}.`);
+    }
     return {
       blockNumber: BigInt(row.block_number),
       blockHash: row.block_hash,
     };
   }
 
-  async set(key: string, checkpoint: ListenerCheckpoint): Promise<void> {
+  async set(
+    key: string,
+    checkpoint: AnchoredListenerCheckpoint,
+  ): Promise<void> {
     await this.database.query(
       `INSERT INTO listener_checkpoints(listener_key, block_number, block_hash)
        VALUES ($1, $2, $3)
