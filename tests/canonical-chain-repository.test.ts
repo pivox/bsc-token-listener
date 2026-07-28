@@ -5,6 +5,7 @@ import type { Hash } from 'viem';
 import { CanonicalChainRepository } from '../src/chain/canonical-chain.repository.js';
 import type {
   CanonicalBlock,
+  ChainReorgStatus,
   ReorgReconciliation,
 } from '../src/chain/canonical-chain.types.js';
 import { CheckpointRepository } from '../src/storage/repositories.js';
@@ -23,6 +24,10 @@ const SHALLOW_REORG: ReorgReconciliation = {
 
 interface ReorgFixtureState {
   auditCount: number;
+  auditStatus: ChainReorgStatus | null;
+  replayedEvents: number;
+  rollbackImpact: unknown | null;
+  details: Record<string, unknown>;
   committed: boolean;
   released: boolean;
   mutations: string[];
@@ -32,13 +37,16 @@ class StatefulReorgDatabase {
   readonly calls: Array<{ sql: string; values?: unknown[] }> = [];
   readonly state: ReorgFixtureState = {
     auditCount: 0,
+    auditStatus: null,
+    replayedEvents: 0,
+    rollbackImpact: null,
+    details: {},
     committed: false,
     released: false,
     mutations: [],
   };
   failOn: string | null = null;
   private pending: ReorgFixtureState | null = null;
-  private savedImpact: unknown = null;
 
   async connect(): Promise<this> {
     return this;
@@ -70,14 +78,31 @@ class StatefulReorgDatabase {
     }
     const staged = this.pending ?? this.state;
     if (normalized.includes('INSERT INTO chain_reorgs')) {
-      if (staged.auditCount === 0) staged.auditCount = 1;
+      if (staged.auditCount === 0) {
+        staged.auditCount = 1;
+        staged.auditStatus = String(values?.[7]) as ChainReorgStatus;
+        staged.details = JSON.parse(String(values?.[11]));
+      } else {
+        const previousStatus = staged.auditStatus;
+        const preservesTerminal = previousStatus === 'RECOVERED'
+          || (
+            previousStatus === 'MANUAL_REVIEW'
+            && normalized.includes("IN ('RECOVERED', 'MANUAL_REVIEW')")
+          );
+        staged.auditStatus = preservesTerminal
+          ? previousStatus
+          : String(values?.[7]) as ChainReorgStatus;
+        if (!preservesTerminal) {
+          Object.assign(staged.details, JSON.parse(String(values?.[11])));
+        }
+      }
       staged.mutations.push('audit');
       return {
         rows: [{
-          status: this.savedImpact ? 'RECONCILING' : String(values?.[7]),
-          details: this.savedImpact
-            ? { rollbackImpact: this.savedImpact }
-            : JSON.parse(String(values?.[11])),
+          status: staged.auditStatus,
+          details: staged.rollbackImpact === null
+            ? staged.details
+            : { ...staged.details, rollbackImpact: staged.rollbackImpact },
         }] as T[],
       };
     }
@@ -139,8 +164,39 @@ class StatefulReorgDatabase {
       };
     }
     if (normalized.includes('UPDATE chain_reorgs') && normalized.includes('rollbackImpact')) {
-      this.savedImpact = JSON.parse(String(values?.[2]));
+      staged.rollbackImpact = JSON.parse(String(values?.[2]));
       staged.mutations.push('impact');
+      return { rows: [] };
+    }
+    if (
+      normalized.includes('UPDATE chain_reorgs')
+      && normalized.includes("SET status = 'RECOVERED'")
+    ) {
+      if (
+        !normalized.includes("AND status = 'RECONCILING'")
+        || staged.auditStatus === 'RECONCILING'
+      ) {
+        staged.auditStatus = 'RECOVERED';
+        staged.replayedEvents = Number(values?.[1]);
+      }
+      staged.mutations.push('complete');
+      return { rows: [] };
+    }
+    if (
+      normalized.includes('UPDATE chain_reorgs')
+      && normalized.includes("'MANUAL_REVIEW'")
+    ) {
+      if (
+        (
+          !normalized.includes("AND status = 'RECONCILING'")
+          && staged.auditStatus !== 'RECOVERED'
+        )
+        || staged.auditStatus === 'RECONCILING'
+      ) {
+        staged.auditStatus = 'MANUAL_REVIEW';
+        Object.assign(staged.details, JSON.parse(String(values?.[1])));
+      }
+      staged.mutations.push('manual');
       return { rows: [] };
     }
     if (
@@ -514,6 +570,10 @@ for (const failure of [
     assert.equal(database.calls.some(({ sql }) => sql === 'COMMIT'), false);
     assert.deepEqual(database.state, {
       auditCount: 0,
+      auditStatus: null,
+      replayedEvents: 0,
+      rollbackImpact: null,
+      details: {},
       committed: false,
       released: true,
       mutations: [],
@@ -591,5 +651,52 @@ test('complete et manual review écrivent compte et détail sûr sans régresser
     'reorg-id',
     '{"reason":"WALLET_CONSEQUENCE_REQUIRES_REVIEW"}',
   ]);
-  assert.match(manual?.sql ?? '', /status = 'RECOVERED' THEN status/u);
+  assert.match(manual?.sql ?? '', /AND status = 'RECONCILING'/u);
+});
+
+test('un retry de rewind conserve un audit MANUAL_REVIEW terminal', async () => {
+  const database = new StatefulReorgDatabase();
+  const repository = new CanonicalChainRepository(database);
+  const first = await repository.rewindToAncestor(SHALLOW_REORG);
+  await repository.requireManualReview(
+    first.reorgId,
+    'SESSION_RECONCILIATION_FAILED',
+  );
+
+  const retry = await repository.rewindToAncestor(SHALLOW_REORG);
+
+  assert.deepEqual(retry, first);
+  assert.equal(database.state.auditStatus, 'MANUAL_REVIEW');
+});
+
+test('completeReorg laisse un audit MANUAL_REVIEW et son compteur inchangés', async () => {
+  const database = new StatefulReorgDatabase();
+  const repository = new CanonicalChainRepository(database);
+  const impact = await repository.rewindToAncestor(SHALLOW_REORG);
+  await repository.requireManualReview(
+    impact.reorgId,
+    'WALLET_CONSEQUENCE_REQUIRES_REVIEW',
+  );
+
+  await repository.completeReorg(impact.reorgId, 9);
+
+  assert.equal(database.state.auditStatus, 'MANUAL_REVIEW');
+  assert.equal(database.state.replayedEvents, 0);
+});
+
+test('requireManualReview laisse un audit RECOVERED intégralement inchangé', async () => {
+  const database = new StatefulReorgDatabase();
+  const repository = new CanonicalChainRepository(database);
+  const impact = await repository.rewindToAncestor(SHALLOW_REORG);
+  await repository.completeReorg(impact.reorgId, 4);
+  const detailsBefore = structuredClone(database.state.details);
+
+  await repository.requireManualReview(
+    impact.reorgId,
+    'REPLAY_FAILED',
+  );
+
+  assert.equal(database.state.auditStatus, 'RECOVERED');
+  assert.equal(database.state.replayedEvents, 4);
+  assert.deepEqual(database.state.details, detailsBefore);
 });

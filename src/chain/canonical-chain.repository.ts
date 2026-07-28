@@ -470,7 +470,8 @@ export class CanonicalChainRepository {
       await client.query(
         `UPDATE chain_reorgs
          SET status = 'RECOVERED', replayed_events = $2
-         WHERE reorg_id = $1`,
+         WHERE reorg_id = $1
+           AND status = 'RECONCILING'`,
         [reorgIdValue, replayedEvents],
       );
     });
@@ -484,12 +485,10 @@ export class CanonicalChainRepository {
     await this.withTransaction(async (client) => {
       await client.query(
         `UPDATE chain_reorgs
-         SET status = CASE
-               WHEN status = 'RECOVERED' THEN status
-               ELSE 'MANUAL_REVIEW'
-             END,
+         SET status = 'MANUAL_REVIEW',
              details = details || $2::jsonb
-         WHERE reorg_id = $1`,
+         WHERE reorg_id = $1
+           AND status = 'RECONCILING'`,
         [reorgIdValue, stringifyJson({ reason })],
       );
     });
@@ -518,10 +517,15 @@ export class CanonicalChainRepository {
        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)
        ON CONFLICT (reorg_id) DO UPDATE SET
          status = CASE
-           WHEN chain_reorgs.status = 'RECOVERED' THEN chain_reorgs.status
+           WHEN chain_reorgs.status IN ('RECOVERED', 'MANUAL_REVIEW')
+             THEN chain_reorgs.status
            ELSE EXCLUDED.status
          END,
-         details = chain_reorgs.details || EXCLUDED.details
+         details = CASE
+           WHEN chain_reorgs.status IN ('RECOVERED', 'MANUAL_REVIEW')
+             THEN chain_reorgs.details
+           ELSE chain_reorgs.details || EXCLUDED.details
+         END
        RETURNING status, details`,
       [
         reorgId(reorg),
