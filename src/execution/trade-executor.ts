@@ -26,17 +26,17 @@ export class TradeExecutor {
 
   constructor(private readonly trades: TradeRepository) {}
 
-  async buy(session: TokenSession): Promise<EntryExecution> {
+  async buy(session: TokenSession, amountInWei: bigint): Promise<EntryExecution> {
     return this.queue.run(async () => {
       const path = [session.pair.wbnb, session.pair.token] as const;
       const quoted = await publicClient.readContract({
         address: session.pair.router,
         abi: pancakeRouterAbi,
         functionName: 'getAmountsOut',
-        args: [config.buyAmountWei, [...path]],
+        args: [amountInWei, [...path]],
       });
       const amountOut = quoted[quoted.length - 1] ?? 0n;
-      const trade = this.newTrade(session, 'BUY', config.buyAmountWei, amountOut);
+      const trade = this.newTrade(session, 'BUY', amountInWei, amountOut);
       await this.trades.save(trade);
 
       if (config.executionMode === 'dry-run') {
@@ -50,7 +50,7 @@ export class TradeExecutor {
         await this.trades.save(trade);
         return {
           mode: 'dry-run',
-          amountInWei: config.buyAmountWei,
+          amountInWei,
           amountOutToken: amountOut,
           confirmedAtMs: Date.now(),
           cursor: {
@@ -73,7 +73,7 @@ export class TradeExecutor {
         abi: pancakeRouterAbi,
         functionName: 'swapExactETHForTokensSupportingFeeOnTransferTokens',
         args: [minimumOut(amountOut), [...path], account.address, deadline()],
-        value: config.buyAmountWei,
+        value: amountInWei,
         account,
       });
       const receipt = await publicClient.waitForTransactionReceipt({
@@ -99,7 +99,7 @@ export class TradeExecutor {
 
       return {
         mode: 'live',
-        amountInWei: config.buyAmountWei,
+          amountInWei,
         amountOutToken: received,
         transactionHash: hash,
         confirmedAtMs: Date.now(),

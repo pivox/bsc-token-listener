@@ -196,7 +196,7 @@ export class SessionEngine {
       session.updatedAtMs = Date.now();
       await this.sessions.save(session);
       try {
-        session.entry = await this.executor.buy(session);
+        session.entry = await this.executor.buy(session, config.buyAmountWei);
         session.status = 'HOLDING';
         session.updatedAtMs = Date.now();
         await this.sessions.save(session);
