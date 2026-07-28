@@ -34,11 +34,13 @@ function block(number: bigint): CanonicalBlock {
 
 class MemoryBlockReader {
   readonly reads: bigint[] = [];
+  blockNumberReads = 0;
   failAt: bigint | null = null;
 
   constructor(readonly latest: bigint) {}
 
   async getBlockNumber(): Promise<bigint> {
+    this.blockNumberReads += 1;
     return this.latest;
   }
 
@@ -1064,6 +1066,121 @@ test('refuse des headers RPC provenant de forks différents pendant le scan', as
       processChunk: async () => true,
     }),
     CanonicalChainContinuityError,
+  );
+
+  assert.equal(reorgHandler.calls.length, 0);
+  assert.deepEqual(canonicalStore.saves, []);
+  assert.deepEqual(canonicalStore.pruneCalls, []);
+  assert.deepEqual(checkpoints.writes, []);
+});
+
+test('bloque toute nouvelle passe si un rewind shallow échoue', async () => {
+  const reader = new MemoryBlockReader(115n);
+  const originalGetBlock = reader.getBlock.bind(reader);
+  reader.getBlock = async (number) =>
+    number > 106n
+      ? forkedBlock(number, 106n)
+      : originalGetBlock(number);
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 11 }, (_, index) => block(BigInt(100 + index))),
+  );
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', {
+    blockNumber: 110n,
+    blockHash: block(110n).hash,
+  });
+  const reorgHandler = new MemoryReorgHandler();
+  reorgHandler.onReconcile = async ({ ancestor }) => {
+    for (const number of canonicalStore.blocks.keys()) {
+      if (ancestor && number > ancestor.number) {
+        canonicalStore.blocks.delete(number);
+      }
+    }
+    throw new Error('rewind incomplet');
+  };
+  const subject = coordinator(reader, canonicalStore, checkpoints, {
+    reorgHandler,
+  });
+  let processCalls = 0;
+  const request = {
+    listenerKey: 'pairs',
+    startBlock: 100n,
+    processChunk: async () => {
+      processCalls += 1;
+      return true;
+    },
+  };
+
+  await assert.rejects(subject.reconcile(request), /rewind incomplet/u);
+  assert.equal(subject.currentStatus.state, 'RECONCILING');
+  const readsAfterFailure = reader.reads.length;
+  const blockNumberReadsAfterFailure = reader.blockNumberReads;
+  const writesAfterFailure = checkpoints.writes.length;
+
+  await subject.reconcile(request);
+
+  assert.equal(reader.reads.length, readsAfterFailure);
+  assert.equal(reader.blockNumberReads, blockNumberReadsAfterFailure);
+  assert.equal(processCalls, 0);
+  assert.equal(checkpoints.writes.length, writesAfterFailure);
+  assert.equal(reorgHandler.calls.length, 1);
+  assert.equal(subject.currentStatus.state, 'RECONCILING');
+});
+
+test('refuse une fenêtre canonique vide avant le handler', async () => {
+  const reader = new MemoryBlockReader(115n);
+  reader.getBlock = async (number) => forkedBlock(number, 106n);
+  const canonicalStore = new MemoryCanonicalStore([block(110n)]);
+  canonicalStore.listCanonicalDescending = async () => [];
+  const checkpoints = new MemoryCheckpoints();
+  const reorgHandler = new MemoryReorgHandler();
+  const subject = coordinator(reader, canonicalStore, checkpoints, {
+    reorgHandler,
+  });
+
+  await assert.rejects(
+    subject.reconcile({
+      listenerKey: 'pairs',
+      startBlock: 100n,
+      processChunk: async () => true,
+    }),
+    /fenêtre canonique.*vide/iu,
+  );
+
+  assert.equal(reorgHandler.calls.length, 0);
+  assert.deepEqual(canonicalStore.saves, []);
+  assert.deepEqual(canonicalStore.pruneCalls, []);
+  assert.deepEqual(checkpoints.writes, []);
+});
+
+test('refuse une fenêtre canonique supérieure à 128 avant le handler', async () => {
+  const reader = new MemoryBlockReader(133n);
+  reader.getBlock = async (number) => ({
+    number,
+    hash: hash(20_000n + number),
+    parentHash:
+      number === 0n ? ZERO_HASH : hash(20_000n + number - 1n),
+  });
+  const persisted = Array.from(
+    { length: 129 },
+    (_, index) => block(BigInt(index)),
+  );
+  const canonicalStore = new MemoryCanonicalStore(persisted);
+  canonicalStore.listCanonicalDescending = async () =>
+    [...persisted].reverse();
+  const checkpoints = new MemoryCheckpoints();
+  const reorgHandler = new MemoryReorgHandler();
+  const subject = coordinator(reader, canonicalStore, checkpoints, {
+    reorgHandler,
+  });
+
+  await assert.rejects(
+    subject.reconcile({
+      listenerKey: 'pairs',
+      startBlock: 0n,
+      processChunk: async () => true,
+    }),
+    /fenêtre canonique.*128/iu,
   );
 
   assert.equal(reorgHandler.calls.length, 0);

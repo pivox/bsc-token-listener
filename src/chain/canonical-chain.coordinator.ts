@@ -340,7 +340,7 @@ export class CanonicalChainCoordinator {
   }
 
   private async execute(request: ConfirmedRangeRequest): Promise<void> {
-    if (this.status.state === 'MANUAL_REVIEW') return;
+    if (this.status.state !== 'HEALTHY') return;
 
     const latestBlock = await this.blockReader.getBlockNumber();
     const head = confirmedHead(latestBlock, this.confirmations);
@@ -549,7 +549,14 @@ export class CanonicalChainCoordinator {
     descending: CanonicalBlock[],
   ): CanonicalBlock[] {
     if (descending.length === 0) {
-      return [validateHeader(tip, tip.number)];
+      throw new CanonicalChainContinuityError(
+        'Fenêtre canonique vide malgré un tip stocké.',
+      );
+    }
+    if (descending.length > DEFAULT_CANONICAL_RETENTION) {
+      throw new CanonicalChainContinuityError(
+        `Fenêtre canonique supérieure à ${DEFAULT_CANONICAL_RETENTION} blocs.`,
+      );
     }
     const window = descending.map((header) =>
       validateHeader(header, header.number));
