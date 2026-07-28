@@ -1042,10 +1042,18 @@ test('une erreur RPC pendant le préflight ou la recherche d’ancêtre ne mute 
 
 test('refuse des headers RPC provenant de forks différents pendant le scan', async () => {
   const reader = new MemoryBlockReader(117n);
-  reader.getBlock = async (number) =>
-    number <= 110n
-      ? forkedBlock(number, 106n, 10_000n)
-      : forkedBlock(number, 106n, 20_000n);
+  let headReads = 0;
+  reader.getBlock = async (number) => {
+    if (number === 112n) {
+      headReads += 1;
+      return forkedBlock(
+        number,
+        106n,
+        headReads === 1 ? 20_000n : 30_000n,
+      );
+    }
+    return forkedBlock(number, 106n, 10_000n);
+  };
   const canonicalStore = new MemoryCanonicalStore(
     Array.from({ length: 11 }, (_, index) => block(BigInt(100 + index))),
   );
@@ -1072,6 +1080,83 @@ test('refuse des headers RPC provenant de forks différents pendant le scan', as
   assert.deepEqual(canonicalStore.saves, []);
   assert.deepEqual(canonicalStore.pruneCalls, []);
   assert.deepEqual(checkpoints.writes, []);
+});
+
+test('borne la recherche d’ancêtre même si le head est très éloigné du tip', async () => {
+  const reader = new MemoryBlockReader(1_005n);
+  reader.getBlock = async (number) => {
+    reader.reads.push(number);
+    return forkedBlock(number, 106n);
+  };
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 11 }, (_, index) => block(BigInt(100 + index))),
+  );
+  const checkpoints = new MemoryCheckpoints();
+  const reorgHandler = new MemoryReorgHandler();
+  const subject = coordinator(reader, canonicalStore, checkpoints, {
+    reorgHandler,
+  });
+
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 2_000n,
+    processChunk: async () => true,
+  });
+
+  assert.ok(
+    reader.reads.length <= DEFAULT_CANONICAL_RETENTION + 3,
+    `lectures RPC non bornées: ${reader.reads.length}`,
+  );
+  assert.equal(reader.reads.includes(999n), false);
+  assert.equal(reorgHandler.calls.length, 1);
+  assert.equal(reorgHandler.calls[0]?.ancestor?.number, 106n);
+  assert.equal(reorgHandler.calls[0]?.newTip.number, 1_000n);
+});
+
+test('isole le handler et les snapshots de status par clones défensifs', async () => {
+  const reader = new MemoryBlockReader(115n);
+  reader.getBlock = async (number) => forkedBlock(number, 106n);
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 11 }, (_, index) => block(BigInt(100 + index))),
+  );
+  const checkpoints = new MemoryCheckpoints();
+  const returnedImpact: ReorgImpact = {
+    depth: 4,
+    orphanedEvents: 2,
+    replayedEvents: 1,
+  };
+  const reorgHandler: CanonicalReorgHandler = {
+    reconcileReorg: async (reorg) => {
+      (reorg.oldTip as { hash: Hash }).hash = hash(90_001n);
+      (reorg.ancestor as { hash: Hash }).hash = hash(90_002n);
+      return returnedImpact;
+    },
+  };
+  const subject = coordinator(reader, canonicalStore, checkpoints, {
+    reorgHandler,
+  });
+
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 100n,
+    processChunk: async () => true,
+  });
+
+  assert.equal(canonicalStore.blocks.get(106n)?.hash, block(106n).hash);
+  (returnedImpact as { orphanedEvents: number }).orphanedEvents = 999;
+  const exposed = subject.currentStatus;
+  assert.ok(exposed.lastReorg);
+  (exposed.lastReorg.oldTip as { hash: Hash }).hash = hash(90_003n);
+  (exposed.lastReorg.impact as { replayedEvents: number }).replayedEvents = 999;
+
+  const reread = subject.currentStatus.lastReorg;
+  assert.equal(reread?.oldTip.hash, block(110n).hash);
+  assert.equal(reread?.ancestor?.hash, block(106n).hash);
+  assert.deepEqual(reread?.impact, {
+    depth: 4,
+    orphanedEvents: 2,
+    replayedEvents: 1,
+  });
 });
 
 test('bloque toute nouvelle passe si un rewind shallow échoue', async () => {

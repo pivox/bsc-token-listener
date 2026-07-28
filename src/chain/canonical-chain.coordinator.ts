@@ -19,6 +19,7 @@ import type {
   CanonicalReorgSummary,
   ConfirmedRangeRequest,
   ListenerCheckpoint,
+  ReorgImpact,
   ReorgReconciliation,
 } from './canonical-chain.types.js';
 import { confirmedHead } from './confirmed-blocks.js';
@@ -148,6 +149,21 @@ function sameHeader(left: CanonicalBlock, right: CanonicalBlock): boolean {
     && left.hash.toLowerCase() === right.hash.toLowerCase()
     && left.parentHash.toLowerCase() === right.parentHash.toLowerCase()
   );
+}
+
+function cloneReconciliation(
+  reorg: ReorgReconciliation,
+): ReorgReconciliation {
+  return {
+    ancestor: reorg.ancestor ? { ...reorg.ancestor } : null,
+    oldTip: { ...reorg.oldTip },
+    newTip: { ...reorg.newTip },
+    depth: reorg.depth,
+  };
+}
+
+function cloneImpact(impact: ReorgImpact): ReorgImpact {
+  return { ...impact };
 }
 
 function minimum(values: bigint[]): bigint | null {
@@ -311,7 +327,7 @@ export class CanonicalChainCoordinator {
   }
 
   get currentStatus(): CanonicalChainCoordinatorStatus {
-    return { ...this.status };
+    return structuredClone(this.status);
   }
 
   reconcile(request: ConfirmedRangeRequest): Promise<void> {
@@ -475,40 +491,21 @@ export class CanonicalChainCoordinator {
     head: bigint,
   ): Promise<void> {
     const window = this.validateDescendingWindow(oldTip, descending);
-    const newTip =
-      head === oldTip.number
-        ? remoteOldTip
-        : validateHeader(await this.blockReader.getBlock(head), head);
-    const remoteHeaders = new Map<bigint, CanonicalBlock>([
-      [oldTip.number, remoteOldTip],
-      [head, newTip],
-    ]);
-    let newerRemote = newTip;
-    for (
-      let number = head - 1n;
-      number >= oldTip.number;
-      number -= 1n
-    ) {
-      const remote =
-        number === oldTip.number
-          ? remoteOldTip
-          : validateHeader(
-              await this.blockReader.getBlock(number),
-              number,
-            );
-      assertContinuous(remote, newerRemote);
-      remoteHeaders.set(number, remote);
-      newerRemote = remote;
-    }
+    const newTip = validateHeader(
+      await this.blockReader.getBlock(head),
+      head,
+    );
+    let newerRemote: CanonicalBlock | null = null;
     let ancestor: CanonicalBlock | null = null;
     for (const stored of window) {
       const remote =
-        remoteHeaders.get(stored.number)
-        ?? validateHeader(
+        stored.number === oldTip.number
+          ? remoteOldTip
+          : validateHeader(
               await this.blockReader.getBlock(stored.number),
               stored.number,
             );
-      if (stored.number < oldTip.number) {
+      if (newerRemote) {
         assertContinuous(remote, newerRemote);
       }
       if (remote.hash.toLowerCase() === stored.hash.toLowerCase()) {
@@ -516,6 +513,15 @@ export class CanonicalChainCoordinator {
         break;
       }
       newerRemote = remote;
+    }
+    const verifiedNewTip = validateHeader(
+      await this.blockReader.getBlock(head),
+      head,
+    );
+    if (!sameHeader(newTip, verifiedNewTip)) {
+      throw new CanonicalChainContinuityError(
+        `Le tip RPC ${head} a changé pendant la recherche d’ancêtre.`,
+      );
     }
 
     const depth = ancestor
@@ -529,11 +535,16 @@ export class CanonicalChainCoordinator {
     };
     this.status = { ...this.status, state: 'RECONCILING' };
     try {
-      const impact = await this.reorgHandler.reconcileReorg(reorg);
+      const impact = await this.reorgHandler.reconcileReorg(
+        cloneReconciliation(reorg),
+      );
       this.status = {
         ...this.status,
         state: ancestor ? 'HEALTHY' : 'MANUAL_REVIEW',
-        lastReorg: { ...reorg, impact },
+        lastReorg: {
+          ...cloneReconciliation(reorg),
+          impact: cloneImpact(impact),
+        },
       };
     } catch (error: unknown) {
       if (!ancestor) {

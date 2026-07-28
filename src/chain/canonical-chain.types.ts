@@ -1,9 +1,9 @@
 import type { Hash } from 'viem';
 
 export interface CanonicalBlock {
-  number: bigint;
-  hash: Hash;
-  parentHash: Hash;
+  readonly number: bigint;
+  readonly hash: Hash;
+  readonly parentHash: Hash;
 }
 
 export interface CanonicalBlockReader {
@@ -42,16 +42,16 @@ export type ChainReorgStatus =
   | 'MANUAL_REVIEW';
 
 export interface ReorgImpact {
-  depth: number | null;
-  orphanedEvents: number;
-  replayedEvents: number;
+  readonly depth: number | null;
+  readonly orphanedEvents: number;
+  readonly replayedEvents: number;
 }
 
 export interface ReorgReconciliation {
-  ancestor: CanonicalBlock | null;
-  oldTip: CanonicalBlock;
-  newTip: CanonicalBlock;
-  depth: number | null;
+  readonly ancestor: CanonicalBlock | null;
+  readonly oldTip: CanonicalBlock;
+  readonly newTip: CanonicalBlock;
+  readonly depth: number | null;
 }
 
 export interface CanonicalReorgHandler {
@@ -59,7 +59,7 @@ export interface CanonicalReorgHandler {
 }
 
 export interface CanonicalReorgSummary extends ReorgReconciliation {
-  impact: ReorgImpact;
+  readonly impact: ReorgImpact;
 }
 
 export interface ChainBlockReference {
