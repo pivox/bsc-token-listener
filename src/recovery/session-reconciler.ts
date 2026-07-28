@@ -458,14 +458,14 @@ export class SessionReconciler {
       ];
     }
     const contaminated =
-      await this.gateway.hasLaterWalletActivityInBlock(
+      await this.gateway.hasOtherWalletActivityInBlock(
         transaction.walletAddress,
         session.pair.token,
         receipt.blockNumber,
         receipt.transactionIndex,
       );
     if (contaminated) {
-      throw new Error('Mesure contaminée par une transaction ultérieure dans le bloc.');
+      throw new Error('Mesure contaminée par une autre transaction dans le bloc.');
     }
     const [nativeAfter, tokenAfter] = await Promise.all([
       transaction.nativeBalanceAfter

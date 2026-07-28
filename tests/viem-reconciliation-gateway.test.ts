@@ -160,11 +160,7 @@ test('ignore une transaction ultérieure sans effet sur le wallet', async () => 
     { kind: 'token', blockNumber: 10n },
   ]);
   assert.equal(
-    await gateway.hasLaterWalletActivityInBlock(WALLET, TOKEN, 10n, 0),
-    false,
-  );
-  assert.equal(
-    await gateway.hasLaterWalletActivityInBlock(WALLET, TOKEN, 10n, 1),
+    await gateway.hasOtherWalletActivityInBlock(WALLET, TOKEN, 10n, 0),
     false,
   );
 });
@@ -178,7 +174,7 @@ test('détecte un transfert direct ou BEP-20 ultérieur vers le wallet', async (
     ],
   }));
   assert.equal(
-    await direct.hasLaterWalletActivityInBlock(WALLET, TOKEN, 10n, 0),
+    await direct.hasOtherWalletActivityInBlock(WALLET, TOKEN, 10n, 0),
     true,
   );
 
@@ -205,7 +201,7 @@ test('détecte un transfert direct ou BEP-20 ultérieur vers le wallet', async (
     },
   }));
   assert.equal(
-    await tokenTransfer.hasLaterWalletActivityInBlock(
+    await tokenTransfer.hasOtherWalletActivityInBlock(
       WALLET,
       TOKEN,
       10n,
@@ -226,7 +222,22 @@ test('refuse un appel de contrat ultérieur aux effets natifs non traçables', a
   }));
 
   assert.equal(
-    await gateway.hasLaterWalletActivityInBlock(WALLET, TOKEN, 10n, 0),
+    await gateway.hasOtherWalletActivityInBlock(WALLET, TOKEN, 10n, 0),
+    true,
+  );
+});
+
+test('détecte aussi une activité wallet antérieure dans le bloc', async () => {
+  const otherWallet = `0x${'5'.repeat(40)}` as Address;
+  const gateway = new ViemReconciliationGateway(client({
+    blockTransactions: [
+      { hash: OTHER_HASH, from: otherWallet, to: WALLET },
+      { hash: HASH, from: WALLET, to: TOKEN },
+    ],
+  }));
+
+  assert.equal(
+    await gateway.hasOtherWalletActivityInBlock(WALLET, TOKEN, 10n, 1),
     true,
   );
 });

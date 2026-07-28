@@ -27,7 +27,7 @@ export interface ReconciliationGateway {
     wallet: Address,
     blockNumber: bigint,
   ): Promise<bigint>;
-  hasLaterWalletActivityInBlock(
+  hasOtherWalletActivityInBlock(
     wallet: Address,
     token: Address,
     blockNumber: bigint,
