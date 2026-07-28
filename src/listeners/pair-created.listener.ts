@@ -66,7 +66,7 @@ export class PairCreatedListener {
     try {
       const latest = await publicClient.getBlockNumber();
       const stored = await this.checkpoints.get('pair-created');
-      let fromBlock = stored === null ? latest : stored + 1n;
+      let fromBlock = stored === null ? latest : stored.blockNumber + 1n;
       const chunk = 1_500n;
       while (fromBlock <= latest) {
         const toBlock = fromBlock + chunk - 1n > latest ? latest : fromBlock + chunk - 1n;
@@ -78,7 +78,11 @@ export class PairCreatedListener {
           toBlock,
         });
         await this.processLogs(logs as PairCreatedLog[]);
-        await this.checkpoints.set('pair-created', toBlock);
+        const block = await publicClient.getBlock({ blockNumber: toBlock });
+        await this.checkpoints.set('pair-created', {
+          blockNumber: toBlock,
+          blockHash: block.hash,
+        });
         fromBlock = toBlock + 1n;
       }
     } finally {

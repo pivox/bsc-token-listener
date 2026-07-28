@@ -119,7 +119,9 @@ export class SwapListener {
     try {
       const latest = await publicClient.getBlockNumber();
       const stored = await this.checkpoints.get(key);
-      let fromBlock = stored === null ? this.session.pair.createdBlock : stored + 1n;
+      let fromBlock = stored === null
+        ? this.session.pair.createdBlock
+        : stored.blockNumber + 1n;
       const chunk = 1_500n;
       while (fromBlock <= latest) {
         const toBlock = fromBlock + chunk - 1n > latest ? latest : fromBlock + chunk - 1n;
@@ -132,7 +134,11 @@ export class SwapListener {
         });
         const remainsActive = await this.processLogs(logs as SwapLog[]);
         if (!remainsActive) return;
-        await this.checkpoints.set(key, toBlock);
+        const block = await publicClient.getBlock({ blockNumber: toBlock });
+        await this.checkpoints.set(key, {
+          blockNumber: toBlock,
+          blockHash: block.hash,
+        });
         fromBlock = toBlock + 1n;
       }
     } finally {
@@ -170,7 +176,7 @@ export class SwapListener {
         amount0Out: args.amount0Out,
         amount1Out: args.amount1Out,
       });
-      if (!(await this.events.claim(event))) continue;
+      if (!(await this.events.claim(event, this.session))) continue;
       try {
         const consumed = await this.engine.onSwap(this.session, event);
         if (!consumed) {
@@ -179,7 +185,7 @@ export class SwapListener {
           this.onTerminal(this.session.pair.pair);
           return false;
         }
-        await this.events.markProcessed(event.id);
+        await this.events.markProcessed(event.id, this.session);
         if (!isSessionMonitorable(this.session)) {
           this.stop();
           this.onTerminal(this.session.pair.pair);

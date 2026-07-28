@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import type { Hash } from 'viem';
+import type { ListenerCheckpoint } from '../src/chain/canonical-chain.types.js';
 import { HeartbeatService } from '../src/heartbeat/heartbeat.js';
 import type { CheckpointRepository, SessionRepository } from '../src/storage/repositories.js';
+
+const BLOCK_HASH = `0x${'1'.repeat(64)}` as Hash;
 
 function createSessionStore(active: number): { countActive: () => Promise<number> } {
   return {
@@ -13,10 +17,12 @@ function createSessionStore(active: number): { countActive: () => Promise<number
 
 function createCheckpointStore(
   checkpoint: bigint | null,
-): { get: (key: string) => Promise<bigint | null> } {
+): { get: (key: string) => Promise<ListenerCheckpoint | null> } {
   return {
-    async get(_key: string): Promise<bigint | null> {
-      return checkpoint;
+    async get(_key: string): Promise<ListenerCheckpoint | null> {
+      return checkpoint === null
+        ? null
+        : { blockNumber: checkpoint, blockHash: BLOCK_HASH };
     },
   };
 }
