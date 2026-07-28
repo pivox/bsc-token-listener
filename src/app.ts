@@ -18,6 +18,7 @@ import { RecoveryIntentService } from './recovery/recovery-intent.service.js';
 import { ReconciliationRepository } from './recovery/reconciliation.repository.js';
 import { SessionReconciler } from './recovery/session-reconciler.js';
 import { ViemReconciliationGateway } from './recovery/viem-reconciliation.gateway.js';
+import { RuntimeRecoveryBarrier } from './recovery/runtime-recovery-barrier.js';
 import { account, publicClient, wsClient } from './rpc/clients.js';
 import { RiskSettingsStore } from './security/risk-settings.store.js';
 import { TokenRiskService } from './security/token-risk.service.js';
@@ -81,13 +82,23 @@ async function main(): Promise<void> {
       return publicClient.getBalance({ address: account.address });
     },
   });
-  const engine = new SessionEngine(sessions, reports, risk, executor, amountService);
+  const runtimeRecoveryBarrier = new RuntimeRecoveryBarrier();
+  const engine = new SessionEngine(
+    sessions,
+    reports,
+    risk,
+    executor,
+    amountService,
+    runtimeRecoveryBarrier,
+  );
   let synchronizeRecoveredSessions = async (): Promise<void> => {};
   const reconciliationStore = new ReconciliationRepository();
   const recoveryIntents = new RecoveryIntentService({
     reports,
     risk,
     amounts: amountService,
+    positions: sessions,
+    maxConcurrentPositions: config.maxConcurrentPositions,
     executor,
     riskPolicy: config.riskPolicy,
   });
@@ -103,6 +114,7 @@ async function main(): Promise<void> {
       leaseMs: config.recoveryLeaseSeconds * 1_000,
       onPeriodicPassCompleted: () => synchronizeRecoveredSessions(),
     },
+    runtimeRecoveryBarrier,
   );
   const heartbeat = new HeartbeatService(
     checkpoints,

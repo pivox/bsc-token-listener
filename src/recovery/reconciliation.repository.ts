@@ -84,7 +84,13 @@ export class ReconciliationRepository implements ReconciliationStore {
         `WITH candidate AS (
            SELECT pair_address
            FROM token_sessions
-           WHERE status IN ('RISK_CHECKING', 'BUY_PENDING', 'SELL_PENDING')
+           WHERE (
+               status IN ('RISK_CHECKING', 'BUY_PENDING', 'SELL_PENDING')
+               OR (
+                 status = 'MANUAL_REVIEW'
+                 AND payload ? 'unreconciledExecution'
+               )
+             )
              AND (recovery_lease_until IS NULL OR recovery_lease_until < NOW())
              AND NOT (pair_address = ANY($3::text[]))
            ORDER BY updated_at

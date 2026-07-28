@@ -128,7 +128,9 @@ ORDER BY t.created_at DESC, x.created_at;
 Au démarrage, le bot réconcilie toutes les sessions interrompues avant d’activer
 le listener `PairCreated` et les listeners `Swap`. Une seule instance exécute une
 passe à la fois grâce à un verrou PostgreSQL ; les sessions sont réclamées avec
-un bail expirant et chaque session n’est traitée qu’une fois par passe.
+un bail expirant et chaque session n’est traitée qu’une fois par passe. Les
+passes périodiques drainent les opérations listener déjà engagées et empêchent
+qu’une nouvelle opération métier démarre pendant la reprise.
 
 La réconciliation observe la blockchain en lecture seule avant toute décision :
 
@@ -137,6 +139,9 @@ La réconciliation observe la blockchain en lecture seule avant toute décision 
 - un revert applique un état métier sûr ;
 - un hash absent, une mesure impossible ou une exécution ambiguë passe en
   `MANUAL_REVIEW` ;
+- une `MANUAL_REVIEW` qui conserve une référence d’exécution est réexaminée
+  périodiquement en lecture seule ; une revue manuelle sans référence ne l’est
+  jamais ;
 - une intention sans transaction enfant peut reprendre automatiquement, mais un
   achat exige toujours un `TokenRiskReport` persisté et compatible avec la
   politique de risque.

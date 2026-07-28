@@ -18,6 +18,7 @@ import { cursorAfter } from '../utils/cursor.js';
 import { errorMessage } from '../utils/error.js';
 import { logger } from '../utils/logger.js';
 import type { TokenRiskReport } from '../security/token-risk.types.js';
+import { RuntimeRecoveryBarrier } from '../recovery/runtime-recovery-barrier.js';
 
 const TERMINAL = new Set(['CLOSED', 'REJECTED', 'EXPIRED']);
 
@@ -30,6 +31,7 @@ export class SessionEngine {
     private readonly risk: TokenRiskService,
     private readonly executor: TradeExecutor,
     private readonly amountService: EntryAmountService,
+    private readonly runtimeBarrier = new RuntimeRecoveryBarrier(),
   ) {}
 
   async onSwap(session: TokenSession, event: SwapEvent): Promise<void> {
@@ -102,7 +104,7 @@ export class SessionEngine {
     });
     const current = previous.catch(() => undefined).then(async () => {
       try {
-        return await operation();
+        return await this.runtimeBarrier.runListener(operation);
       } finally {
         resolveCurrent?.();
       }

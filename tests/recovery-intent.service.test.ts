@@ -92,6 +92,8 @@ test('reprend RISK_CHECKING jusqu’à l’achat avec un rapport ALLOW persisté
     },
     risk: { analyze: async () => report() },
     amounts: { resolve: async () => 100n },
+    positions: { countOpenPositions: async () => 0 },
+    maxConcurrentPositions: 1,
     executor: {
       buy: async () => {
         assert.equal(savedReports.length, 1);
@@ -130,6 +132,8 @@ test('refuse un achat de reprise sans rapport ALLOW', async () => {
     },
     risk: { analyze: async () => report('REVIEW') },
     amounts: { resolve: async () => 100n },
+    positions: { countOpenPositions: async () => 1 },
+    maxConcurrentPositions: 1,
     executor: {
       buy: async () => {
         buyCalls += 1;
@@ -161,6 +165,8 @@ test('block-only refuse aussi un rapport BLOCK persisté', async () => {
     },
     risk: { analyze: async () => report('BLOCK') },
     amounts: { resolve: async () => 100n },
+    positions: { countOpenPositions: async () => 1 },
+    maxConcurrentPositions: 1,
     executor: {
       buy: async () => {
         buyCalls += 1;
@@ -178,4 +184,73 @@ test('block-only refuse aussi un rapport BLOCK persisté', async () => {
 
   assert.equal(buyCalls, 0);
   assert.equal(resumed.status, 'REJECTED');
+});
+
+test('la reprise du risque respecte la capacité maximale de positions', async () => {
+  let buyCalls = 0;
+  const service = new RecoveryIntentService({
+    reports: {
+      save: async () => undefined,
+      findById: async () => report(),
+    },
+    risk: { analyze: async () => report() },
+    amounts: { resolve: async () => 100n },
+    positions: { countOpenPositions: async () => 1 },
+    maxConcurrentPositions: 1,
+    executor: {
+      buy: async () => {
+        buyCalls += 1;
+        throw new Error('achat au-delà de la capacité');
+      },
+      sell: async () => {
+        throw new Error('vente inattendue');
+      },
+    },
+    riskPolicy: 'allow-only',
+    now: () => 3,
+  });
+
+  const resumed = await service.resumeRiskAndBuy(session('RISK_CHECKING'));
+
+  assert.equal(buyCalls, 0);
+  assert.equal(resumed.status, 'REJECTED');
+  assert.match(resumed.rejectionReason ?? '', /maximal/u);
+});
+
+test('BUY_PENDING exclut la session courante du calcul de capacité', async () => {
+  let buyCalls = 0;
+  const current = session('BUY_PENDING');
+  current.riskReportId = 'report';
+  const service = new RecoveryIntentService({
+    reports: {
+      save: async () => undefined,
+      findById: async () => report(),
+    },
+    risk: { analyze: async () => report() },
+    amounts: { resolve: async () => 100n },
+    positions: { countOpenPositions: async () => 1 },
+    maxConcurrentPositions: 1,
+    executor: {
+      buy: async () => {
+        buyCalls += 1;
+        return {
+          mode: 'dry-run',
+          amountInWei: 100n,
+          amountOutToken: 200n,
+          confirmedAtMs: 3,
+          cursor: { blockNumber: 2n, transactionIndex: 1, logIndex: 0 },
+        };
+      },
+      sell: async () => {
+        throw new Error('vente inattendue');
+      },
+    },
+    riskPolicy: 'allow-only',
+    now: () => 3,
+  });
+
+  const resumed = await service.resumeBuy(current);
+
+  assert.equal(buyCalls, 1);
+  assert.equal(resumed.status, 'HOLDING');
 });

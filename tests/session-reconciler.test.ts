@@ -206,6 +206,29 @@ test('reconstruit un achat confirmé depuis les soldes réels', async () => {
   assert.equal(decision?.transaction?.status, 'CONFIRMED');
 });
 
+test('retente la mesure read-only d’une exécution en revue manuelle', async () => {
+  const store = new MemoryStore();
+  const gateway = new FakeGateway();
+  const currentSession = session('MANUAL_REVIEW');
+  const currentTrade = trade('BUY');
+  const currentTransaction = transaction(currentTrade, 'BUY');
+  currentSession.unreconciledExecution = {
+    tradeId: currentTrade.id,
+    step: 'BUY',
+    outcome: 'CONFIRMED',
+    transactionHash: currentTransaction.transactionHash,
+    recordedAtMs: 3,
+  };
+  const current = claim(currentSession, currentTrade, currentTransaction);
+  const reconciler = new SessionReconciler(store, gateway, null, () => 20);
+
+  await reconciler.reconcile(current);
+
+  assert.equal(store.applied.at(-1)?.session.status, 'HOLDING');
+  assert.equal(store.applied.at(-1)?.action, 'BUY_CONFIRMED');
+  assert.equal(store.applied.at(-1)?.session.unreconciledExecution, undefined);
+});
+
 test('reconstruit une vente confirmée sans doubler la vente', async () => {
   const store = new MemoryStore();
   const gateway = new FakeGateway();

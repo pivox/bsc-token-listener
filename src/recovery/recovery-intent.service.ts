@@ -23,6 +23,10 @@ interface AmountResolver {
   resolve(session: TokenSession, liquidityWbnbWei: bigint): Promise<bigint | null>;
 }
 
+interface PositionCounter {
+  countOpenPositions(): Promise<number>;
+}
+
 interface RecoveryTradeExecutor {
   buy(session: TokenSession, amountInWei: bigint): Promise<EntryExecution>;
   sell(session: TokenSession): Promise<ExitExecution>;
@@ -32,6 +36,8 @@ interface RecoveryIntentDependencies {
   reports: RiskReportStore;
   risk: RiskAnalyzer;
   amounts: AmountResolver;
+  positions: PositionCounter;
+  maxConcurrentPositions: number;
   executor: RecoveryTradeExecutor;
   riskPolicy: 'allow-only' | 'block-only';
   now?: () => number;
@@ -67,8 +73,14 @@ export class RecoveryIntentService implements RecoveryIntentExecutor {
           `Reprise bloquée par TokenRiskReport ${report.verdict}.`;
         return session;
       }
+      if (!(await this.hasPositionCapacity(false))) {
+        session.status = 'REJECTED';
+        session.rejectionReason =
+          'Nombre maximal de positions simultanées atteint pendant la reprise.';
+        return session;
+      }
       session.status = 'BUY_PENDING';
-      return this.resumeBuy(session);
+      return this.resumeBuy(session, true);
     } catch (error) {
       session.recovery = {
         attempts: (session.recovery?.attempts ?? 0) + 1,
@@ -81,7 +93,10 @@ export class RecoveryIntentService implements RecoveryIntentExecutor {
     }
   }
 
-  async resumeBuy(session: TokenSession): Promise<TokenSession> {
+  async resumeBuy(
+    session: TokenSession,
+    capacityAlreadyChecked = false,
+  ): Promise<TokenSession> {
     if (session.status !== 'BUY_PENDING') {
       throw new Error('Reprise d’achat impossible depuis cet état.');
     }
@@ -95,6 +110,16 @@ export class RecoveryIntentService implements RecoveryIntentExecutor {
       session.status = 'REJECTED';
       session.rejectionReason =
         'Reprise d’achat interdite sans TokenRiskReport ALLOW persisté.';
+      session.updatedAtMs = this.now();
+      return session;
+    }
+    if (
+      !capacityAlreadyChecked
+      && !(await this.hasPositionCapacity(true))
+    ) {
+      session.status = 'REJECTED';
+      session.rejectionReason =
+        'Nombre maximal de positions simultanées atteint pendant la reprise.';
       session.updatedAtMs = this.now();
       return session;
     }
@@ -151,5 +176,14 @@ export class RecoveryIntentService implements RecoveryIntentExecutor {
   private safeErrorType(error: unknown): string {
     if (!(error instanceof Error)) return typeof error;
     return error.name !== 'Error' ? error.name : error.constructor.name;
+  }
+
+  private async hasPositionCapacity(currentSessionIsCounted: boolean): Promise<boolean> {
+    const openPositions = await this.dependencies.positions.countOpenPositions();
+    const otherOpenPositions = Math.max(
+      0,
+      openPositions - (currentSessionIsCounted ? 1 : 0),
+    );
+    return otherOpenPositions < this.dependencies.maxConcurrentPositions;
   }
 }

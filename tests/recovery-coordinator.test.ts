@@ -6,6 +6,7 @@ import type {
   ReconciliationStore,
 } from '../src/recovery/recovery.types.js';
 import { RecoveryCoordinator } from '../src/recovery/recovery-coordinator.js';
+import { RuntimeRecoveryBarrier } from '../src/recovery/runtime-recovery-barrier.js';
 
 class MemoryStore implements ReconciliationStore {
   claims: ClaimedRecovery[] = [];
@@ -189,4 +190,26 @@ test('la passe périodique resynchronise les sessions même après une erreur', 
 
   assert.equal(synchronizationCalls, 1);
   assert.equal(coordinator.currentStatus.lastErrorType, 'RpcUnavailableError');
+});
+
+test('la passe attend que les opérations listener actives soient drainées', async () => {
+  const store = new MemoryStore();
+  const barrier = new RuntimeRecoveryBarrier();
+  const listener = deferred();
+  const listenerRun = barrier.runListener(() => listener.promise);
+  const coordinator = new RecoveryCoordinator(
+    store,
+    { reconcile: async () => {} },
+    { intervalMs: 30_000, leaseMs: 60_000, owner: 'worker' },
+    barrier,
+  );
+
+  const initial = coordinator.reconcileInitial();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(store.lockAcquired, 0);
+
+  listener.resolve();
+  await listenerRun;
+  await initial;
+  assert.equal(store.lockAcquired, 1);
 });

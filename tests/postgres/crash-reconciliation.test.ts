@@ -242,6 +242,41 @@ test('les claims concurrents et l’application sous bail restent atomiques', as
     assert.equal(final.rows[0]?.status, 'CLOSED');
     assert.equal(final.rows[0]?.decisions, '2');
     assert.equal(await secondRepository.claimNext('worker-3', 60_000), null);
+
+    const manualWithReference = session('MANUAL_REVIEW');
+    manualWithReference.pair.pair = `0x${'4'.repeat(40)}` as Address;
+    manualWithReference.unreconciledExecution = {
+      tradeId: 'trade-manual',
+      step: 'BUY',
+      outcome: 'CONFIRMED',
+      transactionHash: HASH,
+      recordedAtMs: 4,
+    };
+    const manualWithoutReference = session('MANUAL_REVIEW');
+    manualWithoutReference.pair.pair = `0x${'5'.repeat(40)}` as Address;
+    await client.query(
+      `INSERT INTO token_sessions(
+         pair_address, token_address, status, payload, created_at, updated_at
+       ) VALUES
+         ($1, $2, $3, $4::jsonb, NOW(), NOW()),
+         ($5, $6, $7, $8::jsonb, NOW(), NOW())`,
+      [
+        manualWithReference.pair.pair.toLowerCase(),
+        TOKEN.toLowerCase(),
+        manualWithReference.status,
+        stringifyJson(manualWithReference),
+        manualWithoutReference.pair.pair.toLowerCase(),
+        TOKEN.toLowerCase(),
+        manualWithoutReference.status,
+        stringifyJson(manualWithoutReference),
+      ],
+    );
+    const manualClaim = await secondRepository.claimNext('worker-4', 60_000);
+    assert.equal(
+      manualClaim?.snapshot.session.pair.pair.toLowerCase(),
+      manualWithReference.pair.pair.toLowerCase(),
+    );
+    assert.equal(await secondRepository.claimNext('worker-5', 60_000), null);
   } finally {
     await client.query('SET search_path TO public');
     await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);

@@ -4,6 +4,7 @@ import type {
   ClaimedRecovery,
   ReconciliationStore,
 } from './recovery.types.js';
+import { RuntimeRecoveryBarrier } from './runtime-recovery-barrier.js';
 
 interface RecoveryReconciler {
   reconcile(claimed: ClaimedRecovery): Promise<void>;
@@ -58,6 +59,7 @@ export class RecoveryCoordinator {
     private readonly store: ReconciliationStore,
     private readonly reconciler: RecoveryReconciler,
     private readonly options: RecoveryCoordinatorOptions,
+    private readonly runtimeBarrier?: RuntimeRecoveryBarrier,
   ) {
     this.owner = options.owner ?? `recovery-${randomUUID()}`;
   }
@@ -148,6 +150,13 @@ export class RecoveryCoordinator {
   }
 
   private async executePass(): Promise<RecoveryPassResult> {
+    if (this.runtimeBarrier) {
+      return this.runtimeBarrier.runRecovery(() => this.executeLockedPass());
+    }
+    return this.executeLockedPass();
+  }
+
+  private async executeLockedPass(): Promise<RecoveryPassResult> {
     const acquired = await this.store.tryAcquirePassLock();
     if (!acquired) {
       return {
