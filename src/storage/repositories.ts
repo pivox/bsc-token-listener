@@ -226,7 +226,11 @@ export class TradeRepository {
   ) {}
 
   async save(trade: TradeRecord, sourceEventId?: string): Promise<void> {
-    await this.saveTrade(this.database, trade, sourceEventId);
+    await this.saveTrade(
+      this.database,
+      trade,
+      trade.sourceEventId ?? sourceEventId,
+    );
   }
 
   async saveLifecycle(
@@ -237,7 +241,7 @@ export class TradeRepository {
     const client = await this.database.connect();
     try {
       await client.query('BEGIN');
-      await this.saveTrade(client, trade, sourceEventId);
+      await this.saveTrade(client, trade, trade.sourceEventId ?? sourceEventId);
       await this.saveTransaction(client, transaction);
       await client.query('COMMIT');
     } catch (error) {

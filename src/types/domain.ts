@@ -109,6 +109,7 @@ export interface TokenSession {
   entryObservationBuys?: SwapEvent[];
   entry?: EntryExecution;
   exit?: ExitExecution;
+  pendingExecutionSourceEventId?: string;
   unreconciledExecution?: ExecutionReconciliationReference;
   recovery?: SessionRecoveryDiagnostic;
   subsequentBuyCount: number;
@@ -141,6 +142,7 @@ export type TradeTransactionStatus =
 
 export interface TradeRecord {
   id: string;
+  sourceEventId?: string;
   pair: Address;
   token: Address;
   side: TradeSide;

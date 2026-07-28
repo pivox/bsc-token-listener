@@ -23,6 +23,18 @@ import { isSessionMonitorable } from './session-monitor-policy.js';
 
 const TERMINAL = new Set(['CLOSED', 'REJECTED', 'EXPIRED']);
 
+export interface SwapEventLifecycle {
+  claim(event: SwapEvent, before: TokenSession): Promise<boolean>;
+  markProcessed(eventId: string, after: TokenSession): Promise<void>;
+  markFailed(eventId: string, reason: string): Promise<void>;
+}
+
+const NOOP_SWAP_EVENT_LIFECYCLE: SwapEventLifecycle = {
+  claim: async () => true,
+  markProcessed: async () => {},
+  markFailed: async () => {},
+};
+
 export class SessionEngine {
   private readonly locks = new Map<string, Promise<void>>();
 
@@ -33,6 +45,7 @@ export class SessionEngine {
     private readonly executor: TradeExecutor,
     private readonly amountService: EntryAmountService,
     private readonly runtimeBarrier = new RuntimeRecoveryBarrier(),
+    private readonly eventLifecycle: SwapEventLifecycle = NOOP_SWAP_EVENT_LIFECYCLE,
   ) {}
 
   async onSwap(session: TokenSession, event: SwapEvent): Promise<boolean> {
@@ -41,8 +54,34 @@ export class SessionEngine {
       if (!current) return false;
       this.replaceSession(session, current);
       if (!isSessionMonitorable(session)) return false;
-      await this.handle(session, event);
-      return true;
+      const claimed = await this.eventLifecycle.claim(
+        event,
+        structuredClone(session),
+      );
+      if (!claimed) return true;
+      try {
+        await this.handle(session, event);
+        await this.eventLifecycle.markProcessed(
+          event.id,
+          structuredClone(session),
+        );
+        return true;
+      } catch (error) {
+        try {
+          await this.eventLifecycle.markFailed(event.id, errorMessage(error));
+        } catch (lifecycleError) {
+          logger.error(
+            {
+              pair: session.pair.pair,
+              eventId: event.id,
+              processingError: errorMessage(error),
+              lifecycleError: errorMessage(lifecycleError),
+            },
+            'Échec du marquage FAILED; erreur de traitement préservée.',
+          );
+        }
+        throw error;
+      }
     });
   }
 
@@ -165,6 +204,7 @@ export class SessionEngine {
       }
 
       session.firstBuy = event;
+      session.pendingExecutionSourceEventId = event.id;
       session.status = 'RISK_CHECKING';
       session.updatedAtMs = Date.now();
       await this.sessions.save(session);
@@ -191,7 +231,10 @@ export class SessionEngine {
           metadata: session.metadata,
           blockNumber: event.cursor.blockNumber,
         });
-        await this.reports.save(report);
+        await this.reports.save(
+          report,
+          session.pendingExecutionSourceEventId,
+        );
         session.riskReportId = report.id;
         session.updatedAtMs = Date.now();
         await this.sessions.save(session);
@@ -245,8 +288,13 @@ export class SessionEngine {
       }
 
       try {
-        session.entry = await this.executor.buy(session, amountInWei);
+        session.entry = await this.executor.buy(
+          session,
+          amountInWei,
+          session.pendingExecutionSourceEventId,
+        );
         delete session.unreconciledExecution;
+        delete session.pendingExecutionSourceEventId;
         session.status = 'HOLDING';
         session.updatedAtMs = Date.now();
         await this.sessions.save(session);
@@ -311,6 +359,7 @@ export class SessionEngine {
       session,
       'Sortie effectuée après le nombre cible d’achats.',
       false,
+      event.id,
     );
   }
 
@@ -318,14 +367,25 @@ export class SessionEngine {
     session: TokenSession,
     successMessage: string,
     rethrowFailure: boolean,
+    sourceEventId?: string,
   ): Promise<void> {
+    if (sourceEventId === undefined) {
+      delete session.pendingExecutionSourceEventId;
+    } else {
+      session.pendingExecutionSourceEventId = sourceEventId;
+    }
     session.status = 'SELL_PENDING';
     session.sellAttempts += 1;
     session.updatedAtMs = Date.now();
     await this.sessions.save(session);
     try {
-      session.exit = await this.executor.sell(session);
+      session.exit = await this.executor.sell(
+        session,
+        undefined,
+        session.pendingExecutionSourceEventId,
+      );
       delete session.unreconciledExecution;
+      delete session.pendingExecutionSourceEventId;
       session.status = 'CLOSED';
       delete session.rejectionReason;
       session.updatedAtMs = Date.now();
@@ -355,6 +415,7 @@ export class SessionEngine {
   }
 
   private async reject(session: TokenSession, reason: string): Promise<void> {
+    delete session.pendingExecutionSourceEventId;
     session.status = 'REJECTED';
     session.rejectionReason = reason;
     session.updatedAtMs = Date.now();

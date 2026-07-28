@@ -166,6 +166,7 @@ test('persiste atomiquement le trade et la transaction préparée avec ses bigin
     amountOut: 200n,
     quotedAmountOut: 200n,
     walletAddress: ADDRESS,
+    sourceEventId: 'event-source',
     createdAtMs: 1_000,
     updatedAtMs: 1_000,
   };
@@ -185,7 +186,7 @@ test('persiste atomiquement le trade et la transaction préparée avec ses bigin
     updatedAtMs: 1_000,
   };
 
-  await repository.saveLifecycle(trade, transaction, 'event-source');
+  await repository.saveLifecycle(trade, transaction);
 
   assert.match(client.calls[0]?.sql ?? '', /^BEGIN$/u);
   assert.match(client.calls[1]?.sql ?? '', /INSERT INTO trades/u);
@@ -214,11 +215,12 @@ test('persiste la provenance source lors de l’insertion directe d’un trade',
     status: 'SIMULATED',
     amountIn: 100n,
     amountOut: 200n,
+    sourceEventId: 'event-source',
     createdAtMs: 1_000,
     updatedAtMs: 1_000,
   } satisfies TradeRecord;
 
-  await repository.save(trade, 'event-source');
+  await repository.save(trade);
 
   assert.equal(client.calls.length, 1);
   assert.match(

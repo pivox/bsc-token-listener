@@ -216,6 +216,43 @@ test('persiste hash et nonce avant diffusion puis mesure un achat taxé', async 
   assert.equal(store.trades.at(-1)?.status, 'CONFIRMED');
 });
 
+test('attache l’événement source à chaque sauvegarde du trade d’achat', async () => {
+  const store = new MemoryTradeStore();
+  const executor = new TradeExecutor(store, new FakeExecutionGateway(), 'dry-run');
+
+  await executor.buy(session(), 100n, 'event-buy');
+
+  assert.ok(store.trades.length > 1);
+  assert.equal(
+    store.trades.every((trade) => trade.sourceEventId === 'event-buy'),
+    true,
+  );
+});
+
+test('attache l’événement persisté au trade de vente créé en reprise', async () => {
+  const store = new MemoryTradeStore();
+  const openSession = session();
+  openSession.status = 'SELL_PENDING';
+  openSession.entry = {
+    mode: 'dry-run',
+    amountInWei: 100n,
+    amountOutToken: 200n,
+    confirmedAtMs: 2,
+    cursor: { blockNumber: 2n, transactionIndex: 0, logIndex: 0 },
+  };
+  const executor = new TradeExecutor(store, new FakeExecutionGateway(), 'dry-run');
+
+  await executor.sell(openSession, undefined, 'event-sell-recovery');
+
+  assert.ok(store.trades.length > 1);
+  assert.equal(
+    store.trades.every(
+      (trade) => trade.sourceEventId === 'event-sell-recovery',
+    ),
+    true,
+  );
+});
+
 test('classe une erreur de diffusion comme UNKNOWN sans la confondre avec un échec', async () => {
   const store = new MemoryTradeStore();
   const gateway = new FakeExecutionGateway();
@@ -438,6 +475,7 @@ test('reprend le trade d’approval et conserve son gas dans la vente', async ()
     walletAddress: WALLET,
     relatedTradeId: 'trade-buy',
     gasCostWei: 2n,
+    sourceEventId: 'event-sell',
     createdAtMs: 2,
     updatedAtMs: 2,
   };
@@ -446,13 +484,17 @@ test('reprend le trade d’approval et conserve son gas dans la vente', async ()
   const exit = await executor.sell(openSession, {
     trade: recoveredTrade,
     approvalGasWei: 2n,
-  });
+  }, 'event-new');
 
   assert.equal(gateway.preparedApprovalAmount, null);
   assert.equal(exit.tradeId, recoveredTrade.id);
   assert.equal(exit.gasCostWei, 9n);
   assert.equal(store.trades.at(-1)?.id, recoveredTrade.id);
   assert.equal(store.trades.at(-1)?.gasCostWei, 9n);
+  assert.equal(
+    store.trades.every((trade) => trade.sourceEventId === 'event-sell'),
+    true,
+  );
 });
 
 test('ne rediffuse jamais un approval déjà confirmé pendant la reprise', async () => {
