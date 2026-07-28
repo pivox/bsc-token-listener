@@ -152,13 +152,20 @@ test('les claims concurrents et l’application sous bail restent atomiques', as
     ]) {
       await client.query(await readFile(migrationFile, 'utf8'));
     }
-    const initial = session('SELL_PENDING');
+    const initial = session('MANUAL_REVIEW');
     initial.entry = {
       mode: 'live',
       amountInWei: 100n,
       amountOutToken: 200n,
       confirmedAtMs: 1,
       cursor: { blockNumber: 1n, transactionIndex: 0, logIndex: 0 },
+    };
+    initial.unreconciledExecution = {
+      tradeId: 'trade-sell',
+      step: 'APPROVE',
+      outcome: 'CONFIRMED',
+      transactionHash: HASH,
+      recordedAtMs: 1,
     };
     await client.query(
       `INSERT INTO token_sessions(
@@ -197,6 +204,8 @@ test('les claims concurrents et l’application sous bail restent atomiques', as
     );
 
     const approvalRecorded = structuredClone(claimed.snapshot.session);
+    approvalRecorded.status = 'SELL_PENDING';
+    delete approvalRecorded.unreconciledExecution;
     await firstRepository.applyDecision(claimed, {
       idempotencyKey: 'approval-retained',
       session: approvalRecorded,
@@ -213,6 +222,7 @@ test('les claims concurrents et l’application sous bail restent atomiques', as
     );
     assert.equal(retained.rows[0]?.recovery_owner, claimed.owner);
     assert.equal(retained.rows[0]?.status, 'SELL_PENDING');
+    assert.equal(claimed.statusBefore, 'SELL_PENDING');
 
     const completed = structuredClone(approvalRecorded);
     completed.status = 'CLOSED';

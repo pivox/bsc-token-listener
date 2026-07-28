@@ -181,6 +181,7 @@ export class ReconciliationRepository implements ReconciliationStore {
     decision: RecoveryDecision,
   ): Promise<void> {
     const client = await this.database.connect();
+    const statusBefore = claimed.statusBefore;
     try {
       await client.query('BEGIN');
       const updated = await client.query<{ pair_address: string }>(
@@ -202,7 +203,7 @@ export class ReconciliationRepository implements ReconciliationStore {
           decision.session.status,
           stringifyJson(decision.session),
           decision.reason,
-          claimed.statusBefore,
+          statusBefore,
           decision.retainLease ?? false,
         ],
       );
@@ -225,7 +226,7 @@ export class ReconciliationRepository implements ReconciliationStore {
           decision.idempotencyKey,
           decision.session.pair.pair.toLowerCase(),
           decision.session.pair.token.toLowerCase(),
-          claimed.statusBefore,
+          statusBefore,
           decision.session.status,
           decision.action,
           decision.trade?.id ?? null,
@@ -234,6 +235,7 @@ export class ReconciliationRepository implements ReconciliationStore {
         ],
       );
       await client.query('COMMIT');
+      claimed.statusBefore = decision.session.status;
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;

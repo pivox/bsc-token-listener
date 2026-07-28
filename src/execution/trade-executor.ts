@@ -55,6 +55,13 @@ export class ExecutionRevertedError extends Error {
   }
 }
 
+export class ExecutionRecoverySafetyError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'ExecutionRecoverySafetyError';
+  }
+}
+
 export class ExecutionMeasurementError extends Error {
   readonly executionToReconcile: ExecutionReconciliationReference | undefined;
 
@@ -272,6 +279,19 @@ export class TradeExecutor {
       }
 
       const wallet = await this.requireWalletForTrade(trade);
+      if (
+        recovered
+        && (
+          !trade.walletAddress
+          || trade.walletAddress.toLowerCase() !== wallet.toLowerCase()
+        )
+      ) {
+        const error = new ExecutionRecoverySafetyError(
+          'Wallet du trade récupéré absent ou différent du wallet live.',
+        );
+        await this.failTrade(trade, error);
+        throw error;
+      }
       trade.walletAddress = wallet;
       try {
         const walletBalance = await this.gateway.getTokenBalance(session.pair.token, wallet);

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { Address, Hash } from 'viem';
+import { ExecutionRecoverySafetyError } from '../src/execution/trade-executor.js';
 import { RecoveryIntentService } from '../src/recovery/recovery-intent.service.js';
 import type { TokenRiskReport } from '../src/security/token-risk.types.js';
 import type { TokenSession } from '../src/types/domain.js';
@@ -253,4 +254,40 @@ test('BUY_PENDING exclut la session courante du calcul de capacité', async () =
 
   assert.equal(buyCalls, 1);
   assert.equal(resumed.status, 'HOLDING');
+});
+
+test('une incompatibilité de reprise de vente exige une revue manuelle', async () => {
+  const current = session('SELL_PENDING');
+  current.entry = {
+    mode: 'live',
+    amountInWei: 100n,
+    amountOutToken: 200n,
+    confirmedAtMs: 2,
+    cursor: { blockNumber: 2n, transactionIndex: 0, logIndex: 0 },
+  };
+  const service = new RecoveryIntentService({
+    reports: {
+      save: async () => undefined,
+      findById: async () => report(),
+    },
+    risk: { analyze: async () => report() },
+    amounts: { resolve: async () => 100n },
+    positions: { countOpenPositions: async () => 1 },
+    maxConcurrentPositions: 1,
+    executor: {
+      buy: async () => {
+        throw new Error('achat inattendu');
+      },
+      sell: async () => {
+        throw new ExecutionRecoverySafetyError('wallet différent');
+      },
+    },
+    riskPolicy: 'allow-only',
+    now: () => 3,
+  });
+
+  const resumed = await service.resumeSell(current);
+
+  assert.equal(resumed.status, 'MANUAL_REVIEW');
+  assert.equal(resumed.unreconciledExecution, undefined);
 });

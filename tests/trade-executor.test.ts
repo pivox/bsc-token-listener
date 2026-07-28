@@ -495,6 +495,48 @@ test('ne rediffuse jamais un approval déjà confirmé pendant la reprise', asyn
   assert.equal(gateway.preparedSellAmount, null);
 });
 
+test('refuse de reprendre un approval appartenant à un autre wallet', async () => {
+  const otherWallet = `0x${'a'.repeat(40)}` as Address;
+  const store = new MemoryTradeStore();
+  const gateway = new FakeExecutionGateway(otherWallet);
+  const openSession = session();
+  openSession.status = 'SELL_PENDING';
+  openSession.entry = {
+    mode: 'live',
+    amountInWei: 90n,
+    amountOutToken: 100n,
+    confirmedAtMs: 3,
+    cursor: { blockNumber: 3n, transactionIndex: 0, logIndex: 0 },
+  };
+  const recoveredTrade: TradeRecord = {
+    id: 'trade-sell-recovered',
+    pair: PAIR,
+    token: TOKEN,
+    side: 'SELL',
+    mode: 'live',
+    status: 'CREATED',
+    amountIn: 100n,
+    amountOut: 200n,
+    walletAddress: WALLET,
+    gasCostWei: 2n,
+    createdAtMs: 2,
+    updatedAtMs: 2,
+  };
+  const executor = new TradeExecutor(store, gateway, 'live');
+
+  await assert.rejects(
+    executor.sell(openSession, {
+      trade: recoveredTrade,
+      approvalGasWei: 2n,
+    }),
+    /Wallet.*différent/u,
+  );
+
+  assert.equal(gateway.preparedApprovalAmount, null);
+  assert.equal(gateway.preparedSellAmount, null);
+  assert.equal(recoveredTrade.walletAddress, WALLET);
+});
+
 test('conserve le reçu confirmé quand la mesure post-achat échoue', async () => {
   const store = new MemoryTradeStore();
   const gateway = new FakeExecutionGateway();
