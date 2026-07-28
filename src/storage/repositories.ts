@@ -7,6 +7,7 @@ import type {
   TokenMetadata,
   TokenSession,
   TradeRecord,
+  TradeTransactionRecord,
 } from '../types/domain.js';
 import type { TokenRiskReport } from '../security/token-risk.types.js';
 
@@ -120,17 +121,76 @@ export class SwapEventRepository {
   }
 }
 
+interface TradeQueryResult<T> {
+  rows: T[];
+}
+
+interface TradeDatabaseClient {
+  query<T = Record<string, unknown>>(
+    sql: string,
+    values?: unknown[],
+  ): Promise<TradeQueryResult<T>>;
+  release(): void;
+}
+
+interface TradeDatabase {
+  query<T = Record<string, unknown>>(
+    sql: string,
+    values?: unknown[],
+  ): Promise<TradeQueryResult<T>>;
+  connect(): Promise<TradeDatabaseClient>;
+}
+
 export class TradeRepository {
+  constructor(
+    private readonly database: TradeDatabase = pool as unknown as TradeDatabase,
+  ) {}
+
   async save(trade: TradeRecord): Promise<void> {
-    await pool.query(
+    await this.saveTrade(this.database, trade);
+  }
+
+  async saveLifecycle(
+    trade: TradeRecord,
+    transaction: TradeTransactionRecord,
+  ): Promise<void> {
+    const client = await this.database.connect();
+    try {
+      await client.query('BEGIN');
+      await this.saveTrade(client, trade);
+      await this.saveTransaction(client, transaction);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  private async saveTrade(
+    client: Pick<TradeDatabase, 'query'>,
+    trade: TradeRecord,
+  ): Promise<void> {
+    await client.query(
       `INSERT INTO trades(
          trade_id, pair_address, token_address, side, mode, status,
-         transaction_hash, payload, created_at, updated_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb,
-         to_timestamp($9 / 1000.0), to_timestamp($10 / 1000.0))
+         transaction_hash, wallet_address, related_trade_id,
+         quoted_amount_out, actual_amount_in, actual_amount_out,
+         gas_cost_wei, error, payload, created_at, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+         $10, $11, $12, $13, $14, $15::jsonb,
+         to_timestamp($16 / 1000.0), to_timestamp($17 / 1000.0))
        ON CONFLICT (trade_id) DO UPDATE SET
          status = EXCLUDED.status,
          transaction_hash = EXCLUDED.transaction_hash,
+         wallet_address = EXCLUDED.wallet_address,
+         related_trade_id = EXCLUDED.related_trade_id,
+         quoted_amount_out = EXCLUDED.quoted_amount_out,
+         actual_amount_in = EXCLUDED.actual_amount_in,
+         actual_amount_out = EXCLUDED.actual_amount_out,
+         gas_cost_wei = EXCLUDED.gas_cost_wei,
+         error = EXCLUDED.error,
          payload = EXCLUDED.payload,
          updated_at = EXCLUDED.updated_at`,
       [
@@ -141,9 +201,82 @@ export class TradeRepository {
         trade.mode,
         trade.status,
         trade.transactionHash?.toLowerCase() ?? null,
+        trade.walletAddress?.toLowerCase() ?? null,
+        trade.relatedTradeId ?? null,
+        trade.quotedAmountOut?.toString() ?? null,
+        trade.actualAmountIn?.toString() ?? null,
+        trade.actualAmountOut?.toString() ?? null,
+        trade.gasCostWei?.toString() ?? null,
+        trade.error ?? null,
         stringifyJson(trade),
         trade.createdAtMs,
         trade.updatedAtMs,
+      ],
+    );
+  }
+
+  private async saveTransaction(
+    client: Pick<TradeDatabase, 'query'>,
+    transaction: TradeTransactionRecord,
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO trade_transactions(
+         transaction_id, trade_id, step, status, wallet_address,
+         transaction_hash, nonce, to_address, value_wei, block_number,
+         gas_used, effective_gas_price, gas_cost_wei, receipt_status,
+         native_balance_before, native_balance_after,
+         token_balance_before, token_balance_after,
+         error, measurement_error, submitted_at, confirmed_at,
+         payload, created_at, updated_at
+       ) VALUES (
+         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+         $11, $12, $13, $14, $15, $16, $17, $18,
+         $19, $20,
+         CASE WHEN $21::double precision IS NULL THEN NULL ELSE to_timestamp($21 / 1000.0) END,
+         CASE WHEN $22::double precision IS NULL THEN NULL ELSE to_timestamp($22 / 1000.0) END,
+         $23::jsonb, to_timestamp($24 / 1000.0), to_timestamp($25 / 1000.0)
+       )
+       ON CONFLICT (transaction_id) DO UPDATE SET
+         status = EXCLUDED.status,
+         block_number = EXCLUDED.block_number,
+         gas_used = EXCLUDED.gas_used,
+         effective_gas_price = EXCLUDED.effective_gas_price,
+         gas_cost_wei = EXCLUDED.gas_cost_wei,
+         receipt_status = EXCLUDED.receipt_status,
+         native_balance_after = EXCLUDED.native_balance_after,
+         token_balance_after = EXCLUDED.token_balance_after,
+         error = EXCLUDED.error,
+         measurement_error = EXCLUDED.measurement_error,
+         submitted_at = EXCLUDED.submitted_at,
+         confirmed_at = EXCLUDED.confirmed_at,
+         payload = EXCLUDED.payload,
+         updated_at = EXCLUDED.updated_at`,
+      [
+        transaction.id,
+        transaction.tradeId,
+        transaction.step,
+        transaction.status,
+        transaction.walletAddress.toLowerCase(),
+        transaction.transactionHash.toLowerCase(),
+        transaction.nonce.toString(),
+        transaction.toAddress.toLowerCase(),
+        transaction.valueWei.toString(),
+        transaction.blockNumber?.toString() ?? null,
+        transaction.gasUsed?.toString() ?? null,
+        transaction.effectiveGasPrice?.toString() ?? null,
+        transaction.gasCostWei?.toString() ?? null,
+        transaction.receiptStatus ?? null,
+        transaction.nativeBalanceBefore?.toString() ?? null,
+        transaction.nativeBalanceAfter?.toString() ?? null,
+        transaction.tokenBalanceBefore?.toString() ?? null,
+        transaction.tokenBalanceAfter?.toString() ?? null,
+        transaction.error ?? null,
+        transaction.measurementError ?? null,
+        transaction.submittedAtMs ?? null,
+        transaction.confirmedAtMs ?? null,
+        stringifyJson(transaction),
+        transaction.createdAtMs,
+        transaction.updatedAtMs,
       ],
     );
   }

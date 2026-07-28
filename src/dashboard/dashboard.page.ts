@@ -110,7 +110,9 @@ export function renderDashboardPage(nonce: string, refreshSeconds: number): stri
       <article class="card"><div class="card-label">Solde wallet</div><div class="card-value" id="wallet-balance">—</div><div class="card-note" id="wallet-address">Wallet non configuré</div></article>
       <article class="card"><div class="card-label">Positions ouvertes</div><div class="card-value" id="open-positions">—</div><div class="card-note" id="detected-count">— tokens détectés</div></article>
       <article class="card"><div class="card-label">PnL latent estimé</div><div class="card-value" id="unrealized-pnl">—</div><div class="card-note" id="valuation-note">Cotation PancakeSwap V2</div></article>
-      <article class="card"><div class="card-label">Profit réalisé</div><div class="card-value" id="realized-pnl">—</div><div class="card-note" id="closed-count">— positions clôturées</div></article>
+      <article class="card"><div class="card-label">PnL brut réalisé</div><div class="card-value" id="realized-gross-pnl">—</div><div class="card-note" id="closed-count">— positions clôturées</div></article>
+      <article class="card"><div class="card-label">Gas total</div><div class="card-value" id="realized-gas">—</div><div class="card-note">Gas confirmé achat + approval + vente</div></article>
+      <article class="card"><div class="card-label">PnL net réalisé</div><div class="card-value" id="realized-net-pnl">—</div><div class="card-note">PnL brut moins gas confirmé</div></article>
     </section>
 
     <section class="panel">
@@ -202,7 +204,9 @@ export function renderDashboardPage(nonce: string, refreshSeconds: number): stri
       byId('detected-count').textContent = String(snapshot.summary.detectedTokens) + ' tokens détectés';
       byId('unrealized-pnl').innerHTML = pnlHtml(snapshot.summary.unrealizedPnlBnb, null);
       byId('valuation-note').textContent = snapshot.summary.valuationComplete ? 'Toutes les positions cotées' : 'Valorisation partielle ou indisponible';
-      byId('realized-pnl').innerHTML = pnlHtml(snapshot.summary.realizedPnlBnb, null);
+      byId('realized-gross-pnl').innerHTML = pnlHtml(snapshot.summary.realizedGrossPnlBnb, null);
+      byId('realized-gas').textContent = formatBnb(snapshot.summary.realizedGasBnb);
+      byId('realized-net-pnl').innerHTML = pnlHtml(snapshot.summary.realizedNetPnlBnb, null);
       byId('closed-count').textContent = String(snapshot.summary.closedPositions) + ' positions clôturées';
       byId('heartbeat-latest-block').textContent = snapshot.heartbeat && snapshot.heartbeat.latestBlock
         ? snapshot.heartbeat.latestBlock
@@ -248,7 +252,10 @@ export function renderDashboardPage(nonce: string, refreshSeconds: number): stri
         const risk = token.risk.verdict ? '<span class="status ' + riskTone(token.risk.verdict) + '">' + escapeHtml(token.risk.verdict) + ' · ' + escapeHtml(token.risk.score) + '/100</span>' : '—';
         const invested = token.entry ? formatBnb(token.entry.amountInBnb) : '—';
         const value = token.exit ? formatBnb(token.exit.amountOutBnb) : token.valuation ? formatBnb(token.valuation.estimatedNetValueBnb) : '—';
-        const pnl = token.exit ? pnlHtml(token.pnl.realizedBnb, token.pnl.realizedPercent) : pnlHtml(token.pnl.unrealizedBnb, token.pnl.unrealizedPercent);
+        const realizedValue = token.pnl.realizedNetBnb === null ? token.pnl.realizedGrossBnb : token.pnl.realizedNetBnb;
+        const realizedPercent = token.pnl.realizedNetPercent === null ? token.pnl.realizedGrossPercent : token.pnl.realizedNetPercent;
+        const simulation = token.pnl.kind === 'SIMULATED' ? '<span class="sub">Simulation</span>' : '';
+        const pnl = token.exit ? pnlHtml(realizedValue, realizedPercent) + simulation : pnlHtml(token.pnl.unrealizedBnb, token.pnl.unrealizedPercent);
         const progress = token.progress ? escapeHtml(token.progress.current) + ' / ' + escapeHtml(token.progress.target) + '<span class="sub">achats après entrée</span>' : '—';
         return '<tr>' +
           '<td><span class="token-name">' + escapeHtml(label) + '</span><span class="sub">' + escapeHtml(shortAddress(token.tokenAddress)) + '</span></td>' +
@@ -296,7 +303,10 @@ export function renderDashboardPage(nonce: string, refreshSeconds: number): stri
         safeLink(token.links.exitTransaction, 'Transaction de vente')
       ].filter(Boolean).join('');
       const valuation = token.exit ? formatBnb(token.exit.amountOutBnb) : token.valuation ? formatBnb(token.valuation.estimatedNetValueBnb) : 'Indisponible';
-      const pnl = token.exit ? (formatBnb(token.pnl.realizedBnb) + (token.pnl.realizedPercent ? ' (' + token.pnl.realizedPercent + ' %)' : '')) : (formatBnb(token.pnl.unrealizedBnb) + (token.pnl.unrealizedPercent ? ' (' + token.pnl.unrealizedPercent + ' %)' : ''));
+      const realizedGross = formatBnb(token.pnl.realizedGrossBnb) + (token.pnl.kind === 'SIMULATED' ? ' (Simulation)' : '');
+      const realizedNet = formatBnb(token.pnl.realizedNetBnb);
+      const gas = formatBnb(token.pnl.gasBnb);
+      const pnl = token.exit ? (token.pnl.realizedNetBnb === null ? realizedGross : realizedNet) : (formatBnb(token.pnl.unrealizedBnb) + (token.pnl.unrealizedPercent ? ' (' + token.pnl.unrealizedPercent + ' %)' : ''));
       byId('dialog-content').innerHTML =
         '<dl class="detail-grid">' +
           detailItem('Statut', token.statusLabel) +
@@ -306,7 +316,9 @@ export function renderDashboardPage(nonce: string, refreshSeconds: number): stri
           detailItem('Montant investi', token.entry ? formatBnb(token.entry.amountInBnb) : '—') +
           detailItem('Tokens reçus', token.entry ? formatTokenAmount(token.entry.amountOutToken, token.symbol) : '—') +
           detailItem(token.exit ? 'Montant récupéré' : 'Valeur estimée', valuation) +
-          detailItem(token.exit ? 'Profit réalisé' : 'PnL latent', pnl) +
+          detailItem(token.exit ? 'PnL brut' : 'PnL latent', token.exit ? realizedGross : pnl) +
+          detailItem('Gas total', token.exit ? gas : '—') +
+          detailItem('PnL net', token.exit ? realizedNet : '—') +
           detailItem('Liquidité WBNB au contrôle', token.risk.liquidityBnb ? formatBnb(token.risk.liquidityBnb) : '—') +
           detailItem('Taxes estimées', 'Achat ' + (token.risk.buyTaxPercent || '—') + ' % / Vente ' + (token.risk.sellTaxPercent || '—') + ' %') +
         '</dl>' +

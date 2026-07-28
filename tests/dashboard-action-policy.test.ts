@@ -54,6 +54,22 @@ test('autorise la vente manuelle uniquement pour une position ouverte', () => {
   assert.equal(canManuallySell(session('CLOSED', true)), false);
 });
 
+test('bloque une nouvelle vente quand une vente reste à réconcilier', () => {
+  const value = session('MANUAL_REVIEW', true);
+  value.unreconciledExecution = {
+    tradeId: 'sell-trade',
+    step: 'SELL',
+    outcome: 'CONFIRMED',
+    transactionHash: `0x${'a'.repeat(64)}` as Hash,
+    recordedAtMs: 3,
+  };
+
+  assert.equal(canManuallySell(value), false);
+
+  value.unreconciledExecution!.outcome = 'UNKNOWN';
+  assert.equal(canManuallySell(value), false);
+});
+
 test('refuse d’ignorer une position ouverte', () => {
   assert.equal(canIgnoreAsset(session('WAITING_FIRST_BUY')), true);
   assert.equal(canIgnoreAsset(session('REJECTED')), true);

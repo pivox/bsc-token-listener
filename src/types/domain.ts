@@ -62,8 +62,11 @@ export interface SwapEvent {
 
 export interface EntryExecution {
   mode: ExecutionMode;
+  tradeId?: string;
   amountInWei: bigint;
+  quotedAmountOutToken?: bigint;
   amountOutToken: bigint;
+  gasCostWei?: bigint;
   confirmedAtMs: number;
   cursor: ChainCursor;
   transactionHash?: Hash;
@@ -71,10 +74,22 @@ export interface EntryExecution {
 
 export interface ExitExecution {
   mode: ExecutionMode;
+  tradeId?: string;
+  entryTradeId?: string;
   amountInToken: bigint;
+  quotedAmountOutWei?: bigint;
   amountOutWei: bigint;
+  gasCostWei?: bigint;
   confirmedAtMs: number;
   transactionHash?: Hash;
+}
+
+export interface ExecutionReconciliationReference {
+  tradeId: string;
+  step: TradeTransactionStep;
+  outcome: 'CONFIRMED' | 'UNKNOWN';
+  transactionHash: Hash;
+  recordedAtMs: number;
 }
 
 export interface TokenSession {
@@ -85,6 +100,7 @@ export interface TokenSession {
   entryObservationBuys?: SwapEvent[];
   entry?: EntryExecution;
   exit?: ExitExecution;
+  unreconciledExecution?: ExecutionReconciliationReference;
   subsequentBuyCount: number;
   targetBuysAfterEntry: number;
   countedBuyTransactionHashes: Hash[];
@@ -96,18 +112,68 @@ export interface TokenSession {
   updatedAtMs: number;
 }
 
+export type TradeSide = 'BUY' | 'SELL';
+export type TradeStatus =
+  | 'CREATED'
+  | 'SUBMITTED'
+  | 'CONFIRMED'
+  | 'REVERTED'
+  | 'UNKNOWN'
+  | 'FAILED'
+  | 'SIMULATED';
+export type TradeTransactionStep = 'BUY' | 'APPROVE' | 'SELL';
+export type TradeTransactionStatus =
+  | 'CREATED'
+  | 'SUBMITTED'
+  | 'CONFIRMED'
+  | 'REVERTED'
+  | 'UNKNOWN';
+
 export interface TradeRecord {
   id: string;
   pair: Address;
   token: Address;
-  side: 'BUY' | 'SELL';
+  side: TradeSide;
   mode: ExecutionMode;
-  status: 'PENDING' | 'SIMULATED' | 'CONFIRMED' | 'FAILED';
+  status: TradeStatus;
   amountIn: bigint;
   amountOut: bigint;
+  quotedAmountOut?: bigint;
+  actualAmountIn?: bigint;
+  actualAmountOut?: bigint;
+  gasCostWei?: bigint;
+  walletAddress?: Address;
+  relatedTradeId?: string;
   transactionHash?: Hash;
   blockNumber?: bigint;
   error?: string;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+export interface TradeTransactionRecord {
+  id: string;
+  tradeId: string;
+  step: TradeTransactionStep;
+  status: TradeTransactionStatus;
+  walletAddress: Address;
+  transactionHash: Hash;
+  nonce: bigint;
+  toAddress: Address;
+  valueWei: bigint;
+  blockNumber?: bigint;
+  gasUsed?: bigint;
+  effectiveGasPrice?: bigint;
+  gasCostWei?: bigint;
+  receiptStatus?: 'success' | 'reverted';
+  nativeBalanceBefore?: bigint;
+  nativeBalanceAfter?: bigint;
+  tokenBalanceBefore?: bigint;
+  tokenBalanceAfter?: bigint;
+  error?: string;
+  measurementError?: string;
+  submittedAtMs?: number;
+  confirmedAtMs?: number;
   createdAtMs: number;
   updatedAtMs: number;
 }

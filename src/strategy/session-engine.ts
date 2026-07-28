@@ -5,6 +5,11 @@ import { TradeExecutor } from '../execution/trade-executor.js';
 import { TokenRiskService } from '../security/token-risk.service.js';
 import { recordEntryObservationBuy } from './entry-observation.js';
 import {
+  executionToReconcile,
+  hasUnreconciledConfirmedSell,
+  requiresExecutionManualReview,
+} from './execution-failure-policy.js';
+import {
   RiskReportRepository,
   SessionRepository,
 } from '../storage/repositories.js';
@@ -35,6 +40,11 @@ export class SessionEngine {
     return this.withLock(session, async () => {
       if (!session.entry || session.exit) {
         throw new Error('Aucune position ouverte à vendre.');
+      }
+      if (hasUnreconciledConfirmedSell(session)) {
+        throw new Error(
+          'Une vente confirmée doit être réconciliée avant toute nouvelle tentative.',
+        );
       }
       if (session.status !== 'HOLDING' && session.status !== 'MANUAL_REVIEW') {
         throw new Error(`Vente manuelle impossible depuis le statut ${session.status}.`);
@@ -214,6 +224,7 @@ export class SessionEngine {
 
       try {
         session.entry = await this.executor.buy(session, amountInWei);
+        delete session.unreconciledExecution;
         session.status = 'HOLDING';
         session.updatedAtMs = Date.now();
         await this.sessions.save(session);
@@ -228,7 +239,24 @@ export class SessionEngine {
           'Entrée effectuée.',
         );
       } catch (error) {
-        await this.reject(session, `Achat impossible: ${errorMessage(error)}`);
+        const unresolvedExecution = executionToReconcile(error);
+        if (unresolvedExecution) session.unreconciledExecution = unresolvedExecution;
+        if (requiresExecutionManualReview(error)) {
+          session.status = 'MANUAL_REVIEW';
+          session.rejectionReason = `Achat à réconcilier: ${errorMessage(error)}`;
+          session.updatedAtMs = Date.now();
+          await this.sessions.save(session);
+          logger.error(
+            {
+              pair: session.pair.pair,
+              token: session.pair.token,
+              reason: errorMessage(error),
+            },
+            'Résultat de l’achat incertain; intervention manuelle requise.',
+          );
+        } else {
+          await this.reject(session, `Achat impossible: ${errorMessage(error)}`);
+        }
       }
       return;
     }
@@ -275,6 +303,7 @@ export class SessionEngine {
     await this.sessions.save(session);
     try {
       session.exit = await this.executor.sell(session);
+      delete session.unreconciledExecution;
       session.status = 'CLOSED';
       delete session.rejectionReason;
       session.updatedAtMs = Date.now();
@@ -289,6 +318,8 @@ export class SessionEngine {
         successMessage,
       );
     } catch (error) {
+      const unresolvedExecution = executionToReconcile(error);
+      if (unresolvedExecution) session.unreconciledExecution = unresolvedExecution;
       session.status = 'MANUAL_REVIEW';
       session.rejectionReason = `Vente échouée: ${errorMessage(error)}`;
       session.updatedAtMs = Date.now();

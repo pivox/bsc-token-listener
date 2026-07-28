@@ -24,6 +24,7 @@ import {
   applyBasisPointReduction,
   calculatePnl,
 } from './dashboard-metrics.js';
+import { canManuallySell } from './action-policy.js';
 import { HeartbeatService } from '../heartbeat/heartbeat.js';
 import { renderDashboardPage } from './dashboard.page.js';
 
@@ -72,7 +73,9 @@ interface DashboardSummaryRow {
   open_count: string;
   closed_count: string;
   issue_count: string;
-  realized_pnl_wei: string;
+  realized_gross_pnl_wei: string;
+  realized_gas_wei: string | null;
+  realized_net_pnl_wei: string | null;
 }
 
 interface DashboardCounters {
@@ -80,7 +83,9 @@ interface DashboardCounters {
   openPositions: number;
   closedPositions: number;
   issues: number;
-  realizedPnlWei: bigint;
+  realizedGrossPnlWei: bigint;
+  realizedGasWei: bigint | null;
+  realizedNetPnlWei: bigint | null;
 }
 
 interface DashboardRecord {
@@ -115,6 +120,7 @@ interface DashboardTokenView {
   firstBuyAt: string | null;
   failedTradeCount: number;
   error: string | null;
+  canSell: boolean;
   swaps: {
     total: number;
     buys: number;
@@ -152,12 +158,18 @@ interface DashboardTokenView {
     transactionHash: string | null;
   } | null;
   pnl: {
+    kind: 'LIVE' | 'SIMULATED' | null;
     unrealizedWei: string | null;
     unrealizedBnb: string | null;
     unrealizedPercent: string | null;
-    realizedWei: string | null;
-    realizedBnb: string | null;
-    realizedPercent: string | null;
+    realizedGrossWei: string | null;
+    realizedGrossBnb: string | null;
+    realizedGrossPercent: string | null;
+    gasWei: string | null;
+    gasBnb: string | null;
+    realizedNetWei: string | null;
+    realizedNetBnb: string | null;
+    realizedNetPercent: string | null;
   };
   links: {
     token: string;
@@ -184,7 +196,9 @@ interface DashboardSnapshot {
     issues: number;
     walletBalanceBnb: string | null;
     unrealizedPnlBnb: string | null;
-    realizedPnlBnb: string;
+    realizedGrossPnlBnb: string;
+    realizedGasBnb: string | null;
+    realizedNetPnlBnb: string | null;
     valuationComplete: boolean;
   };
   heartbeat: {
@@ -265,7 +279,7 @@ export class DashboardRepository {
        ), failed_trades AS (
          SELECT pair_address, COUNT(*)::text AS failed_trade_count
          FROM trades
-         WHERE status = 'FAILED'
+         WHERE status IN ('FAILED', 'REVERTED', 'UNKNOWN')
          GROUP BY pair_address
        )
        SELECT
@@ -343,7 +357,7 @@ export class DashboardRepository {
          (SELECT COUNT(*)::text FROM (
             SELECT pair_address FROM token_sessions WHERE status IN ('REJECTED', 'MANUAL_REVIEW')
             UNION
-            SELECT pair_address FROM trades WHERE status = 'FAILED'
+            SELECT pair_address FROM trades WHERE status IN ('FAILED', 'REVERTED', 'UNKNOWN')
           ) issue_pairs) AS issue_count,
          COALESCE((
            SELECT SUM(
@@ -352,9 +366,51 @@ export class DashboardRepository {
            )::text
            FROM token_sessions
            WHERE status = 'CLOSED'
+             AND payload #>> '{entry,mode}' = 'live'
+             AND payload #>> '{exit,mode}' = 'live'
              AND payload #>> '{entry,amountInWei,__bsc_bot_bigint__}' IS NOT NULL
              AND payload #>> '{exit,amountOutWei,__bsc_bot_bigint__}' IS NOT NULL
-         ), '0') AS realized_pnl_wei`,
+         ), '0') AS realized_gross_pnl_wei,
+         CASE WHEN EXISTS (
+           SELECT 1 FROM token_sessions
+           WHERE status = 'CLOSED'
+             AND payload #>> '{entry,mode}' = 'live'
+             AND payload #>> '{exit,mode}' = 'live'
+             AND (
+               payload #>> '{entry,gasCostWei,__bsc_bot_bigint__}' IS NULL
+               OR payload #>> '{exit,gasCostWei,__bsc_bot_bigint__}' IS NULL
+             )
+         ) THEN NULL ELSE COALESCE((
+           SELECT SUM(
+             (payload #>> '{entry,gasCostWei,__bsc_bot_bigint__}')::numeric
+             + (payload #>> '{exit,gasCostWei,__bsc_bot_bigint__}')::numeric
+           )::text
+           FROM token_sessions
+           WHERE status = 'CLOSED'
+             AND payload #>> '{entry,mode}' = 'live'
+             AND payload #>> '{exit,mode}' = 'live'
+         ), '0') END AS realized_gas_wei,
+         CASE WHEN EXISTS (
+           SELECT 1 FROM token_sessions
+           WHERE status = 'CLOSED'
+             AND payload #>> '{entry,mode}' = 'live'
+             AND payload #>> '{exit,mode}' = 'live'
+             AND (
+               payload #>> '{entry,gasCostWei,__bsc_bot_bigint__}' IS NULL
+               OR payload #>> '{exit,gasCostWei,__bsc_bot_bigint__}' IS NULL
+             )
+         ) THEN NULL ELSE COALESCE((
+           SELECT SUM(
+             (payload #>> '{exit,amountOutWei,__bsc_bot_bigint__}')::numeric
+             - (payload #>> '{entry,amountInWei,__bsc_bot_bigint__}')::numeric
+             - (payload #>> '{entry,gasCostWei,__bsc_bot_bigint__}')::numeric
+             - (payload #>> '{exit,gasCostWei,__bsc_bot_bigint__}')::numeric
+           )::text
+           FROM token_sessions
+           WHERE status = 'CLOSED'
+             AND payload #>> '{entry,mode}' = 'live'
+             AND payload #>> '{exit,mode}' = 'live'
+         ), '0') END AS realized_net_pnl_wei`,
     );
     const row = result.rows[0];
     return {
@@ -362,7 +418,14 @@ export class DashboardRepository {
       openPositions: count(row?.open_count ?? '0'),
       closedPositions: count(row?.closed_count ?? '0'),
       issues: count(row?.issue_count ?? '0'),
-      realizedPnlWei: BigInt(row?.realized_pnl_wei ?? '0'),
+      realizedGrossPnlWei: BigInt(row?.realized_gross_pnl_wei ?? '0'),
+      realizedGasWei: row?.realized_gas_wei === null || row?.realized_gas_wei === undefined
+        ? null
+        : BigInt(row.realized_gas_wei),
+      realizedNetPnlWei:
+        row?.realized_net_pnl_wei === null || row?.realized_net_pnl_wei === undefined
+          ? null
+          : BigInt(row.realized_net_pnl_wei),
     };
   }
 }
@@ -370,7 +433,11 @@ export class DashboardRepository {
 export class DashboardService {
   private readonly startedAt = new Date();
   private cache: { expiresAtMs: number; snapshot: DashboardSnapshot } | null = null;
-  private inFlight: Promise<DashboardSnapshot> | null = null;
+  private generation = 0;
+  private inFlight: {
+    generation: number;
+    promise: Promise<DashboardSnapshot>;
+  } | null = null;
 
   constructor(
     private readonly repository: DashboardRepository,
@@ -380,19 +447,29 @@ export class DashboardService {
   async getSnapshot(): Promise<DashboardSnapshot> {
     const now = Date.now();
     if (this.cache && this.cache.expiresAtMs > now) return this.cache.snapshot;
-    if (this.inFlight) return this.inFlight;
+    const generation = this.generation;
+    if (this.inFlight?.generation === generation) return this.inFlight.promise;
 
-    this.inFlight = this.buildSnapshot();
+    const promise = this.buildSnapshot();
+    this.inFlight = { generation, promise };
     try {
-      const snapshot = await this.inFlight;
-      this.cache = {
-        expiresAtMs: Date.now() + config.dashboardRefreshSeconds * 1000,
-        snapshot,
-      };
+      const snapshot = await promise;
+      if (this.generation === generation) {
+        this.cache = {
+          expiresAtMs: Date.now() + config.dashboardRefreshSeconds * 1000,
+          snapshot,
+        };
+      }
       return snapshot;
     } finally {
-      this.inFlight = null;
+      if (this.inFlight?.promise === promise) this.inFlight = null;
     }
+  }
+
+  invalidate(): void {
+    this.generation += 1;
+    this.cache = null;
+    this.inFlight = null;
   }
 
   private async buildSnapshot(): Promise<DashboardSnapshot> {
@@ -423,7 +500,7 @@ export class DashboardService {
       walletAddress: account?.address ?? null,
       readOnly: true,
       heartbeat: this.heartbeatService.currentSnapshot,
-      feeNote: 'PnL en BNB. La taxe de vente estimée est appliquée au PnL latent quand elle est connue; les frais de gas réseau ne sont pas encore persistés et ne sont donc pas déduits.',
+      feeNote: 'PnL en BNB. Le PnL live réalisé distingue le brut, le gas confirmé et le net. Les valeurs dry-run sont explicitement simulées.',
       summary: {
         detectedTokens: counters.detectedTokens,
         openPositions: counters.openPositions,
@@ -431,7 +508,13 @@ export class DashboardService {
         issues: counters.issues,
         walletBalanceBnb: walletBalanceWei === null ? null : formatEther(walletBalanceWei),
         unrealizedPnlBnb: unrealizedTotalWei === null ? null : formatEther(unrealizedTotalWei),
-        realizedPnlBnb: formatEther(counters.realizedPnlWei),
+        realizedGrossPnlBnb: formatEther(counters.realizedGrossPnlWei),
+        realizedGasBnb: counters.realizedGasWei === null
+          ? null
+          : formatEther(counters.realizedGasWei),
+        realizedNetPnlBnb: counters.realizedNetPnlWei === null
+          ? null
+          : formatEther(counters.realizedNetPnlWei),
         valuationComplete: counters.openPositions === valuedTokens.length,
       },
       tokens,
@@ -462,6 +545,17 @@ export class DashboardService {
     const realized = entry && exit
       ? calculatePnl(entry.amountInWei, exit.amountOutWei)
       : null;
+    const pnlKind = entry && exit
+      ? (entry.mode === 'dry-run' || exit.mode === 'dry-run' ? 'SIMULATED' : 'LIVE')
+      : null;
+    const realizedGasWei = pnlKind === 'LIVE'
+      && entry?.gasCostWei !== undefined
+      && exit?.gasCostWei !== undefined
+      ? entry.gasCostWei + exit.gasCostWei
+      : null;
+    const realizedNet = entry && exit && realizedGasWei !== null
+      ? calculatePnl(entry.amountInWei, exit.amountOutWei - realizedGasWei)
+      : null;
     const pair = session?.pair ?? record.pair;
     const error = session?.rejectionReason
       ?? (record.failedTradeCount > 0 ? 'Une ou plusieurs transactions d’exécution ont échoué.' : null);
@@ -480,6 +574,7 @@ export class DashboardService {
       firstBuyAt: session?.firstBuy ? isoDate(session.firstBuy.observedAtMs) : null,
       failedTradeCount: record.failedTradeCount,
       error,
+      canSell: canManuallySell(session),
       swaps: record.swaps,
       risk: {
         score: riskReport?.score ?? null,
@@ -524,12 +619,18 @@ export class DashboardService {
         }
         : null,
       pnl: {
+        kind: pnlKind,
         unrealizedWei: unrealized?.deltaWei.toString() ?? null,
         unrealizedBnb: unrealized ? formatEther(unrealized.deltaWei) : null,
         unrealizedPercent: unrealized?.percentage ?? null,
-        realizedWei: realized?.deltaWei.toString() ?? null,
-        realizedBnb: realized ? formatEther(realized.deltaWei) : null,
-        realizedPercent: realized?.percentage ?? null,
+        realizedGrossWei: realized?.deltaWei.toString() ?? null,
+        realizedGrossBnb: realized ? formatEther(realized.deltaWei) : null,
+        realizedGrossPercent: realized?.percentage ?? null,
+        gasWei: realizedGasWei?.toString() ?? null,
+        gasBnb: realizedGasWei === null ? null : formatEther(realizedGasWei),
+        realizedNetWei: realizedNet?.deltaWei.toString() ?? null,
+        realizedNetBnb: realizedNet ? formatEther(realizedNet.deltaWei) : null,
+        realizedNetPercent: realizedNet?.percentage ?? null,
       },
       links: {
         token: explorerUrl(`address/${record.tokenAddress}`),

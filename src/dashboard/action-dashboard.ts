@@ -30,7 +30,7 @@ function envBoolean(name: string, fallback = false): boolean {
   return ['1', 'true', 'yes', 'on'].includes(value);
 }
 
-function injectControls(page: string, nonce: string, minimumScore: number): string {
+export function injectControls(page: string, nonce: string, minimumScore: number): string {
   const style = `<style nonce="${nonce}">
     .risk-settings { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 20px; padding: 15px 17px; border: 1px solid #6a5529; border-radius: 14px; background: rgba(71,52,19,.34); }
     .risk-settings-copy strong { display: block; margin-bottom: 5px; }
@@ -155,8 +155,7 @@ function injectControls(page: string, nonce: string, minimumScore: number): stri
         banner.classList.add('visible');
       }
       function canSell(token) {
-        return Boolean(token && token.entry && !token.exit
-          && (token.status === 'HOLDING' || token.status === 'MANUAL_REVIEW'));
+        return Boolean(token && token.canSell);
       }
       function canIgnore(token) {
         if (!token || (token.entry && !token.exit)) return false;
@@ -241,10 +240,14 @@ function injectControls(page: string, nonce: string, minimumScore: number): stri
           const confirmation = action.toUpperCase() + ':' + lower(tokenAddress);
           await sendAction(action, tokenAddress, confirmation);
           showMessage(action === 'sell' ? 'Ordre de vente traité.' : 'Actif placé dans la liste d’ignorance.', false);
-          await Promise.all([loadDashboard(), loadActions()]);
         } catch (error) {
           showMessage('Action refusée : ' + (error instanceof Error ? error.message : String(error)), true);
         } finally {
+          try {
+            await Promise.all([loadDashboard(), loadActions()]);
+          } catch (refreshError) {
+            showMessage('État du dashboard indisponible : ' + (refreshError instanceof Error ? refreshError.message : String(refreshError)), true);
+          }
           button.disabled = false;
         }
       });
@@ -423,6 +426,8 @@ export class ActionDashboardServer {
       this.sendJson(response, 200, { result });
     } catch (error) {
       this.sendJson(response, 409, { error: errorMessage(error) });
+    } finally {
+      this.service.invalidate();
     }
   }
 
