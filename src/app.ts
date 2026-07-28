@@ -134,6 +134,7 @@ async function main(): Promise<void> {
   const monitors = new Map<string, SwapListener>();
   const activeSessionsByToken = new Map<string, TokenSession>();
   const activeTokenByPair = new Map<string, string>();
+  const monitorsPendingRecoveryDrain = new Map<string, SwapListener>();
   let monitorSchedulingEnabled = true;
   let requestMonitorReconcile = (): void => {};
 
@@ -150,7 +151,11 @@ async function main(): Promise<void> {
     if (removed && logRelease) {
       logger.info({ pair }, 'Capacité de monitoring libérée.');
     }
-    if (scheduleNext && monitorSchedulingEnabled) requestMonitorReconcile();
+    if (
+      scheduleNext
+      && monitorSchedulingEnabled
+      && monitorsPendingRecoveryDrain.size === 0
+    ) requestMonitorReconcile();
   };
 
   const stopMonitor = async (
@@ -220,7 +225,10 @@ async function main(): Promise<void> {
     stop: (pair) => stopMonitor(pair, false, false),
   });
   requestMonitorReconcile = (): void => {
-    if (recovery.currentStatus.running) return;
+    if (
+      recovery.currentStatus.running
+      || monitorsPendingRecoveryDrain.size > 0
+    ) return;
     void monitorScheduler.reconcile().catch((error: unknown) =>
       logger.error(
         { reason: errorMessage(error) },
@@ -236,11 +244,15 @@ async function main(): Promise<void> {
     for (const [pairKey] of monitors) {
       const current = refreshedByPair.get(pairKey);
       if (!current) {
-        await stopMonitor(pairKey as Address, false);
+        const listener = monitors.get(pairKey);
+        listener?.stop();
+        if (listener) monitorsPendingRecoveryDrain.set(pairKey, listener);
         continue;
       }
       if (!isSessionMonitorable(current)) {
-        await stopMonitor(pairKey as Address, false);
+        const listener = monitors.get(pairKey);
+        listener?.stop();
+        if (listener) monitorsPendingRecoveryDrain.set(pairKey, listener);
         refreshedByPair.delete(pairKey);
         continue;
       }
@@ -254,6 +266,14 @@ async function main(): Promise<void> {
   };
 
   activateRecoveredSessions = async (): Promise<void> => {
+    const pending = [...monitorsPendingRecoveryDrain.entries()];
+    await Promise.all(
+      pending.map(([, listener]) => listener.stopAndDrain()),
+    );
+    for (const [pairKey] of pending) {
+      removeMonitor(pairKey as Address, false);
+      monitorsPendingRecoveryDrain.delete(pairKey);
+    }
     await monitorScheduler.reconcile();
   };
 

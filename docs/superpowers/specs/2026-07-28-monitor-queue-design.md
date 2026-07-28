@@ -80,3 +80,5 @@ expiration, ignored removal, startup failure and capacity release.
 - The monitor cap is never increased automatically.
 - Shutdown disables new admissions and drains the current scheduler pass before
   listeners and storage are closed.
+- Recovery stops obsolete listeners while holding the runtime barrier, but
+  defers their drain and capacity release until after the barrier opens.
