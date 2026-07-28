@@ -86,9 +86,13 @@ export class TradeExecutor {
     private readonly mode: ExecutionMode = config.executionMode,
   ) {}
 
-  async buy(session: TokenSession, requestedAmountInWei: bigint): Promise<EntryExecution> {
+  async buy(
+    session: TokenSession,
+    requestedAmountInWei: bigint,
+    sourceEventId?: string,
+  ): Promise<EntryExecution> {
     return this.queue.run(async () => {
-      const trade = this.newTrade(session, 'BUY', requestedAmountInWei);
+      const trade = this.newTrade(session, 'BUY', requestedAmountInWei, sourceEventId);
       await this.trades.save(trade);
       const path = [session.pair.wbnb, session.pair.token] as const;
 
@@ -226,12 +230,14 @@ export class TradeExecutor {
   async sell(
     session: TokenSession,
     recovered?: { trade: TradeRecord; approvalGasWei: bigint },
+    sourceEventId?: string,
   ): Promise<ExitExecution> {
     return this.queue.run(async () => {
       const positionAmount = session.entry?.amountOutToken ?? 0n;
       if (positionAmount <= 0n) throw new Error('Aucun token à vendre.');
 
-      const trade = recovered?.trade ?? this.newTrade(session, 'SELL', positionAmount);
+      const trade = recovered?.trade
+        ?? this.newTrade(session, 'SELL', positionAmount, sourceEventId);
       if (
         trade.side !== 'SELL'
         || trade.mode !== this.mode
@@ -622,10 +628,12 @@ export class TradeExecutor {
     session: TokenSession,
     side: 'BUY' | 'SELL',
     amountIn: bigint,
+    sourceEventId?: string,
   ): TradeRecord {
     const now = Date.now();
     return {
       id: randomUUID(),
+      ...(sourceEventId ? { sourceEventId } : {}),
       pair: session.pair.pair,
       token: session.pair.token,
       side,

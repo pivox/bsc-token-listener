@@ -15,6 +15,7 @@ function session(status: TokenSession['status'], withEntry = false): TokenSessio
       token0: '0x0000000000000000000000000000000000000005' as Address,
       token1: '0x0000000000000000000000000000000000000003' as Address,
       createdBlock: 1n,
+      blockHash: `0x${'0'.repeat(64)}` as Hash,
       createdTransactionHash: `0x${'1'.repeat(64)}` as Hash,
       createdLogIndex: 0,
       discoveredAtMs: 1,

@@ -12,7 +12,7 @@ import {
 import type { RecoveryIntentExecutor } from './recovery.types.js';
 
 interface RiskReportStore {
-  save(report: TokenRiskReport): Promise<void>;
+  save(report: TokenRiskReport, sourceEventId?: string): Promise<void>;
   findById(id: string): Promise<TokenRiskReport | null>;
 }
 
@@ -33,10 +33,15 @@ interface PositionCounter {
 }
 
 interface RecoveryTradeExecutor {
-  buy(session: TokenSession, amountInWei: bigint): Promise<EntryExecution>;
+  buy(
+    session: TokenSession,
+    amountInWei: bigint,
+    sourceEventId?: string,
+  ): Promise<EntryExecution>;
   sell(
     session: TokenSession,
     recovered?: { trade: TradeRecord; approvalGasWei: bigint },
+    sourceEventId?: string,
   ): Promise<ExitExecution>;
 }
 
@@ -68,7 +73,10 @@ export class RecoveryIntentService implements RecoveryIntentExecutor {
         metadata: session.metadata,
         blockNumber: session.firstBuy.cursor.blockNumber,
       });
-      await this.dependencies.reports.save(report);
+      await this.dependencies.reports.save(
+        report,
+        session.pendingExecutionSourceEventId,
+      );
       session.riskReportId = report.id;
       session.updatedAtMs = this.now();
 
@@ -76,12 +84,14 @@ export class RecoveryIntentService implements RecoveryIntentExecutor {
         ? report.verdict !== 'ALLOW'
         : report.verdict === 'BLOCK';
       if (blocked) {
+        delete session.pendingExecutionSourceEventId;
         session.status = 'REJECTED';
         session.rejectionReason =
           `Reprise bloquée par TokenRiskReport ${report.verdict}.`;
         return session;
       }
       if (!(await this.hasPositionCapacity(false))) {
+        delete session.pendingExecutionSourceEventId;
         session.status = 'REJECTED';
         session.rejectionReason =
           'Nombre maximal de positions simultanées atteint pendant la reprise.';
@@ -115,6 +125,7 @@ export class RecoveryIntentService implements RecoveryIntentExecutor {
       ? report.verdict !== 'ALLOW'
       : report?.verdict === 'BLOCK';
     if (!report || blocked) {
+      delete session.pendingExecutionSourceEventId;
       session.status = 'REJECTED';
       session.rejectionReason =
         'Reprise d’achat interdite sans TokenRiskReport ALLOW persisté.';
@@ -125,6 +136,7 @@ export class RecoveryIntentService implements RecoveryIntentExecutor {
       !capacityAlreadyChecked
       && !(await this.hasPositionCapacity(true))
     ) {
+      delete session.pendingExecutionSourceEventId;
       session.status = 'REJECTED';
       session.rejectionReason =
         'Nombre maximal de positions simultanées atteint pendant la reprise.';
@@ -136,13 +148,19 @@ export class RecoveryIntentService implements RecoveryIntentExecutor {
       report.summary.liquidityWbnb ?? 0n,
     );
     if (amountInWei === null) {
+      delete session.pendingExecutionSourceEventId;
       session.status = 'REJECTED';
       session.rejectionReason = 'Montant de reprise d’achat non admissible.';
       session.updatedAtMs = this.now();
       return session;
     }
     try {
-      session.entry = await this.dependencies.executor.buy(session, amountInWei);
+      session.entry = await this.dependencies.executor.buy(
+        session,
+        amountInWei,
+        session.pendingExecutionSourceEventId,
+      );
+      delete session.pendingExecutionSourceEventId;
       session.status = 'HOLDING';
       delete session.rejectionReason;
       delete session.unreconciledExecution;
@@ -152,6 +170,9 @@ export class RecoveryIntentService implements RecoveryIntentExecutor {
       session.status = requiresExecutionManualReview(error)
         ? 'MANUAL_REVIEW'
         : 'REJECTED';
+      if (session.status === 'REJECTED') {
+        delete session.pendingExecutionSourceEventId;
+      }
       session.rejectionReason =
         `Reprise d’achat impossible (${this.safeErrorType(error)}).`;
     }
@@ -167,7 +188,12 @@ export class RecoveryIntentService implements RecoveryIntentExecutor {
       throw new Error('Reprise de vente impossible depuis cet état.');
     }
     try {
-      session.exit = await this.dependencies.executor.sell(session, recovered);
+      session.exit = await this.dependencies.executor.sell(
+        session,
+        recovered,
+        session.pendingExecutionSourceEventId,
+      );
+      delete session.pendingExecutionSourceEventId;
       session.status = 'CLOSED';
       delete session.rejectionReason;
       delete session.unreconciledExecution;
@@ -177,6 +203,9 @@ export class RecoveryIntentService implements RecoveryIntentExecutor {
       session.status = requiresExecutionManualReview(error)
         ? 'MANUAL_REVIEW'
         : 'HOLDING';
+      if (session.status === 'HOLDING') {
+        delete session.pendingExecutionSourceEventId;
+      }
       session.rejectionReason =
         `Reprise de vente impossible (${this.safeErrorType(error)}).`;
     }

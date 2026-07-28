@@ -27,6 +27,7 @@ export interface PairInfo {
   token0: Address;
   token1: Address;
   createdBlock: bigint;
+  blockHash: Hash;
   createdTransactionHash: Hash;
   createdLogIndex: number;
   discoveredAtMs: number;
@@ -47,6 +48,7 @@ export interface SwapEvent {
   id: string;
   pair: Address;
   transactionHash: Hash;
+  blockHash: Hash;
   kind: SwapKind;
   sender: Address;
   recipient: Address;
@@ -107,6 +109,7 @@ export interface TokenSession {
   entryObservationBuys?: SwapEvent[];
   entry?: EntryExecution;
   exit?: ExitExecution;
+  pendingExecutionSourceEventId?: string;
   unreconciledExecution?: ExecutionReconciliationReference;
   recovery?: SessionRecoveryDiagnostic;
   subsequentBuyCount: number;
@@ -139,6 +142,7 @@ export type TradeTransactionStatus =
 
 export interface TradeRecord {
   id: string;
+  sourceEventId?: string;
   pair: Address;
   token: Address;
   side: TradeSide;

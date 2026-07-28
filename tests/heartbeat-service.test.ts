@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import type { Hash } from 'viem';
+import type { ListenerCheckpoint } from '../src/chain/canonical-chain.types.js';
 import { HeartbeatService } from '../src/heartbeat/heartbeat.js';
 import type { CheckpointRepository, SessionRepository } from '../src/storage/repositories.js';
+
+const BLOCK_HASH = `0x${'1'.repeat(64)}` as Hash;
 
 function createSessionStore(active: number): { countActive: () => Promise<number> } {
   return {
@@ -13,10 +17,13 @@ function createSessionStore(active: number): { countActive: () => Promise<number
 
 function createCheckpointStore(
   checkpoint: bigint | null,
-): { get: (key: string) => Promise<bigint | null> } {
+  blockHash: Hash | null = BLOCK_HASH,
+): { get: (key: string) => Promise<ListenerCheckpoint | null> } {
   return {
-    async get(_key: string): Promise<bigint | null> {
-      return checkpoint;
+    async get(_key: string): Promise<ListenerCheckpoint | null> {
+      return checkpoint === null
+        ? null
+        : { blockNumber: checkpoint, blockHash };
     },
   };
 }
@@ -78,6 +85,22 @@ test('collecte et expose un heartbeat complet avec RPC disponibles', async () =>
     new Date(1_753_700_000_000).toISOString(),
   );
   assert.equal(heartbeat.currentSnapshot?.activeSessions, 4);
+});
+
+test('expose le numéro d’un checkpoint legacy sans le confondre avec une absence', async () => {
+  const heartbeat = new HeartbeatService(
+    createCheckpointStore(3_456n, null) as unknown as CheckpointRepository,
+    createSessionStore(0) as unknown as SessionRepository,
+    {
+      getHttpLatestBlock: async () => 12_345n,
+      getWsLatestBlock: async () => 12_346n,
+    },
+    'dry-run',
+  );
+
+  const snapshot = await heartbeat.refresh(0);
+
+  assert.equal(snapshot.pairCreatedCheckpoint, '3456');
 });
 
 test('garde le dernier bloc valide quand le RPC HTTP chute', async () => {

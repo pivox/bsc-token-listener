@@ -6,6 +6,7 @@ import {
   type Address,
   type Hex,
 } from 'viem';
+import { readBlockConfirmations } from '../chain/confirmed-blocks.js';
 import type { ExecutionMode } from '../types/domain.js';
 
 function read(name: string, fallback?: string): string {
@@ -123,6 +124,7 @@ if (buyAmountStepWei > minBuyBnbWei) {
 
 export const config = {
   network,
+  blockConfirmations: readBlockConfirmations(process.env),
   httpRpcUrl: read('BSC_HTTP_RPC_URL', firstUrl('BSC_HTTP_URLS')),
   wsRpcUrl: read('BSC_WS_RPC_URL', firstUrl('BSC_WSS_URLS')),
   databaseUrl: read('DATABASE_URL'),

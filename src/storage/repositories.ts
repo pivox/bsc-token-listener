@@ -1,6 +1,10 @@
-import type { Address } from 'viem';
+import { isHash, type Address } from 'viem';
 import { pool } from './database.js';
 import { parseJson, stringifyJson } from '../utils/json.js';
+import type {
+  AnchoredListenerCheckpoint,
+  ListenerCheckpoint,
+} from '../chain/canonical-chain.types.js';
 import type {
   PairInfo,
   SwapEvent,
@@ -16,6 +20,14 @@ interface SessionDatabase {
     sql: string,
     values?: unknown[],
   ): Promise<{ rows: T[] }>;
+}
+
+interface RepositoryDatabaseClient extends SessionDatabase {
+  release(): void;
+}
+
+interface RepositoryDatabase extends SessionDatabase {
+  connect(): Promise<RepositoryDatabaseClient>;
 }
 
 export class SessionRepository {
@@ -84,26 +96,51 @@ export class SessionRepository {
 }
 
 export class SwapEventRepository {
-  async claim(event: SwapEvent): Promise<boolean> {
-    const client = await pool.connect();
+  constructor(
+    private readonly database: RepositoryDatabase =
+      pool as unknown as RepositoryDatabase,
+  ) {}
+
+  async claim(event: SwapEvent, sessionBefore: TokenSession): Promise<boolean> {
+    const client = await this.database.connect();
     try {
       await client.query('BEGIN');
       await client.query(
         `INSERT INTO swap_events(
-           event_id, pair_address, transaction_hash, block_number,
-           transaction_index, log_index, kind, payload, created_at, updated_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb,
-           to_timestamp($9 / 1000.0), NOW())
-         ON CONFLICT (event_id) DO NOTHING`,
+           event_id, pair_address, transaction_hash, block_hash, block_number,
+           transaction_index, log_index, kind, payload, session_before,
+           canonical, created_at, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb,
+           TRUE, to_timestamp($11 / 1000.0), NOW())
+         ON CONFLICT (event_id) DO UPDATE SET
+           pair_address = EXCLUDED.pair_address,
+           transaction_hash = EXCLUDED.transaction_hash,
+           block_hash = EXCLUDED.block_hash,
+           block_number = EXCLUDED.block_number,
+           transaction_index = EXCLUDED.transaction_index,
+           log_index = EXCLUDED.log_index,
+           kind = EXCLUDED.kind,
+           payload = EXCLUDED.payload,
+           session_before = EXCLUDED.session_before,
+           session_after = NULL,
+           canonical = TRUE,
+           orphaned_at = NULL,
+           processing_status = 'PENDING',
+           processing_error = NULL,
+           processed_at = NULL,
+           updated_at = NOW()
+         WHERE swap_events.canonical = FALSE`,
         [
           event.id,
           event.pair.toLowerCase(),
           event.transactionHash.toLowerCase(),
+          event.blockHash.toLowerCase(),
           event.cursor.blockNumber.toString(),
           event.cursor.transactionIndex,
           event.cursor.logIndex,
           event.kind,
           stringifyJson(event),
+          stringifyJson(sessionBefore),
           event.observedAtMs,
         ],
       );
@@ -128,17 +165,23 @@ export class SwapEventRepository {
     }
   }
 
-  async markProcessed(eventId: string): Promise<void> {
-    await pool.query(
+  async markProcessed(
+    eventId: string,
+    sessionAfter: TokenSession,
+  ): Promise<void> {
+    await this.database.query(
       `UPDATE swap_events
-       SET processing_status = 'PROCESSED', processed_at = NOW(), updated_at = NOW()
+       SET processing_status = 'PROCESSED',
+           session_after = $2::jsonb,
+           processed_at = NOW(),
+           updated_at = NOW()
        WHERE event_id = $1`,
-      [eventId],
+      [eventId, stringifyJson(sessionAfter)],
     );
   }
 
   async release(eventId: string): Promise<void> {
-    await pool.query(
+    await this.database.query(
       `UPDATE swap_events
        SET processing_status = 'PENDING', processing_error = NULL, updated_at = NOW()
        WHERE event_id = $1
@@ -148,7 +191,7 @@ export class SwapEventRepository {
   }
 
   async markFailed(eventId: string, error: string): Promise<void> {
-    await pool.query(
+    await this.database.query(
       `UPDATE swap_events
        SET processing_status = 'FAILED', processing_error = $2, updated_at = NOW()
        WHERE event_id = $1`,
@@ -182,18 +225,23 @@ export class TradeRepository {
     private readonly database: TradeDatabase = pool as unknown as TradeDatabase,
   ) {}
 
-  async save(trade: TradeRecord): Promise<void> {
-    await this.saveTrade(this.database, trade);
+  async save(trade: TradeRecord, sourceEventId?: string): Promise<void> {
+    await this.saveTrade(
+      this.database,
+      trade,
+      trade.sourceEventId ?? sourceEventId,
+    );
   }
 
   async saveLifecycle(
     trade: TradeRecord,
     transaction: TradeTransactionRecord,
+    sourceEventId?: string,
   ): Promise<void> {
     const client = await this.database.connect();
     try {
       await client.query('BEGIN');
-      await this.saveTrade(client, trade);
+      await this.saveTrade(client, trade, trade.sourceEventId ?? sourceEventId);
       await this.saveTransaction(client, transaction);
       await client.query('COMMIT');
     } catch (error) {
@@ -207,21 +255,24 @@ export class TradeRepository {
   private async saveTrade(
     client: Pick<TradeDatabase, 'query'>,
     trade: TradeRecord,
+    sourceEventId?: string,
   ): Promise<void> {
     await client.query(
       `INSERT INTO trades(
          trade_id, pair_address, token_address, side, mode, status,
          transaction_hash, wallet_address, related_trade_id,
+         source_event_id, canonical,
          quoted_amount_out, actual_amount_in, actual_amount_out,
          gas_cost_wei, error, payload, created_at, updated_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
-         $10, $11, $12, $13, $14, $15::jsonb,
-         to_timestamp($16 / 1000.0), to_timestamp($17 / 1000.0))
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE,
+         $11, $12, $13, $14, $15, $16::jsonb,
+         to_timestamp($17 / 1000.0), to_timestamp($18 / 1000.0))
        ON CONFLICT (trade_id) DO UPDATE SET
          status = EXCLUDED.status,
          transaction_hash = EXCLUDED.transaction_hash,
          wallet_address = EXCLUDED.wallet_address,
          related_trade_id = EXCLUDED.related_trade_id,
+         source_event_id = COALESCE(EXCLUDED.source_event_id, trades.source_event_id),
          quoted_amount_out = EXCLUDED.quoted_amount_out,
          actual_amount_in = EXCLUDED.actual_amount_in,
          actual_amount_out = EXCLUDED.actual_amount_out,
@@ -239,6 +290,7 @@ export class TradeRepository {
         trade.transactionHash?.toLowerCase() ?? null,
         trade.walletAddress?.toLowerCase() ?? null,
         trade.relatedTradeId ?? null,
+        sourceEventId ?? null,
         trade.quotedAmountOut?.toString() ?? null,
         trade.actualAmountIn?.toString() ?? null,
         trade.actualAmountOut?.toString() ?? null,
@@ -319,13 +371,18 @@ export class TradeRepository {
 }
 
 export class RiskReportRepository {
-  async save(report: TokenRiskReport): Promise<void> {
-    await pool.query(
+  constructor(
+    private readonly database: RepositoryDatabase =
+      pool as unknown as RepositoryDatabase,
+  ) {}
+
+  async save(report: TokenRiskReport, sourceEventId?: string): Promise<void> {
+    await this.database.query(
       `INSERT INTO token_risk_reports(
          id, token_address, pair_address, block_number,
-         score, verdict, checks, report, created_at
+         score, verdict, checks, report, source_event_id, canonical, created_at
        ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb,
-         to_timestamp($9 / 1000.0))`,
+         $9, $10, to_timestamp($11 / 1000.0))`,
       [
         report.id,
         report.token.toLowerCase(),
@@ -335,13 +392,15 @@ export class RiskReportRepository {
         report.verdict,
         stringifyJson(report.checks),
         stringifyJson(report),
+        sourceEventId ?? null,
+        true,
         report.createdAtMs,
       ],
     );
   }
 
   async findById(id: string): Promise<TokenRiskReport | null> {
-    const result = await pool.query<{ report: unknown }>(
+    const result = await this.database.query<{ report: unknown }>(
       'SELECT report FROM token_risk_reports WHERE id = $1 LIMIT 1',
       [id],
     );
@@ -351,6 +410,11 @@ export class RiskReportRepository {
 }
 
 export class DiscoveredTokenRepository {
+  constructor(
+    private readonly database: RepositoryDatabase =
+      pool as unknown as RepositoryDatabase,
+  ) {}
+
   async upsert(input: {
     pair: PairInfo;
     metadata?: TokenMetadata;
@@ -362,16 +426,20 @@ export class DiscoveredTokenRepository {
       metadata: input.metadata ?? null,
       source,
     };
-    await pool.query(
+    await this.database.query(
       `INSERT INTO discovered_tokens(
          token_address, pair_address, source,
-         deployment_transaction_hash, deployment_block,
+         deployment_transaction_hash, deployment_block, block_hash, canonical,
          probable_bep20, payload, metadata, created_at, updated_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb,
-         to_timestamp($9 / 1000.0), NOW())
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb,
+         to_timestamp($11 / 1000.0), NOW())
        ON CONFLICT (token_address) DO UPDATE SET
          pair_address = COALESCE(EXCLUDED.pair_address, discovered_tokens.pair_address),
          source = EXCLUDED.source,
+         deployment_transaction_hash = EXCLUDED.deployment_transaction_hash,
+         deployment_block = EXCLUDED.deployment_block,
+         block_hash = EXCLUDED.block_hash,
+         canonical = TRUE,
          probable_bep20 = EXCLUDED.probable_bep20,
          payload = EXCLUDED.payload,
          metadata = COALESCE(EXCLUDED.metadata, discovered_tokens.metadata),
@@ -382,6 +450,8 @@ export class DiscoveredTokenRepository {
         source,
         input.pair.createdTransactionHash.toLowerCase(),
         input.pair.createdBlock.toString(),
+        input.pair.blockHash.toLowerCase(),
+        true,
         Boolean(input.metadata),
         stringifyJson(payload),
         input.metadata ? stringifyJson(input.metadata) : null,
@@ -392,22 +462,65 @@ export class DiscoveredTokenRepository {
 }
 
 export class CheckpointRepository {
-  async get(key: string): Promise<bigint | null> {
-    const result = await pool.query<{ block_number: string }>(
-      'SELECT block_number::text FROM listener_checkpoints WHERE listener_key = $1',
+  constructor(
+    private readonly database: SessionDatabase =
+      pool as unknown as SessionDatabase,
+  ) {}
+
+  async get(key: string): Promise<ListenerCheckpoint | null> {
+    const result = await this.database.query<{
+      block_number: string;
+      block_hash: string | null;
+    }>(
+      `SELECT block_number::text, block_hash
+       FROM listener_checkpoints
+       WHERE listener_key = $1`,
       [key],
     );
-    return result.rows[0] ? BigInt(result.rows[0].block_number) : null;
+    const row = result.rows[0];
+    if (!row) return null;
+    if (row.block_hash === null) {
+      return {
+        blockNumber: BigInt(row.block_number),
+        blockHash: null,
+      };
+    }
+    if (!isHash(row.block_hash)) {
+      throw new Error(`Hash de checkpoint invalide pour ${key}.`);
+    }
+    return {
+      blockNumber: BigInt(row.block_number),
+      blockHash: row.block_hash,
+    };
   }
 
-  async set(key: string, blockNumber: bigint): Promise<void> {
-    await pool.query(
-      `INSERT INTO listener_checkpoints(listener_key, block_number)
-       VALUES ($1, $2)
+  async getOldestBlockNumber(): Promise<bigint | null> {
+    const result = await this.database.query<{
+      block_number: string | null;
+    }>(
+      `SELECT MIN(block_number)::text AS block_number
+       FROM listener_checkpoints`,
+    );
+    const blockNumber = result.rows[0]?.block_number ?? null;
+    return blockNumber === null ? null : BigInt(blockNumber);
+  }
+
+  async set(
+    key: string,
+    checkpoint: AnchoredListenerCheckpoint,
+  ): Promise<void> {
+    await this.database.query(
+      `INSERT INTO listener_checkpoints(listener_key, block_number, block_hash)
+       VALUES ($1, $2, $3)
        ON CONFLICT (listener_key) DO UPDATE SET
          block_number = EXCLUDED.block_number,
+         block_hash = EXCLUDED.block_hash,
          updated_at = NOW()`,
-      [key, blockNumber.toString()],
+      [
+        key,
+        checkpoint.blockNumber.toString(),
+        checkpoint.blockHash.toLowerCase(),
+      ],
     );
   }
 }

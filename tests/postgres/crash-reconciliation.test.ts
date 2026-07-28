@@ -32,6 +32,7 @@ function session(status: TokenSession['status']): TokenSession {
       token0: TOKEN,
       token1: PAIR,
       createdBlock: 1n,
+      blockHash: HASH,
       createdTransactionHash: HASH,
       createdLogIndex: 0,
       discoveredAtMs: 1,

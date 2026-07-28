@@ -78,7 +78,7 @@ export class HeartbeatService {
       generatedAt: new Date().toISOString(),
       executionMode: this.executionMode,
       latestBlock,
-      pairCreatedCheckpoint: pairCreatedCheckpoint === null ? null : pairCreatedCheckpoint.toString(),
+      pairCreatedCheckpoint: pairCreatedCheckpoint?.blockNumber.toString() ?? null,
       activeSwapMonitors,
       activeSessions,
       monitoring: monitoring ?? {

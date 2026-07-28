@@ -2,10 +2,7 @@ import type { Address, Hash } from 'viem';
 import { pancakePairAbi } from '../abi/pancake-pair.abi.js';
 import { config } from '../config/env.js';
 import { publicClient, wsClient } from '../rpc/clients.js';
-import {
-  CheckpointRepository,
-  SwapEventRepository,
-} from '../storage/repositories.js';
+import { CheckpointRepository } from '../storage/repositories.js';
 import { classifySwap } from '../strategy/swap-classifier.js';
 import { SessionEngine } from '../strategy/session-engine.js';
 import { isSessionMonitorable } from '../strategy/session-monitor-policy.js';
@@ -23,6 +20,7 @@ interface SwapLog {
     amount1Out?: bigint;
   };
   blockNumber: bigint | null;
+  blockHash: Hash | null;
   transactionHash: Hash | null;
   transactionIndex: number | null;
   logIndex: number | null;
@@ -38,7 +36,6 @@ export class SwapListener {
   constructor(
     private readonly session: TokenSession,
     private readonly checkpoints: CheckpointRepository,
-    private readonly events: SwapEventRepository,
     private readonly engine: SessionEngine,
     private readonly onTerminal: (pair: Address) => void,
   ) {}
@@ -118,7 +115,9 @@ export class SwapListener {
     try {
       const latest = await publicClient.getBlockNumber();
       const stored = await this.checkpoints.get(key);
-      let fromBlock = stored === null ? this.session.pair.createdBlock : stored + 1n;
+      let fromBlock = stored === null
+        ? this.session.pair.createdBlock
+        : stored.blockNumber + 1n;
       const chunk = 1_500n;
       while (fromBlock <= latest) {
         const toBlock = fromBlock + chunk - 1n > latest ? latest : fromBlock + chunk - 1n;
@@ -131,7 +130,11 @@ export class SwapListener {
         });
         const remainsActive = await this.processLogs(logs as SwapLog[]);
         if (!remainsActive) return;
-        await this.checkpoints.set(key, toBlock);
+        const block = await publicClient.getBlock({ blockNumber: toBlock });
+        await this.checkpoints.set(key, {
+          blockNumber: toBlock,
+          blockHash: block.hash,
+        });
         fromBlock = toBlock + 1n;
       }
     } finally {
@@ -152,12 +155,13 @@ export class SwapListener {
         !args.sender || !args.to ||
         args.amount0In === undefined || args.amount1In === undefined ||
         args.amount0Out === undefined || args.amount1Out === undefined ||
-        log.blockNumber === null || !log.transactionHash
+        log.blockNumber === null || !log.blockHash || !log.transactionHash
       ) continue;
 
       const event = classifySwap(this.session.pair, {
         pair: this.session.pair.pair,
         transactionHash: log.transactionHash,
+        blockHash: log.blockHash,
         blockNumber: log.blockNumber,
         transactionIndex: log.transactionIndex ?? 0,
         logIndex: log.logIndex ?? 0,
@@ -168,24 +172,16 @@ export class SwapListener {
         amount0Out: args.amount0Out,
         amount1Out: args.amount1Out,
       });
-      if (!(await this.events.claim(event))) continue;
-      try {
-        const consumed = await this.engine.onSwap(this.session, event);
-        if (!consumed) {
-          await this.events.release(event.id);
-          this.stop();
-          this.onTerminal(this.session.pair.pair);
-          return false;
-        }
-        await this.events.markProcessed(event.id);
-        if (!isSessionMonitorable(this.session)) {
-          this.stop();
-          this.onTerminal(this.session.pair.pair);
-          return false;
-        }
-      } catch (error) {
-        await this.events.markFailed(event.id, errorMessage(error));
-        throw error;
+      const consumed = await this.engine.onSwap(this.session, event);
+      if (!consumed) {
+        this.stop();
+        this.onTerminal(this.session.pair.pair);
+        return false;
+      }
+      if (!isSessionMonitorable(this.session)) {
+        this.stop();
+        this.onTerminal(this.session.pair.pair);
+        return false;
       }
     }
     return true;

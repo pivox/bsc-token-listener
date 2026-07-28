@@ -4,6 +4,7 @@ import type { PairInfo, SwapEvent } from '../types/domain.js';
 export interface RawSwap {
   pair: Address;
   transactionHash: Hash;
+  blockHash: Hash;
   blockNumber: bigint;
   transactionIndex: number;
   logIndex: number;
@@ -32,6 +33,7 @@ export function classifySwap(pair: PairInfo, raw: RawSwap): SwapEvent {
     id: `${raw.transactionHash.toLowerCase()}:${raw.logIndex}`,
     pair: raw.pair,
     transactionHash: raw.transactionHash,
+    blockHash: raw.blockHash,
     kind,
     sender: raw.sender,
     recipient: raw.recipient,

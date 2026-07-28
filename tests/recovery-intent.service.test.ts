@@ -20,6 +20,7 @@ function session(status: TokenSession['status']): TokenSession {
       token0: ADDRESS,
       token1: ADDRESS,
       createdBlock: 1n,
+      blockHash: HASH,
       createdTransactionHash: HASH,
       createdLogIndex: 0,
       discoveredAtMs: 1,
@@ -37,6 +38,7 @@ function session(status: TokenSession['status']): TokenSession {
       id: 'event',
       pair: ADDRESS,
       transactionHash: HASH,
+      blockHash: HASH,
       kind: 'BUY',
       sender: ADDRESS,
       recipient: ADDRESS,
@@ -83,11 +85,16 @@ function report(verdict: TokenRiskReport['verdict'] = 'ALLOW'): TokenRiskReport 
 
 test('reprend RISK_CHECKING jusqu’à l’achat avec un rapport ALLOW persisté', async () => {
   const savedReports: TokenRiskReport[] = [];
+  let savedReportSourceEventId: string | undefined;
+  let buySourceEventId: string | undefined;
   let buyCalls = 0;
+  const current = session('RISK_CHECKING');
+  current.pendingExecutionSourceEventId = 'event-persisted';
   const service = new RecoveryIntentService({
     reports: {
-      save: async (value) => {
+      save: async (value, sourceEventId?: string) => {
         savedReports.push(structuredClone(value));
+        savedReportSourceEventId = sourceEventId;
       },
       findById: async () => report(),
     },
@@ -96,8 +103,9 @@ test('reprend RISK_CHECKING jusqu’à l’achat avec un rapport ALLOW persisté
     positions: { countOpenPositions: async () => 0 },
     maxConcurrentPositions: 1,
     executor: {
-      buy: async () => {
+      buy: async (_session, _amountInWei, sourceEventId?: string) => {
         assert.equal(savedReports.length, 1);
+        buySourceEventId = sourceEventId;
         buyCalls += 1;
         return {
           mode: 'dry-run',
@@ -115,11 +123,14 @@ test('reprend RISK_CHECKING jusqu’à l’achat avec un rapport ALLOW persisté
     now: () => 3,
   });
 
-  const resumed = await service.resumeRiskAndBuy(session('RISK_CHECKING'));
+  const resumed = await service.resumeRiskAndBuy(current);
 
   assert.equal(savedReports.length, 1);
+  assert.equal(savedReportSourceEventId, 'event-persisted');
   assert.equal(buyCalls, 1);
+  assert.equal(buySourceEventId, 'event-persisted');
   assert.equal(resumed.status, 'HOLDING');
+  assert.equal(resumed.pendingExecutionSourceEventId, undefined);
 });
 
 test('refuse un achat de reprise sans rapport ALLOW', async () => {
@@ -220,6 +231,7 @@ test('la reprise du risque respecte la capacité maximale de positions', async (
 
 test('BUY_PENDING exclut la session courante du calcul de capacité', async () => {
   let buyCalls = 0;
+  let buySourceEventId: string | undefined;
   const current = session('BUY_PENDING');
   current.riskReportId = 'report';
   const service = new RecoveryIntentService({
@@ -232,8 +244,9 @@ test('BUY_PENDING exclut la session courante du calcul de capacité', async () =
     positions: { countOpenPositions: async () => 1 },
     maxConcurrentPositions: 1,
     executor: {
-      buy: async () => {
+      buy: async (_session, _amountInWei, sourceEventId?: string) => {
         buyCalls += 1;
+        buySourceEventId = sourceEventId;
         return {
           mode: 'dry-run',
           amountInWei: 100n,
@@ -253,7 +266,57 @@ test('BUY_PENDING exclut la session courante du calcul de capacité', async () =
   const resumed = await service.resumeBuy(current);
 
   assert.equal(buyCalls, 1);
+  assert.equal(buySourceEventId, undefined);
   assert.equal(resumed.status, 'HOLDING');
+});
+
+test('nettoie la provenance d’un achat rejeté mais la conserve en revue manuelle', async () => {
+  const cases = [
+    {
+      error: new Error('quote indisponible'),
+      expectedStatus: 'REJECTED',
+      expectedSourceEventId: undefined,
+    },
+    {
+      error: new ExecutionRecoverySafetyError('reprise ambiguë'),
+      expectedStatus: 'MANUAL_REVIEW',
+      expectedSourceEventId: 'event-buy',
+    },
+  ] as const;
+
+  for (const scenario of cases) {
+    const current = session('BUY_PENDING');
+    current.riskReportId = 'report';
+    current.pendingExecutionSourceEventId = 'event-buy';
+    const service = new RecoveryIntentService({
+      reports: {
+        save: async () => undefined,
+        findById: async () => report(),
+      },
+      risk: { analyze: async () => report() },
+      amounts: { resolve: async () => 100n },
+      positions: { countOpenPositions: async () => 1 },
+      maxConcurrentPositions: 1,
+      executor: {
+        buy: async () => {
+          throw scenario.error;
+        },
+        sell: async () => {
+          throw new Error('vente inattendue');
+        },
+      },
+      riskPolicy: 'allow-only',
+      now: () => 3,
+    });
+
+    const resumed = await service.resumeBuy(current);
+
+    assert.equal(resumed.status, scenario.expectedStatus);
+    assert.equal(
+      resumed.pendingExecutionSourceEventId,
+      scenario.expectedSourceEventId,
+    );
+  }
 });
 
 test('une incompatibilité de reprise de vente exige une revue manuelle', async () => {
@@ -290,4 +353,49 @@ test('une incompatibilité de reprise de vente exige une revue manuelle', async 
 
   assert.equal(resumed.status, 'MANUAL_REVIEW');
   assert.equal(resumed.unreconciledExecution, undefined);
+});
+
+test('reprend une vente sans trade avec la provenance persistée dans la session', async () => {
+  const current = session('SELL_PENDING');
+  current.pendingExecutionSourceEventId = 'event-sell';
+  current.entry = {
+    mode: 'dry-run',
+    amountInWei: 100n,
+    amountOutToken: 200n,
+    confirmedAtMs: 2,
+    cursor: { blockNumber: 2n, transactionIndex: 0, logIndex: 0 },
+  };
+  let sellSourceEventId: string | undefined;
+  const service = new RecoveryIntentService({
+    reports: {
+      save: async () => undefined,
+      findById: async () => report(),
+    },
+    risk: { analyze: async () => report() },
+    amounts: { resolve: async () => 100n },
+    positions: { countOpenPositions: async () => 1 },
+    maxConcurrentPositions: 1,
+    executor: {
+      buy: async () => {
+        throw new Error('achat inattendu');
+      },
+      sell: async (_session, _recovered, sourceEventId?: string) => {
+        sellSourceEventId = sourceEventId;
+        return {
+          mode: 'dry-run',
+          amountInToken: 200n,
+          amountOutWei: 100n,
+          confirmedAtMs: 3,
+        };
+      },
+    },
+    riskPolicy: 'allow-only',
+    now: () => 3,
+  });
+
+  const resumed = await service.resumeSell(current);
+
+  assert.equal(sellSourceEventId, 'event-sell');
+  assert.equal(resumed.status, 'CLOSED');
+  assert.equal(resumed.pendingExecutionSourceEventId, undefined);
 });

@@ -92,6 +92,7 @@ async function main(): Promise<void> {
     executor,
     amountService,
     runtimeRecoveryBarrier,
+    events,
   );
   let synchronizeRecoveredSessions = async (): Promise<void> => {};
   let activateRecoveredSessions = async (): Promise<void> => {};
@@ -190,7 +191,6 @@ async function main(): Promise<void> {
     const listener = new SwapListener(
       session,
       checkpoints,
-      events,
       engine,
       (pair) => removeMonitor(pair),
     );
