@@ -10,6 +10,10 @@ import {
 import type { TokenRiskReport } from '../src/security/token-risk.types.js';
 
 const ADDRESS = `0x${'1'.repeat(40)}` as Address;
+const COUNTED_HASH_LOWER = `0x${'a'.repeat(64)}` as Hash;
+const COUNTED_HASH_UPPER = `0x${'A'.repeat(64)}` as Hash;
+const NEW_HASH_LOWER = `0x${'b'.repeat(64)}` as Hash;
+const NEW_HASH_UPPER = `0x${'B'.repeat(64)}` as Hash;
 
 function buy(id: number): SwapEvent {
   return {
@@ -455,6 +459,54 @@ test('persiste la provenance avant une vente SELL_PENDING interrompue', async ()
   assert.equal(sellCalls, 0);
   assert.equal(persisted.status, 'SELL_PENDING');
   assert.equal(persisted.pendingExecutionSourceEventId, event.id);
+});
+
+test('déduplique un replay post-entrée sans tenir compte de la casse et stocke les nouveaux hashes en lowercase', async () => {
+  const current = waitingSession();
+  current.status = 'HOLDING';
+  current.entry = {
+    mode: 'dry-run',
+    amountInWei: 100n,
+    amountOutToken: 200n,
+    confirmedAtMs: 1,
+    cursor: { blockNumber: 1n, transactionIndex: 0, logIndex: 0 },
+  };
+  current.countedBuyTransactionHashes = [COUNTED_HASH_LOWER];
+  current.subsequentBuyCount = 1;
+  let persisted = structuredClone(current);
+  let saveCalls = 0;
+  const engine = new SessionEngine(
+    {
+      findByPair: async () => structuredClone(persisted),
+      save: async (value: TokenSession) => {
+        saveCalls += 1;
+        persisted = structuredClone(value);
+      },
+    } as never,
+    {} as never,
+    {} as never,
+    {} as never,
+    {} as never,
+  );
+  const replay = buy(4);
+  replay.transactionHash = COUNTED_HASH_UPPER;
+  const next = buy(5);
+  next.transactionHash = NEW_HASH_UPPER;
+
+  await engine.onSwap(current, replay);
+
+  assert.equal(current.subsequentBuyCount, 1);
+  assert.deepEqual(current.countedBuyTransactionHashes, [COUNTED_HASH_LOWER]);
+  assert.equal(saveCalls, 0);
+
+  await engine.onSwap(current, next);
+
+  assert.equal(current.subsequentBuyCount, 2);
+  assert.deepEqual(current.countedBuyTransactionHashes, [
+    COUNTED_HASH_LOWER,
+    NEW_HASH_LOWER,
+  ]);
+  assert.equal(saveCalls, 1);
 });
 
 test('une vente manuelle n’hérite jamais d’une provenance résiduelle', async () => {

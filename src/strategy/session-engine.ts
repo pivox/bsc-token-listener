@@ -337,17 +337,22 @@ export class SessionEngine {
     }
 
     if (!cursorAfter(event.cursor, session.entry.cursor)) return;
-    if (session.entry.transactionHash === event.transactionHash) return;
-    if (session.countedBuyTransactionHashes.includes(event.transactionHash)) return;
+    const transactionHash = (
+      event.transactionHash.toLowerCase()
+    ) as SwapEvent['transactionHash'];
+    if (session.entry.transactionHash?.toLowerCase() === transactionHash) return;
+    if (session.countedBuyTransactionHashes.some(
+      (hash) => hash.toLowerCase() === transactionHash
+    )) return;
 
-    session.countedBuyTransactionHashes.push(event.transactionHash);
+    session.countedBuyTransactionHashes.push(transactionHash);
     session.subsequentBuyCount += 1;
     session.updatedAtMs = Date.now();
     await this.sessions.save(session);
     logger.info(
       {
         pair: session.pair.pair,
-        transactionHash: event.transactionHash,
+        transactionHash,
         count: session.subsequentBuyCount,
         target: session.targetBuysAfterEntry,
       },
