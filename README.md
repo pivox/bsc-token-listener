@@ -81,6 +81,8 @@ RISK_PROBE_REQUIRED=true
 - `token_sessions` : état de chaque paire suivie ;
 - `swap_events` : événements dédupliqués ;
 - `trades` : achats et ventes simulés ou réels ;
+- `trade_transactions` : étapes on-chain `BUY`, `APPROVE` et `SELL`, avec hash,
+  nonce, wallet, reçu, gas et snapshots de soldes ;
 - `token_risk_reports` : rapports complets ;
 - `listener_checkpoints` : reprise après coupure.
 
@@ -91,6 +93,37 @@ SELECT token_address, pair_address, score, verdict, created_at
 FROM token_risk_reports
 ORDER BY created_at DESC;
 ```
+
+### Cycle de vie des transactions
+
+Un trade métier utilise les états `CREATED`, `SUBMITTED`, `CONFIRMED`,
+`REVERTED`, `UNKNOWN`, `FAILED` ou `SIMULATED`. En live, chaque transaction est
+préparée et signée localement afin de calculer son hash et son nonce. Ces
+informations sont persistées avant l'appel de diffusion. La transaction signée
+elle-même n'est jamais stockée ni journalisée.
+
+Une erreur RPC après tentative de diffusion ou pendant l'attente du reçu produit
+`UNKNOWN`, jamais un échec on-chain supposé. Un reçu en échec produit `REVERTED`.
+Les transactions incertaines ne sont pas rediffusées automatiquement.
+
+```sql
+SELECT
+  t.trade_id,
+  t.side,
+  t.status AS trade_status,
+  x.step,
+  x.status AS transaction_status,
+  x.transaction_hash,
+  x.nonce,
+  x.gas_cost_wei,
+  x.receipt_status
+FROM trades t
+LEFT JOIN trade_transactions x ON x.trade_id = t.trade_id
+ORDER BY t.created_at DESC, x.created_at;
+```
+
+La reprise automatique et périodique de ces enregistrements est volontairement
+réservée à l'issue #7.
 
 ## Dashboard minimal
 
@@ -119,7 +152,30 @@ Après `npm run dev`, ouvrir :
 http://127.0.0.1:3000/dashboard
 ```
 
-Le PnL latent utilise la cotation `getAmountsOut` de PancakeSwap V2 et applique l’estimation de taxe de vente du rapport de risque lorsqu’elle est disponible. Le profit réalisé correspond au montant de sortie moins le montant d’entrée. Les frais de gas ne sont pas encore persistés : ils ne sont donc pas déduits et l’interface le signale explicitement.
+Le PnL latent utilise la cotation `getAmountsOut` de PancakeSwap V2 et applique
+l’estimation de taxe de vente du rapport de risque lorsqu’elle est disponible.
+Pour une position live clôturée, le dashboard distingue :
+
+- le PnL brut calculé à partir des variations réelles de soldes ;
+- le gas confirmé de l'achat, de l'approval éventuel et de la vente ;
+- le PnL net après déduction de ce gas.
+
+Les cotations dry-run restent explicitement marquées comme simulations et ne sont
+jamais présentées comme des montants réels.
+
+## Tests PostgreSQL
+
+La suite unitaire standard ne nécessite pas PostgreSQL. Le cycle de vie SQL peut
+être validé séparément sur une base de test jetable :
+
+```bash
+TEST_DATABASE_URL=postgresql://bscbot:bscbot@127.0.0.1:5432/bscbot \
+  npm run test:postgres
+```
+
+Cette commande crée un schéma temporaire, exécute la migration deux fois, vérifie
+la sérialisation exacte des `bigint` et les contraintes de déduplication, puis
+supprime le schéma.
 
 Le serveur reste lié à `127.0.0.1` par défaut. Ne définir `DASHBOARD_HOST=0.0.0.0` que derrière un pare-feu ou un reverse proxy correctement protégé.
 
