@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { medianBigInt } from '../src/strategy/entry-sizing.js';
+import { calculateEntryAmount, medianBigInt } from '../src/strategy/entry-sizing.js';
 
 test('medianBigInt retourne la valeur centrale pour un tableau impair', () => {
   assert.equal(medianBigInt([5n, 1n, 9n]), 5n);
@@ -28,4 +28,68 @@ test('medianBigInt échoue explicitement avec un tableau vide', () => {
   assert.throws(() => medianBigInt([]), {
     message: 'medianBigInt: values must not be empty',
   });
+});
+
+test('calcule un montant minimum autorisé', () => {
+  const amount = calculateEntryAmount(
+    1_000n,
+    [10n],
+    10_000n,
+    8n,
+    10_000n,
+    10_000,
+    10_000,
+    10_000,
+    0n,
+    1n,
+  );
+  assert.equal(amount, 10n);
+});
+
+test('limite le montant par la liquidité', () => {
+  const amount = calculateEntryAmount(
+    1_000n,
+    [2_000n],
+    10_000n,
+    8n,
+    10_000n,
+    3_000,
+    10_000,
+    10_000,
+    0n,
+    100n,
+  );
+  assert.equal(amount, 300n);
+});
+
+test('limite le montant par le wallet', () => {
+  const amount = calculateEntryAmount(
+    10_000n,
+    [10_000n],
+    1_000n,
+    8n,
+    10_000n,
+    10_000,
+    10_000,
+    5_000,
+    100n,
+    10n,
+  );
+  assert.equal(amount, 450n);
+});
+
+test('retourne null si le montant est sous le minimum', () => {
+  const amount = calculateEntryAmount(
+    10_000n,
+    [10_000n],
+    10_000n,
+    30n,
+    25n,
+    10_000,
+    10_000,
+    10_000,
+    0n,
+    10n,
+  );
+  assert.equal(amount, null);
 });
