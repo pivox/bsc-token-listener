@@ -1,4 +1,9 @@
-import type { EntryExecution, ExitExecution, TokenSession } from '../types/domain.js';
+import type {
+  EntryExecution,
+  ExitExecution,
+  TokenSession,
+  TradeRecord,
+} from '../types/domain.js';
 import type { TokenRiskReport } from '../security/token-risk.types.js';
 import {
   executionToReconcile,
@@ -29,7 +34,10 @@ interface PositionCounter {
 
 interface RecoveryTradeExecutor {
   buy(session: TokenSession, amountInWei: bigint): Promise<EntryExecution>;
-  sell(session: TokenSession): Promise<ExitExecution>;
+  sell(
+    session: TokenSession,
+    recovered?: { trade: TradeRecord; approvalGasWei: bigint },
+  ): Promise<ExitExecution>;
 }
 
 interface RecoveryIntentDependencies {
@@ -151,12 +159,15 @@ export class RecoveryIntentService implements RecoveryIntentExecutor {
     return session;
   }
 
-  async resumeSell(session: TokenSession): Promise<TokenSession> {
+  async resumeSell(
+    session: TokenSession,
+    recovered?: { trade: TradeRecord; approvalGasWei: bigint },
+  ): Promise<TokenSession> {
     if (session.status !== 'SELL_PENDING' || !session.entry || session.exit) {
       throw new Error('Reprise de vente impossible depuis cet état.');
     }
     try {
-      session.exit = await this.dependencies.executor.sell(session);
+      session.exit = await this.dependencies.executor.sell(session, recovered);
       session.status = 'CLOSED';
       delete session.rejectionReason;
       delete session.unreconciledExecution;

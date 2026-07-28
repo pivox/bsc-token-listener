@@ -408,6 +408,93 @@ test('un approval revert empêche toute tentative de vente', async () => {
   assert.equal(store.trades.at(-1)?.status, 'REVERTED');
 });
 
+test('reprend le trade d’approval et conserve son gas dans la vente', async () => {
+  const store = new MemoryTradeStore();
+  const gateway = new FakeExecutionGateway();
+  gateway.tokenBalances = [100n, 100n, 0n];
+  gateway.nativeBalances = [1_000n, 1_093n];
+  const openSession = session();
+  openSession.status = 'SELL_PENDING';
+  openSession.entry = {
+    mode: 'live',
+    tradeId: 'trade-buy',
+    amountInWei: 90n,
+    amountOutToken: 100n,
+    confirmedAtMs: 3,
+    cursor: { blockNumber: 3n, transactionIndex: 0, logIndex: 0 },
+  };
+  const recoveredTrade: TradeRecord = {
+    id: 'trade-sell-recovered',
+    pair: PAIR,
+    token: TOKEN,
+    side: 'SELL',
+    mode: 'live',
+    status: 'CREATED',
+    amountIn: 100n,
+    amountOut: 200n,
+    quotedAmountOut: 200n,
+    walletAddress: WALLET,
+    relatedTradeId: 'trade-buy',
+    gasCostWei: 2n,
+    createdAtMs: 2,
+    updatedAtMs: 2,
+  };
+  const executor = new TradeExecutor(store, gateway, 'live');
+
+  const exit = await executor.sell(openSession, {
+    trade: recoveredTrade,
+    approvalGasWei: 2n,
+  });
+
+  assert.equal(gateway.preparedApprovalAmount, null);
+  assert.equal(exit.tradeId, recoveredTrade.id);
+  assert.equal(exit.gasCostWei, 9n);
+  assert.equal(store.trades.at(-1)?.id, recoveredTrade.id);
+  assert.equal(store.trades.at(-1)?.gasCostWei, 9n);
+});
+
+test('ne rediffuse jamais un approval déjà confirmé pendant la reprise', async () => {
+  const store = new MemoryTradeStore();
+  const gateway = new FakeExecutionGateway();
+  gateway.allowance = 0n;
+  gateway.tokenBalances = [100n];
+  const openSession = session();
+  openSession.status = 'SELL_PENDING';
+  openSession.entry = {
+    mode: 'live',
+    amountInWei: 90n,
+    amountOutToken: 100n,
+    confirmedAtMs: 3,
+    cursor: { blockNumber: 3n, transactionIndex: 0, logIndex: 0 },
+  };
+  const recoveredTrade: TradeRecord = {
+    id: 'trade-sell-recovered',
+    pair: PAIR,
+    token: TOKEN,
+    side: 'SELL',
+    mode: 'live',
+    status: 'CREATED',
+    amountIn: 100n,
+    amountOut: 200n,
+    walletAddress: WALLET,
+    gasCostWei: 2n,
+    createdAtMs: 2,
+    updatedAtMs: 2,
+  };
+  const executor = new TradeExecutor(store, gateway, 'live');
+
+  await assert.rejects(
+    executor.sell(openSession, {
+      trade: recoveredTrade,
+      approvalGasWei: 2n,
+    }),
+    /Allowance insuffisante après reprise/u,
+  );
+
+  assert.equal(gateway.preparedApprovalAmount, null);
+  assert.equal(gateway.preparedSellAmount, null);
+});
+
 test('conserve le reçu confirmé quand la mesure post-achat échoue', async () => {
   const store = new MemoryTradeStore();
   const gateway = new FakeExecutionGateway();

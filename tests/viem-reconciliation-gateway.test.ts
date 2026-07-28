@@ -97,13 +97,14 @@ test('ne conserve que le type d’une erreur RPC', async () => {
   });
 });
 
-test('lit les soldes au bloc du reçu et détecte un nonce wallet ultérieur', async () => {
+test('lit les soldes au bloc du reçu et détecte toute transaction ultérieure', async () => {
+  const otherWallet = `0x${'3'.repeat(40)}` as Address;
   const calls: Array<{ kind: string; blockNumber: bigint }> = [];
   const gateway = new ViemReconciliationGateway({
     ...client({
       blockTransactions: [
         { from: WALLET },
-        { from: WALLET },
+        { from: otherWallet },
       ],
     }),
     async getBalance(input: {
@@ -129,7 +130,11 @@ test('lit les soldes au bloc du reçu et détecte un nonce wallet ultérieur', a
     { kind: 'token', blockNumber: 10n },
   ]);
   assert.equal(
-    await gateway.hasLaterWalletTransactionInBlock(WALLET, 10n, 0),
+    await gateway.hasLaterTransactionInBlock(10n, 0),
     true,
+  );
+  assert.equal(
+    await gateway.hasLaterTransactionInBlock(10n, 1),
+    false,
   );
 });

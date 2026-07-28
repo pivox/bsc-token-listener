@@ -414,6 +414,10 @@ export class SessionReconciler {
     this.applyReceipt(trade, transaction, receipt);
     transaction.status = 'CONFIRMED';
     trade.status = 'CREATED';
+    session.status = 'SELL_PENDING';
+    delete session.rejectionReason;
+    delete session.unreconciledExecution;
+    const approvalGasWei = transaction.gasCostWei ?? 0n;
     const reason = 'Approval confirmé; vente à reprendre sans rediffuser l’approval.';
     this.recordRecovery(session, 'APPROVAL_CONFIRMED', reason);
     await this.apply(claimed, {
@@ -425,7 +429,10 @@ export class SessionReconciler {
       transaction,
     });
     if (this.intents) {
-      const resumed = await this.intents.resumeSell(session);
+      const resumed = await this.intents.resumeSell(session, {
+        trade,
+        approvalGasWei,
+      });
       const resumeReason = 'Vente reprise après confirmation de l’approval.';
       this.recordRecovery(resumed, 'RESUME_INTENT', resumeReason);
       await this.apply(claimed, {
@@ -451,13 +458,12 @@ export class SessionReconciler {
       ];
     }
     const contaminated =
-      await this.gateway.hasLaterWalletTransactionInBlock(
-        transaction.walletAddress,
+      await this.gateway.hasLaterTransactionInBlock(
         receipt.blockNumber,
         receipt.transactionIndex,
       );
     if (contaminated) {
-      throw new Error('Mesure contaminée par une transaction wallet ultérieure.');
+      throw new Error('Mesure contaminée par une transaction ultérieure dans le bloc.');
     }
     const [nativeAfter, tokenAfter] = await Promise.all([
       transaction.nativeBalanceAfter

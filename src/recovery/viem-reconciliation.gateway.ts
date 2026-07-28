@@ -104,8 +104,7 @@ export class ViemReconciliationGateway implements ReconciliationGateway {
     return balance;
   }
 
-  async hasLaterWalletTransactionInBlock(
-    wallet: Address,
+  async hasLaterTransactionInBlock(
     blockNumber: bigint,
     transactionIndex: number,
   ): Promise<boolean> {
@@ -113,10 +112,6 @@ export class ViemReconciliationGateway implements ReconciliationGateway {
       blockNumber,
       includeTransactions: true,
     });
-    return block.transactions
-      .slice(transactionIndex + 1)
-      .some((transaction) =>
-        typeof transaction !== 'string'
-        && transaction.from.toLowerCase() === wallet.toLowerCase());
+    return block.transactions.length > transactionIndex + 1;
   }
 }

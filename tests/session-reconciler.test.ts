@@ -131,7 +131,7 @@ class FakeGateway implements ReconciliationGateway {
   };
   nativeBalance = 893n;
   tokenBalance = 170n;
-  laterWalletTransaction = false;
+  laterBlockTransaction = false;
   readonly balanceBlockNumbers: bigint[] = [];
 
   async observeTransaction(): Promise<ChainObservation> {
@@ -155,8 +155,8 @@ class FakeGateway implements ReconciliationGateway {
     return this.tokenBalance;
   }
 
-  async hasLaterWalletTransactionInBlock(): Promise<boolean> {
-    return this.laterWalletTransaction;
+  async hasLaterTransactionInBlock(): Promise<boolean> {
+    return this.laterBlockTransaction;
   }
 }
 
@@ -164,6 +164,9 @@ class FakeIntents implements RecoveryIntentExecutor {
   buyCalls = 0;
   sellCalls = 0;
   riskCalls = 0;
+  resumedSellStatus: TokenSession['status'] | null = null;
+  recoveredApprovalGasWei: bigint | null = null;
+  recoveredTradeId: string | null = null;
 
   async resumeRiskAndBuy(value: TokenSession): Promise<TokenSession> {
     this.riskCalls += 1;
@@ -176,8 +179,14 @@ class FakeIntents implements RecoveryIntentExecutor {
     return value;
   }
 
-  async resumeSell(value: TokenSession): Promise<TokenSession> {
+  async resumeSell(
+    value: TokenSession,
+    recovered?: { trade: TradeRecord; approvalGasWei: bigint },
+  ): Promise<TokenSession> {
     this.sellCalls += 1;
+    this.resumedSellStatus = value.status;
+    this.recoveredApprovalGasWei = recovered?.approvalGasWei ?? null;
+    this.recoveredTradeId = recovered?.trade.id ?? null;
     value.status = 'CLOSED';
     return value;
   }
@@ -245,10 +254,10 @@ test('retente la mesure read-only d’une exécution en revue manuelle', async (
   assert.equal(store.applied.at(-1)?.session.unreconciledExecution, undefined);
 });
 
-test('refuse une mesure contaminée par une transaction wallet ultérieure du même bloc', async () => {
+test('refuse une mesure contaminée par toute transaction ultérieure du même bloc', async () => {
   const store = new MemoryStore();
   const gateway = new FakeGateway();
-  gateway.laterWalletTransaction = true;
+  gateway.laterBlockTransaction = true;
   const currentTrade = trade('BUY');
   const current = claim(
     session('BUY_PENDING'),
@@ -394,9 +403,52 @@ test('un approval confirmé reprend la vente sans rediffuser l’approval', asyn
   await reconciler.reconcile(current);
 
   assert.equal(intents.sellCalls, 1);
+  assert.equal(intents.resumedSellStatus, 'SELL_PENDING');
+  assert.equal(intents.recoveredApprovalGasWei, 7n);
+  assert.equal(intents.recoveredTradeId, currentTrade.id);
   assert.equal(store.applied[0]?.action, 'APPROVAL_CONFIRMED');
   assert.equal(store.applied[0]?.retainLease, true);
   assert.equal(store.applied.at(-1)?.action, 'RESUME_INTENT');
+  assert.equal(store.applied.at(-1)?.session.status, 'CLOSED');
+});
+
+test('un approval confirmé restaure MANUAL_REVIEW en SELL_PENDING avant reprise', async () => {
+  const store = new MemoryStore();
+  const gateway = new FakeGateway();
+  const intents = new FakeIntents();
+  const currentSession = session('MANUAL_REVIEW');
+  currentSession.entry = {
+    mode: 'live',
+    amountInWei: 100n,
+    amountOutToken: 100n,
+    confirmedAtMs: 1,
+    cursor: { blockNumber: 1n, transactionIndex: 0, logIndex: 0 },
+  };
+  currentSession.unreconciledExecution = {
+    tradeId: 'trade-sell',
+    step: 'APPROVE',
+    outcome: 'CONFIRMED',
+    transactionHash: HASH,
+    recordedAtMs: 2,
+  };
+  const currentTrade = trade('SELL');
+  const approval = {
+    ...transaction(currentTrade, 'SELL'),
+    id: 'transaction-approval',
+    step: 'APPROVE' as const,
+  };
+  const reconciler = new SessionReconciler(
+    store,
+    gateway,
+    intents,
+    () => 20,
+  );
+
+  await reconciler.reconcile(claim(currentSession, currentTrade, approval));
+
+  assert.equal(intents.sellCalls, 1);
+  assert.equal(intents.resumedSellStatus, 'SELL_PENDING');
+  assert.equal(store.applied[0]?.session.status, 'SELL_PENDING');
   assert.equal(store.applied.at(-1)?.session.status, 'CLOSED');
 });
 

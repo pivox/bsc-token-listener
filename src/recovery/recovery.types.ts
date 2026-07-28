@@ -27,8 +27,7 @@ export interface ReconciliationGateway {
     wallet: Address,
     blockNumber: bigint,
   ): Promise<bigint>;
-  hasLaterWalletTransactionInBlock(
-    wallet: Address,
+  hasLaterTransactionInBlock(
     blockNumber: bigint,
     transactionIndex: number,
   ): Promise<boolean>;
@@ -74,5 +73,8 @@ export interface ReconciliationStore {
 export interface RecoveryIntentExecutor {
   resumeRiskAndBuy(session: TokenSession): Promise<TokenSession>;
   resumeBuy(session: TokenSession): Promise<TokenSession>;
-  resumeSell(session: TokenSession): Promise<TokenSession>;
+  resumeSell(
+    session: TokenSession,
+    recovered?: { trade: TradeRecord; approvalGasWei: bigint },
+  ): Promise<TokenSession>;
 }

@@ -216,12 +216,26 @@ export class TradeExecutor {
     });
   }
 
-  async sell(session: TokenSession): Promise<ExitExecution> {
+  async sell(
+    session: TokenSession,
+    recovered?: { trade: TradeRecord; approvalGasWei: bigint },
+  ): Promise<ExitExecution> {
     return this.queue.run(async () => {
       const positionAmount = session.entry?.amountOutToken ?? 0n;
       if (positionAmount <= 0n) throw new Error('Aucun token à vendre.');
 
-      const trade = this.newTrade(session, 'SELL', positionAmount);
+      const trade = recovered?.trade ?? this.newTrade(session, 'SELL', positionAmount);
+      if (
+        trade.side !== 'SELL'
+        || trade.mode !== this.mode
+        || trade.pair.toLowerCase() !== session.pair.pair.toLowerCase()
+        || trade.token.toLowerCase() !== session.pair.token.toLowerCase()
+      ) {
+        throw new Error('Trade de vente récupéré incompatible avec la session.');
+      }
+      trade.status = 'CREATED';
+      trade.amountIn = positionAmount;
+      if (recovered) trade.gasCostWei = recovered.approvalGasWei;
       if (session.entry?.tradeId) trade.relatedTradeId = session.entry.tradeId;
       await this.trades.save(trade);
       const path = [session.pair.token, session.pair.wbnb] as const;
@@ -271,7 +285,7 @@ export class TradeExecutor {
         throw error;
       }
 
-      let approvalGasWei = 0n;
+      let approvalGasWei = recovered?.approvalGasWei ?? 0n;
       try {
         const allowance = await this.gateway.getAllowance({
           token: session.pair.token,
@@ -279,6 +293,11 @@ export class TradeExecutor {
           spender: session.pair.router,
         });
         if (allowance < positionAmount) {
+          if (recovered) {
+            throw new Error(
+              'Allowance insuffisante après reprise d’un approval confirmé.',
+            );
+          }
           approvalGasWei = await this.approve(
             trade,
             session,
