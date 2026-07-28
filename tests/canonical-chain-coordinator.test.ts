@@ -7,6 +7,9 @@ import {
   DEFAULT_CANONICAL_RETENTION,
 } from '../src/chain/canonical-chain.coordinator.js';
 import type {
+  CanonicalChainCoordinatorOptions,
+} from '../src/chain/canonical-chain.coordinator.js';
+import type {
   CanonicalBlock,
   ListenerCheckpoint,
 } from '../src/chain/canonical-chain.types.js';
@@ -48,6 +51,7 @@ class MemoryCanonicalStore {
   readonly blocks = new Map<bigint, CanonicalBlock>();
   readonly saves: CanonicalBlock[][] = [];
   readonly pruneCalls: bigint[] = [];
+  readonly listLimits: number[] = [];
 
   constructor(initial: CanonicalBlock[] = []) {
     for (const header of initial) this.blocks.set(header.number, header);
@@ -61,6 +65,7 @@ class MemoryCanonicalStore {
   }
 
   async listCanonicalDescending(limit: number): Promise<CanonicalBlock[]> {
+    this.listLimits.push(limit);
     return [...this.blocks.values()]
       .sort((left, right) =>
         left.number > right.number ? -1 : left.number < right.number ? 1 : 0)
@@ -100,11 +105,15 @@ class MemoryCheckpoints {
   }
 }
 
+type HasConfigurableRetention =
+  'retention' extends keyof CanonicalChainCoordinatorOptions ? true : false;
+const hasConfigurableRetention: HasConfigurableRetention = false;
+
 function coordinator(
   reader: MemoryBlockReader,
   canonicalStore = new MemoryCanonicalStore(),
   checkpoints = new MemoryCheckpoints(),
-  options: { confirmations?: number; chunkSize?: number; retention?: number } = {},
+  options: { confirmations?: number; chunkSize?: number } = {},
 ): CanonicalChainCoordinator {
   return new CanonicalChainCoordinator({
     blockReader: reader,
@@ -114,9 +123,6 @@ function coordinator(
     ...(options.chunkSize === undefined
       ? {}
       : { chunkSize: options.chunkSize }),
-    ...(options.retention === undefined
-      ? {}
-      : { retention: options.retention }),
   });
 }
 
@@ -138,6 +144,30 @@ test('refuse un chunk supérieur au maximum de production', () => {
     }),
     /chunkSize.*1.*1500/iu,
   );
+});
+
+test('ignore toute ancienne option runtime et impose une rétention de 128', async () => {
+  assert.equal(hasConfigurableRetention, false);
+  const reader = new MemoryBlockReader(132n);
+  const canonicalStore = new MemoryCanonicalStore();
+  const checkpoints = new MemoryCheckpoints();
+  const legacyOptions = {
+    blockReader: reader,
+    canonicalStore,
+    checkpoints,
+    confirmations: 5,
+    retention: 1,
+  };
+  const subject = new CanonicalChainCoordinator(legacyOptions);
+
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 200n,
+    processChunk: async () => true,
+  });
+
+  assert.deepEqual(canonicalStore.listLimits, [128]);
+  assert.equal(canonicalStore.saves[0]?.length, 128);
 });
 
 test('traite uniquement la plage confirmée puis ancre le checkpoint', async () => {

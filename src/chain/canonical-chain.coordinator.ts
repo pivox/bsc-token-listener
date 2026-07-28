@@ -31,7 +31,6 @@ export interface CanonicalChainCoordinatorOptions {
   checkpoints: ListenerCheckpointStore;
   confirmations?: number;
   chunkSize?: number;
-  retention?: number;
 }
 
 export interface CanonicalChainCoordinatorStatus {
@@ -44,13 +43,6 @@ export class CanonicalChainContinuityError extends Error {
     super(message);
     this.name = 'CanonicalChainContinuityError';
   }
-}
-
-function positiveInteger(value: number, name: string): number {
-  if (!Number.isSafeInteger(value) || value < 1) {
-    throw new Error(`${name} doit être un entier strictement positif.`);
-  }
-  return value;
 }
 
 function boundedInteger(
@@ -108,7 +100,6 @@ export class CanonicalChainCoordinator {
   private readonly checkpoints: ListenerCheckpointStore;
   private readonly confirmations: number;
   private readonly chunkSize: bigint;
-  private readonly retention: number;
   private tail: Promise<void> = Promise.resolve();
   private status: CanonicalChainCoordinatorStatus = {
     running: false,
@@ -132,10 +123,6 @@ export class CanonicalChainCoordinator {
         1,
         DEFAULT_CONFIRMED_CHUNK_SIZE,
       ),
-    );
-    this.retention = positiveInteger(
-      options.retention ?? DEFAULT_CANONICAL_RETENTION,
-      'retention',
     );
   }
 
@@ -175,7 +162,9 @@ export class CanonicalChainCoordinator {
     const [checkpoint, tip, descending] = await Promise.all([
       this.checkpoints.get(request.listenerKey),
       this.canonicalStore.getCanonicalTip(),
-      this.canonicalStore.listCanonicalDescending(this.retention),
+      this.canonicalStore.listCanonicalDescending(
+        DEFAULT_CANONICAL_RETENTION,
+      ),
     ]);
     const knownHeaders = new Map<bigint, CanonicalBlock>();
     for (const header of descending) {
@@ -246,7 +235,7 @@ export class CanonicalChainCoordinator {
     head: bigint,
   ): Promise<CanonicalBlock[]> {
     if (tip && tip.number >= head) return [];
-    const retention = BigInt(this.retention);
+    const retention = BigInt(DEFAULT_CANONICAL_RETENTION);
     const firstBlock = tip
       ? tip.number + 1n
       : head >= retention
