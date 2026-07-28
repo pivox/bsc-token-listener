@@ -69,7 +69,11 @@ export class ReconciliationRepository implements ReconciliationStore {
     }
   }
 
-  async claimNext(owner: string, leaseMs: number): Promise<ClaimedRecovery | null> {
+  async claimNext(
+    owner: string,
+    leaseMs: number,
+    excludedPairs: readonly string[] = [],
+  ): Promise<ClaimedRecovery | null> {
     const client = await this.database.connect();
     try {
       await client.query('BEGIN');
@@ -82,6 +86,7 @@ export class ReconciliationRepository implements ReconciliationStore {
            FROM token_sessions
            WHERE status IN ('RISK_CHECKING', 'BUY_PENDING', 'SELL_PENDING', 'MANUAL_REVIEW')
              AND (recovery_lease_until IS NULL OR recovery_lease_until < NOW())
+             AND NOT (pair_address = ANY($3::text[]))
            ORDER BY updated_at
            FOR UPDATE SKIP LOCKED
            LIMIT 1
@@ -93,7 +98,7 @@ export class ReconciliationRepository implements ReconciliationStore {
          FROM candidate
          WHERE s.pair_address = candidate.pair_address
          RETURNING s.payload, s.status`,
-        [owner, leaseMs],
+        [owner, leaseMs, excludedPairs.map((pair) => pair.toLowerCase())],
       );
       const row = claimed.rows[0];
       if (!row) {

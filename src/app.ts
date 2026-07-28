@@ -13,6 +13,11 @@ import { TradeExecutor } from './execution/trade-executor.js';
 import { HeartbeatService } from './heartbeat/heartbeat.js';
 import { PairCreatedListener } from './listeners/pair-created.listener.js';
 import { SwapListener } from './listeners/swap.listener.js';
+import { RecoveryCoordinator } from './recovery/recovery-coordinator.js';
+import { RecoveryIntentService } from './recovery/recovery-intent.service.js';
+import { ReconciliationRepository } from './recovery/reconciliation.repository.js';
+import { SessionReconciler } from './recovery/session-reconciler.js';
+import { ViemReconciliationGateway } from './recovery/viem-reconciliation.gateway.js';
 import { account, publicClient, wsClient } from './rpc/clients.js';
 import { RiskSettingsStore } from './security/risk-settings.store.js';
 import { TokenRiskService } from './security/token-risk.service.js';
@@ -147,6 +152,28 @@ async function main(): Promise<void> {
     }
   };
 
+  const reconciliationStore = new ReconciliationRepository();
+  const recoveryIntents = new RecoveryIntentService({
+    sessions,
+    reports,
+    risk,
+    amounts: amountService,
+    executor,
+    riskPolicy: config.riskPolicy,
+  });
+  const recovery = new RecoveryCoordinator(
+    reconciliationStore,
+    new SessionReconciler(
+      reconciliationStore,
+      new ViemReconciliationGateway(),
+      recoveryIntents,
+    ),
+    {
+      intervalMs: config.recoveryIntervalSeconds * 1_000,
+      leaseMs: config.recoveryLeaseSeconds * 1_000,
+    },
+  );
+
   const onPair = async (pair: PairInfo): Promise<void> => {
     const key = pair.pair.toLowerCase();
     if (monitors.has(key)) return;
@@ -199,6 +226,12 @@ async function main(): Promise<void> {
     await startMonitor(session);
   };
 
+  const initialRecovery = await recovery.reconcileInitial();
+  logger.info(
+    { processedSessions: initialRecovery.processedSessions },
+    'Réconciliation initiale terminée; activation des listeners autorisée.',
+  );
+
   const restored = await sessions.loadActive();
   for (const session of restored) {
     if (await ignoredAssets.isIgnored(session.pair.token)) {
@@ -210,6 +243,7 @@ async function main(): Promise<void> {
 
   const pairListener = new PairCreatedListener(checkpoints, onPair);
   await pairListener.start();
+  recovery.start();
 
   const refreshHeartbeat = async (): Promise<void> => {
     const snapshot = await heartbeat.refresh(monitors.size);
@@ -273,6 +307,7 @@ async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info({ signal }, 'Arrêt du bot.');
+    recovery.stop();
     clearInterval(heartbeatInterval);
     pairListener.stop();
     for (const listener of monitors.values()) listener.stop();

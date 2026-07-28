@@ -47,7 +47,11 @@ export interface RecoveryDecision {
 }
 
 export interface ReconciliationStore {
-  claimNext(owner: string, leaseMs: number): Promise<ClaimedRecovery | null>;
+  claimNext(
+    owner: string,
+    leaseMs: number,
+    excludedPairs?: readonly string[],
+  ): Promise<ClaimedRecovery | null>;
   applyDecision(claimed: ClaimedRecovery, decision: RecoveryDecision): Promise<void>;
   tryAcquirePassLock(): Promise<boolean>;
   releasePassLock(): Promise<void>;
