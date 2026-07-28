@@ -3,12 +3,158 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import type { Hash } from 'viem';
 import { CanonicalChainRepository } from '../src/chain/canonical-chain.repository.js';
-import type { CanonicalBlock } from '../src/chain/canonical-chain.types.js';
+import type {
+  CanonicalBlock,
+  ReorgReconciliation,
+} from '../src/chain/canonical-chain.types.js';
 import { CheckpointRepository } from '../src/storage/repositories.js';
 
 const HASH_10 = `0x${'1'.repeat(64)}` as Hash;
 const HASH_11 = `0x${'2'.repeat(64)}` as Hash;
 const HASH_12 = `0x${'3'.repeat(64)}` as Hash;
+const HASH_13 = `0x${'4'.repeat(64)}` as Hash;
+
+const SHALLOW_REORG: ReorgReconciliation = {
+  ancestor: { number: 10n, hash: HASH_10, parentHash: HASH_10 },
+  oldTip: { number: 12n, hash: HASH_12, parentHash: HASH_11 },
+  newTip: { number: 13n, hash: HASH_13, parentHash: HASH_12 },
+  depth: 2,
+};
+
+interface ReorgFixtureState {
+  auditCount: number;
+  committed: boolean;
+  released: boolean;
+  mutations: string[];
+}
+
+class StatefulReorgDatabase {
+  readonly calls: Array<{ sql: string; values?: unknown[] }> = [];
+  readonly state: ReorgFixtureState = {
+    auditCount: 0,
+    committed: false,
+    released: false,
+    mutations: [],
+  };
+  failOn: string | null = null;
+  private pending: ReorgFixtureState | null = null;
+  private savedImpact: unknown = null;
+
+  async connect(): Promise<this> {
+    return this;
+  }
+
+  release(): void {
+    this.state.released = true;
+  }
+
+  async query<T>(sql: string, values?: unknown[]): Promise<{ rows: T[] }> {
+    this.calls.push({ sql, ...(values ? { values } : {}) });
+    const normalized = sql.replace(/\s+/gu, ' ').trim();
+    if (this.failOn && normalized.includes(this.failOn)) {
+      throw new Error(`failure:${this.failOn}`);
+    }
+    if (normalized === 'BEGIN') {
+      this.pending = structuredClone(this.state);
+      return { rows: [] };
+    }
+    if (normalized === 'ROLLBACK') {
+      this.pending = null;
+      return { rows: [] };
+    }
+    if (normalized === 'COMMIT') {
+      assert.ok(this.pending);
+      Object.assign(this.state, this.pending, { committed: true });
+      this.pending = null;
+      return { rows: [] };
+    }
+    const staged = this.pending ?? this.state;
+    if (normalized.includes('INSERT INTO chain_reorgs')) {
+      if (staged.auditCount === 0) staged.auditCount = 1;
+      staged.mutations.push('audit');
+      return {
+        rows: [{
+          status: this.savedImpact ? 'RECONCILING' : String(values?.[7]),
+          details: this.savedImpact
+            ? { rollbackImpact: this.savedImpact }
+            : JSON.parse(String(values?.[11])),
+        }] as T[],
+      };
+    }
+    if (normalized.includes('FROM discovered_tokens') && normalized.includes('FOR UPDATE')) {
+      return {
+        rows: [
+          { pair_address: '0xpair-b' },
+          { pair_address: '0xpair-a' },
+        ] as T[],
+      };
+    }
+    if (normalized.includes('FROM swap_events') && normalized.includes('FOR UPDATE')) {
+      return {
+        rows: [
+          {
+            event_id: 'event-late',
+            pair_address: '0xpair-a',
+            block_number: '12',
+            transaction_index: 1,
+            log_index: 0,
+            session_before: '{"step":"late"}',
+          },
+          {
+            event_id: 'event-early',
+            pair_address: '0xpair-a',
+            block_number: '11',
+            transaction_index: 0,
+            log_index: 2,
+            session_before: '{"step":"baseline"}',
+          },
+          {
+            event_id: 'event-wallet',
+            pair_address: '0xpair-b',
+            block_number: '11',
+            transaction_index: 1,
+            log_index: 1,
+            session_before: null,
+          },
+        ] as T[],
+      };
+    }
+    if (normalized.includes('FROM trades') && normalized.includes('FOR UPDATE')) {
+      return {
+        rows: [
+          { trade_id: 'dry-trade', pair_address: '0xpair-a', has_transaction: false },
+          { trade_id: 'wallet-trade', pair_address: '0xpair-b', has_transaction: true },
+        ] as T[],
+      };
+    }
+    if (
+      normalized.includes('FROM swap_events')
+      && normalized.includes('DISTINCT ON')
+    ) {
+      return {
+        rows: [{
+          pair_address: '0xpair-b',
+          session_after: '{"step":"canonical"}',
+        }] as T[],
+      };
+    }
+    if (normalized.includes('UPDATE chain_reorgs') && normalized.includes('rollbackImpact')) {
+      this.savedImpact = JSON.parse(String(values?.[2]));
+      staged.mutations.push('impact');
+      return { rows: [] };
+    }
+    if (
+      normalized.startsWith('UPDATE')
+      || normalized.startsWith('DELETE')
+    ) {
+      staged.mutations.push(
+        normalized.match(/^(?:UPDATE|DELETE FROM) ([a-z_]+)/u)?.[1] ?? normalized,
+      );
+      return { rows: [] };
+    }
+    return { rows: [] };
+  }
+}
 
 test('migration reorg reste idempotente et conserve les colonnes legacy nullables', async () => {
   const migration = await readFile(
@@ -269,4 +415,181 @@ test('mappe un audit encore sans ancêtre commun ni profondeur', async () => {
   assert.equal(audit?.impact.orphanedEvents, 0);
   assert.equal(audit?.impact.replayedEvents, 0);
   assert.deepEqual(audit?.details, {});
+});
+
+test('rewind un reorg superficiel dans une transaction ordonnée et retourne un impact déterministe', async () => {
+  const database = new StatefulReorgDatabase();
+  const repository = new CanonicalChainRepository(database);
+
+  const impact = await repository.rewindToAncestor(SHALLOW_REORG);
+
+  assert.deepEqual(
+    database.calls.map(({ sql }) =>
+      sql.replace(/\s+/gu, ' ').trim().match(
+        /^(BEGIN|COMMIT|INSERT INTO chain_reorgs|SELECT .*? FROM ([a-z_]+)|UPDATE ([a-z_]+)|DELETE FROM ([a-z_]+))/u,
+      )?.[0]
+    ),
+    [
+      'BEGIN',
+      'INSERT INTO chain_reorgs',
+      'SELECT pair_address FROM discovered_tokens',
+      'SELECT event_id, pair_address, block_number::text, transaction_index, log_index, session_before FROM swap_events',
+      'SELECT t.trade_id, t.pair_address, EXISTS ( SELECT 1 FROM trade_transactions',
+      'SELECT DISTINCT ON (pair_address) pair_address, session_after FROM swap_events',
+      'UPDATE discovered_tokens',
+      'UPDATE swap_events',
+      'UPDATE token_risk_reports',
+      'UPDATE trades',
+      'UPDATE listener_checkpoints',
+      'DELETE FROM canonical_blocks',
+      'UPDATE chain_reorgs',
+      'COMMIT',
+    ],
+  );
+  assert.equal(impact.reorgId, `reorg:${HASH_12}:${HASH_13}`);
+  assert.equal(impact.depth, 2);
+  assert.deepEqual(impact.orphanedEventIds, [
+    'event-early',
+    'event-wallet',
+    'event-late',
+  ]);
+  assert.deepEqual(impact.affectedPairs, [
+    {
+      pairAddress: '0xpair-a',
+      discoveryOrphaned: true,
+      earliestSessionBefore: { step: 'baseline' },
+      latestCanonicalSessionAfter: null,
+      hasWalletConsequence: false,
+    },
+    {
+      pairAddress: '0xpair-b',
+      discoveryOrphaned: true,
+      earliestSessionBefore: null,
+      latestCanonicalSessionAfter: { step: 'canonical' },
+      hasWalletConsequence: true,
+    },
+  ]);
+  assert.equal(database.state.auditCount, 1);
+  assert.equal(database.state.committed, true);
+  assert.equal(database.state.released, true);
+  assert.deepEqual(
+    database.calls.find(({ sql }) => sql.includes('UPDATE listener_checkpoints'))?.values,
+    ['10', HASH_10],
+  );
+  assert.deepEqual(
+    database.calls.find(({ sql }) => sql.includes('DELETE FROM canonical_blocks'))?.values,
+    ['10'],
+  );
+  assert.match(
+    database.calls.find(({ sql }) => sql.includes('UPDATE trades'))?.sql ?? '',
+    /NOT EXISTS[\s\S]*trade_transactions/u,
+  );
+  assert.doesNotMatch(
+    database.calls.find(({ sql }) => sql.includes('UPDATE trades'))?.sql ?? '',
+    /t\.mode/u,
+  );
+});
+
+for (const failure of [
+  'INSERT INTO chain_reorgs',
+  'FROM discovered_tokens',
+  'FROM swap_events',
+  'FROM trades',
+  'UPDATE discovered_tokens',
+  'UPDATE swap_events',
+  'UPDATE token_risk_reports',
+  'UPDATE trades',
+  'UPDATE listener_checkpoints',
+  'DELETE FROM canonical_blocks',
+  'UPDATE chain_reorgs',
+]) {
+  test(`rollback sans commit ni mutation visible si ${failure} échoue`, async () => {
+    const database = new StatefulReorgDatabase();
+    database.failOn = failure;
+    const repository = new CanonicalChainRepository(database);
+
+    await assert.rejects(repository.rewindToAncestor(SHALLOW_REORG), /failure:/u);
+
+    assert.equal(database.calls.at(-1)?.sql, 'ROLLBACK');
+    assert.equal(database.calls.some(({ sql }) => sql === 'COMMIT'), false);
+    assert.deepEqual(database.state, {
+      auditCount: 0,
+      committed: false,
+      released: true,
+      mutations: [],
+    });
+  });
+}
+
+test('un retry du même fork réutilise audit et impact sans rejouer les mutations', async () => {
+  const database = new StatefulReorgDatabase();
+  const repository = new CanonicalChainRepository(database);
+  const first = await repository.rewindToAncestor(SHALLOW_REORG);
+  const mutationCount = database.state.mutations.length;
+
+  const second = await repository.rewindToAncestor(SHALLOW_REORG);
+
+  assert.deepEqual(second, first);
+  assert.equal(database.state.auditCount, 1);
+  assert.equal(database.state.mutations.length, mutationCount + 1);
+  assert.equal(
+    database.calls.filter(({ sql }) => sql.includes('UPDATE swap_events')).length,
+    1,
+  );
+});
+
+test('un reorg profond persiste seulement un audit manuel sans ancêtre', async () => {
+  const database = new StatefulReorgDatabase();
+  const repository = new CanonicalChainRepository(database);
+  const deepReorg: ReorgReconciliation = {
+    ...SHALLOW_REORG,
+    ancestor: null,
+    depth: null,
+  };
+
+  const audit = await repository.recordDeepReorg(
+    deepReorg,
+    'NO_COMMON_ANCESTOR_WITHIN_RETENTION',
+  );
+
+  assert.equal(audit.reorgId, `reorg:${HASH_12}:${HASH_13}`);
+  assert.deepEqual(
+    database.calls.map(({ sql }) => sql.replace(/\s+/gu, ' ').trim()),
+    [
+      'BEGIN',
+      database.calls[1]?.sql.replace(/\s+/gu, ' ').trim(),
+      'COMMIT',
+    ],
+  );
+  assert.match(database.calls[1]?.sql ?? '', /INSERT INTO chain_reorgs/u);
+  assert.deepEqual(database.calls[1]?.values?.slice(1, 4), [null, null, '12']);
+  assert.equal(database.calls[1]?.values?.[7], 'MANUAL_REVIEW');
+  assert.equal(database.calls[1]?.values?.[8], null);
+  assert.deepEqual(JSON.parse(String(database.calls[1]?.values?.[11])), {
+    reason: 'NO_COMMON_ANCESTOR_WITHIN_RETENTION',
+  });
+});
+
+test('complete et manual review écrivent compte et détail sûr sans régresser RECOVERED', async () => {
+  const database = new StatefulReorgDatabase();
+  const repository = new CanonicalChainRepository(database);
+
+  await repository.completeReorg('reorg-id', 7);
+  await repository.requireManualReview(
+    'reorg-id',
+    'WALLET_CONSEQUENCE_REQUIRES_REVIEW',
+  );
+
+  const complete = database.calls.find(
+    ({ sql }) => sql.includes("status = 'RECOVERED'"),
+  );
+  const manual = database.calls.find(
+    ({ sql }) => sql.includes("'MANUAL_REVIEW'"),
+  );
+  assert.deepEqual(complete?.values, ['reorg-id', 7]);
+  assert.deepEqual(manual?.values, [
+    'reorg-id',
+    '{"reason":"WALLET_CONSEQUENCE_REQUIRES_REVIEW"}',
+  ]);
+  assert.match(manual?.sql ?? '', /status = 'RECOVERED' THEN status/u);
 });
