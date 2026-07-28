@@ -225,18 +225,19 @@ export class TradeRepository {
     private readonly database: TradeDatabase = pool as unknown as TradeDatabase,
   ) {}
 
-  async save(trade: TradeRecord): Promise<void> {
-    await this.saveTrade(this.database, trade);
+  async save(trade: TradeRecord, sourceEventId?: string): Promise<void> {
+    await this.saveTrade(this.database, trade, sourceEventId);
   }
 
   async saveLifecycle(
     trade: TradeRecord,
     transaction: TradeTransactionRecord,
+    sourceEventId?: string,
   ): Promise<void> {
     const client = await this.database.connect();
     try {
       await client.query('BEGIN');
-      await this.saveTrade(client, trade);
+      await this.saveTrade(client, trade, sourceEventId);
       await this.saveTransaction(client, transaction);
       await client.query('COMMIT');
     } catch (error) {
@@ -250,21 +251,24 @@ export class TradeRepository {
   private async saveTrade(
     client: Pick<TradeDatabase, 'query'>,
     trade: TradeRecord,
+    sourceEventId?: string,
   ): Promise<void> {
     await client.query(
       `INSERT INTO trades(
          trade_id, pair_address, token_address, side, mode, status,
          transaction_hash, wallet_address, related_trade_id,
+         source_event_id, canonical,
          quoted_amount_out, actual_amount_in, actual_amount_out,
          gas_cost_wei, error, payload, created_at, updated_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
-         $10, $11, $12, $13, $14, $15::jsonb,
-         to_timestamp($16 / 1000.0), to_timestamp($17 / 1000.0))
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE,
+         $11, $12, $13, $14, $15, $16::jsonb,
+         to_timestamp($17 / 1000.0), to_timestamp($18 / 1000.0))
        ON CONFLICT (trade_id) DO UPDATE SET
          status = EXCLUDED.status,
          transaction_hash = EXCLUDED.transaction_hash,
          wallet_address = EXCLUDED.wallet_address,
          related_trade_id = EXCLUDED.related_trade_id,
+         source_event_id = COALESCE(EXCLUDED.source_event_id, trades.source_event_id),
          quoted_amount_out = EXCLUDED.quoted_amount_out,
          actual_amount_in = EXCLUDED.actual_amount_in,
          actual_amount_out = EXCLUDED.actual_amount_out,
@@ -282,6 +286,7 @@ export class TradeRepository {
         trade.transactionHash?.toLowerCase() ?? null,
         trade.walletAddress?.toLowerCase() ?? null,
         trade.relatedTradeId ?? null,
+        sourceEventId ?? null,
         trade.quotedAmountOut?.toString() ?? null,
         trade.actualAmountIn?.toString() ?? null,
         trade.actualAmountOut?.toString() ?? null,

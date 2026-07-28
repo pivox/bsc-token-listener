@@ -185,14 +185,80 @@ test('persiste atomiquement le trade et la transaction préparée avec ses bigin
     updatedAtMs: 1_000,
   };
 
-  await repository.saveLifecycle(trade, transaction);
+  await repository.saveLifecycle(trade, transaction, 'event-source');
 
   assert.match(client.calls[0]?.sql ?? '', /^BEGIN$/u);
   assert.match(client.calls[1]?.sql ?? '', /INSERT INTO trades/u);
+  assert.match(client.calls[1]?.sql ?? '', /source_event_id/u);
+  assert.match(client.calls[1]?.sql ?? '', /canonical/u);
+  assert.match(client.calls[1]?.sql ?? '', /TRUE/u);
+  assert.equal(client.calls[1]?.values?.[9], 'event-source');
   assert.match(client.calls[2]?.sql ?? '', /INSERT INTO trade_transactions/u);
   assert.match(client.calls[3]?.sql ?? '', /^COMMIT$/u);
   assert.equal(client.calls[2]?.values?.includes(transaction.nonce.toString()), true);
   assert.match(String(client.calls[2]?.values?.at(-3)), /__bsc_bot_bigint__/u);
+});
+
+test('persiste la provenance source lors de l’insertion directe d’un trade', async () => {
+  const client = new FakeClient();
+  const repository = new TradeRepository({
+    query: client.query.bind(client),
+    connect: async () => client,
+  });
+  const trade = {
+    id: 'trade-source',
+    pair: ADDRESS,
+    token: TOKEN,
+    side: 'BUY',
+    mode: 'dry-run',
+    status: 'SIMULATED',
+    amountIn: 100n,
+    amountOut: 200n,
+    createdAtMs: 1_000,
+    updatedAtMs: 1_000,
+  } satisfies TradeRecord;
+
+  await repository.save(trade, 'event-source');
+
+  assert.equal(client.calls.length, 1);
+  assert.match(
+    client.calls[0]?.sql ?? '',
+    /source_event_id,\s*canonical/u,
+  );
+  assert.match(client.calls[0]?.sql ?? '', /\$10,\s*TRUE/u);
+  assert.equal(client.calls[0]?.values?.[9], 'event-source');
+});
+
+test('un update sans source conserve la provenance déjà enregistrée', async () => {
+  const client = new FakeClient();
+  const repository = new TradeRepository({
+    query: client.query.bind(client),
+    connect: async () => client,
+  });
+  const trade = {
+    id: 'trade-existing',
+    pair: ADDRESS,
+    token: TOKEN,
+    side: 'SELL',
+    mode: 'dry-run',
+    status: 'SIMULATED',
+    amountIn: 200n,
+    amountOut: 100n,
+    createdAtMs: 1_000,
+    updatedAtMs: 2_000,
+  } satisfies TradeRecord;
+
+  await repository.save(trade);
+
+  assert.equal(client.calls[0]?.values?.[9], null);
+  assert.match(
+    client.calls[0]?.sql ?? '',
+    /source_event_id = COALESCE\(EXCLUDED\.source_event_id, trades\.source_event_id\)/u,
+  );
+  assert.doesNotMatch(
+    client.calls[0]?.sql ?? '',
+    /canonical = (?:TRUE|EXCLUDED\.canonical)/u,
+  );
 });
 
 test('rollback la transition atomique lorsque la transaction enfant échoue', async () => {
