@@ -31,4 +31,5 @@ test('dashboard utilise la décision serveur pour afficher la vente', () => {
   const html = injectControls(renderDashboardPage('nonce', 5), 'nonce', 60);
 
   assert.match(html, /token\.canSell/u);
+  assert.match(html, /finally\s*\{\s*try\s*\{\s*await Promise\.all/u);
 });

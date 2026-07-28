@@ -240,10 +240,14 @@ export function injectControls(page: string, nonce: string, minimumScore: number
           const confirmation = action.toUpperCase() + ':' + lower(tokenAddress);
           await sendAction(action, tokenAddress, confirmation);
           showMessage(action === 'sell' ? 'Ordre de vente traité.' : 'Actif placé dans la liste d’ignorance.', false);
-          await Promise.all([loadDashboard(), loadActions()]);
         } catch (error) {
           showMessage('Action refusée : ' + (error instanceof Error ? error.message : String(error)), true);
         } finally {
+          try {
+            await Promise.all([loadDashboard(), loadActions()]);
+          } catch (refreshError) {
+            showMessage('État du dashboard indisponible : ' + (refreshError instanceof Error ? refreshError.message : String(refreshError)), true);
+          }
           button.disabled = false;
         }
       });
@@ -422,6 +426,8 @@ export class ActionDashboardServer {
       this.sendJson(response, 200, { result });
     } catch (error) {
       this.sendJson(response, 409, { error: errorMessage(error) });
+    } finally {
+      this.service.invalidate();
     }
   }
 

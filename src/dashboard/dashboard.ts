@@ -433,7 +433,11 @@ export class DashboardRepository {
 export class DashboardService {
   private readonly startedAt = new Date();
   private cache: { expiresAtMs: number; snapshot: DashboardSnapshot } | null = null;
-  private inFlight: Promise<DashboardSnapshot> | null = null;
+  private generation = 0;
+  private inFlight: {
+    generation: number;
+    promise: Promise<DashboardSnapshot>;
+  } | null = null;
 
   constructor(
     private readonly repository: DashboardRepository,
@@ -443,19 +447,29 @@ export class DashboardService {
   async getSnapshot(): Promise<DashboardSnapshot> {
     const now = Date.now();
     if (this.cache && this.cache.expiresAtMs > now) return this.cache.snapshot;
-    if (this.inFlight) return this.inFlight;
+    const generation = this.generation;
+    if (this.inFlight?.generation === generation) return this.inFlight.promise;
 
-    this.inFlight = this.buildSnapshot();
+    const promise = this.buildSnapshot();
+    this.inFlight = { generation, promise };
     try {
-      const snapshot = await this.inFlight;
-      this.cache = {
-        expiresAtMs: Date.now() + config.dashboardRefreshSeconds * 1000,
-        snapshot,
-      };
+      const snapshot = await promise;
+      if (this.generation === generation) {
+        this.cache = {
+          expiresAtMs: Date.now() + config.dashboardRefreshSeconds * 1000,
+          snapshot,
+        };
+      }
       return snapshot;
     } finally {
-      this.inFlight = null;
+      if (this.inFlight?.promise === promise) this.inFlight = null;
     }
+  }
+
+  invalidate(): void {
+    this.generation += 1;
+    this.cache = null;
+    this.inFlight = null;
   }
 
   private async buildSnapshot(): Promise<DashboardSnapshot> {

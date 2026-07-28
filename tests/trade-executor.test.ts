@@ -217,18 +217,22 @@ test('persiste hash et nonce avant diffusion puis mesure un achat taxé', async 
 test('classe une erreur de diffusion comme UNKNOWN sans la confondre avec un échec', async () => {
   const store = new MemoryTradeStore();
   const gateway = new FakeExecutionGateway();
-  gateway.sendError = new Error('RPC indisponible');
+  const signedTransaction = '0xf86c_signed_transaction_secret';
+  gateway.sendError = new Error(`RPC indisponible, body: ${signedTransaction}`);
   const executor = new TradeExecutor(store, gateway, 'live');
 
-  await assert.rejects(
-    executor.buy(session(), 100n),
-    (error: unknown) =>
-      error instanceof ExecutionOutcomeUnknownError
-      && error.executionToReconcile?.outcome === 'UNKNOWN'
-      && error.executionToReconcile.step === 'BUY'
-      && error.executionToReconcile.transactionHash === HASH,
-  );
+  const error = await executor.buy(session(), 100n).catch((caught: unknown) => caught);
 
+  assert.ok(error instanceof ExecutionOutcomeUnknownError);
+  assert.equal(error.executionToReconcile?.outcome, 'UNKNOWN');
+  assert.equal(error.executionToReconcile?.step, 'BUY');
+  assert.equal(error.executionToReconcile?.transactionHash, HASH);
+  assert.doesNotMatch(error.message, new RegExp(signedTransaction, 'u'));
+  assert.doesNotMatch(store.trades.at(-1)?.error ?? '', new RegExp(signedTransaction, 'u'));
+  assert.doesNotMatch(
+    store.lifecycles.at(-1)?.transaction.error ?? '',
+    new RegExp(signedTransaction, 'u'),
+  );
   assert.equal(store.trades.at(-1)?.status, 'UNKNOWN');
   assert.equal(store.lifecycles.at(-1)?.transaction.status, 'UNKNOWN');
 });

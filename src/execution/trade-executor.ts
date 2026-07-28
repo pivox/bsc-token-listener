@@ -443,11 +443,15 @@ export class TradeExecutor {
         throw new Error(`Hash RPC inattendu: ${returnedHash}.`);
       }
     } catch (error) {
+      const safeError = new Error(
+        `Échec RPC de diffusion (${error instanceof Error ? error.name : typeof error}); `
+        + `hash local ${prepared.hash}.`,
+      );
       return this.raiseUnknown(
         trade,
         transaction,
         `Statut de diffusion ${transaction.step} inconnu`,
-        error,
+        safeError,
       );
     }
 
