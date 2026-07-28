@@ -193,6 +193,20 @@ test('expire une session en attente sans moniteur', async () => {
   assert.equal(harness.starts.length, 0);
 });
 
+test('laisse le listener actif sérialiser sa propre expiration', async () => {
+  const harness = new Harness();
+  const waiting = session('1', 'WAITING_FIRST_BUY', 1);
+  harness.sessions = [waiting];
+  harness.active.add(waiting.pair.pair);
+  const scheduler = harness.scheduler();
+
+  await scheduler.reconcile();
+
+  assert.deepEqual(harness.expired, []);
+  assert.deepEqual(harness.stops, []);
+  assert.equal(scheduler.currentStatus.activeMonitors, 1);
+});
+
 test('retire immédiatement un actif ignoré pendant l’attente', async () => {
   const harness = new Harness();
   const waiting = session('1', 'WAITING_FIRST_BUY', 9_500);
@@ -218,6 +232,28 @@ test('retire immédiatement un moniteur dont la session est terminale', async ()
   assert.deepEqual(harness.stops, [closed.pair.pair]);
   assert.equal(scheduler.currentStatus.activeMonitors, 0);
   assert.equal(scheduler.currentStatus.waitingSessions, 0);
+});
+
+test('préserve la capacité pendant une entrée en cours', async () => {
+  const harness = new Harness();
+  const entering = session('1', 'RISK_CHECKING', 9_500);
+  const waiting = session('2', 'WAITING_FIRST_BUY', 9_600);
+  harness.sessions = [entering, waiting];
+  harness.active.add(entering.pair.pair);
+  const scheduler = harness.scheduler();
+
+  await scheduler.reconcile();
+
+  assert.deepEqual(harness.stops, []);
+  assert.deepEqual(harness.starts, []);
+  assert.equal(scheduler.currentStatus.activeMonitors, 1);
+  assert.equal(scheduler.currentStatus.waitingSessions, 1);
+
+  entering.status = 'HOLDING';
+  await scheduler.reconcile();
+
+  assert.deepEqual(harness.stops, []);
+  assert.deepEqual(harness.starts, []);
 });
 
 test('reconstruit la file au redémarrage', async () => {

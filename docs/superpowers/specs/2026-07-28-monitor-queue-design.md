@@ -17,8 +17,10 @@ Priority is deterministic and safety-first:
 2. `WAITING_FIRST_BUY` sessions, oldest first (FIFO by `createdAtMs`);
 3. pair address as the final stable tie-breaker.
 
-`RISK_CHECKING`, `BUY_PENDING`, `SELL_PENDING`, `MANUAL_REVIEW`, ignored assets
-and terminal sessions are not admitted.
+`RISK_CHECKING`, `BUY_PENDING` and `SELL_PENDING` are not newly admitted, but an
+existing monitor keeps its reservation while one of these in-flight
+transitions completes. `MANUAL_REVIEW`, ignored assets and terminal sessions
+are not admitted.
 
 ## Scheduling
 
@@ -26,7 +28,9 @@ and terminal sessions are not admitted.
 
 1. reloads active sessions from PostgreSQL;
 2. stops monitors whose sessions are no longer monitorable;
-3. expires every queued `WAITING_FIRST_BUY` older than the configured TTL;
+3. expires every unmonitored queued `WAITING_FIRST_BUY` older than the
+   configured TTL; active listeners serialize their own expiry with swap
+   processing;
 4. removes ignored assets through the existing ignore workflow;
 5. sorts remaining candidates with the policy above;
 6. admits candidates while capacity remains;
@@ -59,4 +63,3 @@ expiration, ignored removal, startup failure and capacity release.
 - Expiration is persisted before admission.
 - No RPC failure advances a blockchain checkpoint.
 - The monitor cap is never increased automatically.
-

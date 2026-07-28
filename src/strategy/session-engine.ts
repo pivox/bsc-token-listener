@@ -90,14 +90,16 @@ export class SessionEngine {
   }
 
   async expireIfNeeded(session: TokenSession): Promise<boolean> {
-    if (session.status !== 'WAITING_FIRST_BUY') return false;
-    const ttlMs = config.pairMonitorTtlMinutes * 60_000;
-    if (Date.now() - session.createdAtMs < ttlMs) return false;
-    session.status = 'EXPIRED';
-    session.updatedAtMs = Date.now();
-    session.rejectionReason = 'Aucun premier achat avant expiration du moniteur.';
-    await this.sessions.save(session);
-    return true;
+    return this.withLock(session, async () => {
+      if (session.status !== 'WAITING_FIRST_BUY') return false;
+      const ttlMs = config.pairMonitorTtlMinutes * 60_000;
+      if (Date.now() - session.createdAtMs < ttlMs) return false;
+      session.status = 'EXPIRED';
+      session.updatedAtMs = Date.now();
+      session.rejectionReason = 'Aucun premier achat avant expiration du moniteur.';
+      await this.sessions.save(session);
+      return true;
+    });
   }
 
   private async withLock<T>(session: TokenSession, operation: () => Promise<T>): Promise<T> {

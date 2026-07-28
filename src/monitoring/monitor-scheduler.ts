@@ -32,6 +32,10 @@ function statusRank(status: TokenSession['status']): number {
   return 2;
 }
 
+function preservesMonitorReservation(status: TokenSession['status']): boolean {
+  return ['RISK_CHECKING', 'BUY_PENDING', 'SELL_PENDING'].includes(status);
+}
+
 export function compareMonitorPriority(
   left: TokenSession,
   right: TokenSession,
@@ -91,28 +95,35 @@ export class MonitorScheduler {
     const now = this.now();
     const sessions = await this.dependencies.loadSessions();
     const eligible: TokenSession[] = [];
+    const reservedPairs = new Set<string>();
 
     for (const session of sessions) {
       const pairKey = session.pair.pair.toLowerCase();
+      const isActive = this.activePairKeys().has(pairKey);
       if (
         session.status === 'WAITING_FIRST_BUY'
         && now - session.createdAtMs >= this.dependencies.ttlMs
       ) {
-        await this.dependencies.expire(session);
-        await this.stopIfActive(session.pair.pair);
-        logger.info(
-          { pair: session.pair.pair, waitingAgeMs: now - session.createdAtMs },
-          'Session expirée dans la file de monitoring.',
-        );
-        continue;
+        if (!isActive) {
+          await this.dependencies.expire(session);
+          logger.info(
+            { pair: session.pair.pair, waitingAgeMs: now - session.createdAtMs },
+            'Session expirée dans la file de monitoring.',
+          );
+          continue;
+        }
       }
 
       if (
         session.status === 'WAITING_FIRST_BUY'
         && await this.dependencies.isIgnored(session.pair.token)
       ) {
-        await this.dependencies.ignore(session);
-        await this.stopIfActive(session.pair.pair);
+        if (isActive) {
+          await this.dependencies.stop(session.pair.pair);
+          this.rerunRequested = true;
+        } else {
+          await this.dependencies.ignore(session);
+        }
         logger.info(
           { pair: session.pair.pair, token: session.pair.token },
           'Session retirée de la file de monitoring: actif ignoré.',
@@ -121,13 +132,19 @@ export class MonitorScheduler {
       }
 
       if (isSessionMonitorable(session)) eligible.push(session);
+      else if (isActive && preservesMonitorReservation(session.status)) {
+        reservedPairs.add(pairKey);
+      }
       else if (this.activePairKeys().has(pairKey)) {
         await this.dependencies.stop(session.pair.pair);
       }
     }
 
     const eligiblePairs = new Set(
-      eligible.map((session) => session.pair.pair.toLowerCase()),
+      [
+        ...reservedPairs,
+        ...eligible.map((session) => session.pair.pair.toLowerCase()),
+      ],
     );
     for (const activePair of this.dependencies.activePairs()) {
       if (eligiblePairs.has(activePair.toLowerCase())) continue;
@@ -200,10 +217,5 @@ export class MonitorScheduler {
     return new Set(
       this.dependencies.activePairs().map((pair) => pair.toLowerCase()),
     );
-  }
-
-  private async stopIfActive(pair: Address): Promise<void> {
-    if (!this.activePairKeys().has(pair.toLowerCase())) return;
-    await this.dependencies.stop(pair);
   }
 }
