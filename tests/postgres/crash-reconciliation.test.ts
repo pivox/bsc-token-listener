@@ -253,6 +253,44 @@ test('les claims concurrents et l’application sous bail restent atomiques', as
     assert.equal(final.rows[0]?.decisions, '2');
     assert.equal(await secondRepository.claimNext('worker-3', 60_000), null);
 
+    const freshPending = session('BUY_PENDING');
+    freshPending.pair.pair = `0x${'6'.repeat(40)}` as Address;
+    const stalePending = session('BUY_PENDING');
+    stalePending.pair.pair = `0x${'7'.repeat(40)}` as Address;
+    await client.query(
+      `INSERT INTO token_sessions(
+         pair_address, token_address, status, payload, created_at, updated_at
+       ) VALUES
+         ($1, $2, $3, $4::jsonb, NOW(), NOW()),
+         ($5, $6, $7, $8::jsonb, NOW() - INTERVAL '10 minutes',
+           NOW() - INTERVAL '10 minutes')`,
+      [
+        freshPending.pair.pair.toLowerCase(),
+        TOKEN.toLowerCase(),
+        freshPending.status,
+        stringifyJson(freshPending),
+        stalePending.pair.pair.toLowerCase(),
+        TOKEN.toLowerCase(),
+        stalePending.status,
+        stringifyJson(stalePending),
+      ],
+    );
+    const staleClaim = await secondRepository.claimNext(
+      'worker-stale',
+      60_000,
+      [],
+      180_000,
+    );
+    assert.equal(
+      staleClaim?.snapshot.session.pair.pair.toLowerCase(),
+      stalePending.pair.pair.toLowerCase(),
+    );
+    const freshLease = await client.query<{ recovery_owner: string | null }>(
+      'SELECT recovery_owner FROM token_sessions WHERE pair_address = $1',
+      [freshPending.pair.pair.toLowerCase()],
+    );
+    assert.equal(freshLease.rows[0]?.recovery_owner, null);
+
     const manualWithReference = session('MANUAL_REVIEW');
     manualWithReference.pair.pair = `0x${'4'.repeat(40)}` as Address;
     manualWithReference.unreconciledExecution = {

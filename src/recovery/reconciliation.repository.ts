@@ -73,6 +73,7 @@ export class ReconciliationRepository implements ReconciliationStore {
     owner: string,
     leaseMs: number,
     excludedPairs: readonly string[] = [],
+    staleAfterMs = leaseMs * 3,
   ): Promise<ClaimedRecovery | null> {
     const client = await this.database.connect();
     try {
@@ -85,7 +86,11 @@ export class ReconciliationRepository implements ReconciliationStore {
            SELECT pair_address
            FROM token_sessions
            WHERE (
-               status IN ('RISK_CHECKING', 'BUY_PENDING', 'SELL_PENDING')
+               (
+                 status IN ('RISK_CHECKING', 'BUY_PENDING', 'SELL_PENDING')
+                 AND updated_at
+                   < NOW() - ($4::text || ' milliseconds')::interval
+               )
                OR (
                  status = 'MANUAL_REVIEW'
                  AND payload ? 'unreconciledExecution'
@@ -104,7 +109,12 @@ export class ReconciliationRepository implements ReconciliationStore {
          FROM candidate
          WHERE s.pair_address = candidate.pair_address
          RETURNING s.payload, s.status`,
-        [owner, leaseMs, excludedPairs.map((pair) => pair.toLowerCase())],
+        [
+          owner,
+          leaseMs,
+          excludedPairs.map((pair) => pair.toLowerCase()),
+          staleAfterMs,
+        ],
       );
       const row = claimed.rows[0];
       if (!row) {

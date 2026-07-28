@@ -13,6 +13,7 @@ interface RecoveryReconciler {
 interface RecoveryCoordinatorOptions {
   intervalMs: number;
   leaseMs: number;
+  staleAfterMs?: number;
   owner?: string;
   initialRetryMs?: number;
   onPeriodicPassCompleted?: () => Promise<void>;
@@ -190,6 +191,7 @@ export class RecoveryCoordinator {
           this.owner,
           this.options.leaseMs,
           processedPairs,
+          this.options.staleAfterMs ?? this.options.leaseMs * 3,
         );
         if (!claimed) break;
         processedPairs.push(claimed.snapshot.session.pair.pair);

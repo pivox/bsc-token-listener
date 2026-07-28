@@ -155,7 +155,12 @@ non chevauchante s’exécute selon :
 ```env
 RECOVERY_INTERVAL_SECONDS=30
 RECOVERY_LEASE_SECONDS=60
+RECOVERY_STALE_SECONDS=180
 ```
+
+Les états d’exécution transitoires ne sont réclamés qu’après
+`RECOVERY_STALE_SECONDS`. Cette fenêtre empêche une autre instance saine de
+reprendre simultanément une intention encore en cours.
 
 Le heartbeat et le dashboard affichent le nombre de sessions en reprise, le
 nombre de revues manuelles, la dernière passe terminée et le dernier type

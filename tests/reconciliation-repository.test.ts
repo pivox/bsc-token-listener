@@ -79,6 +79,8 @@ test('réclame une session avec SKIP LOCKED et charge son snapshot', async () =>
   assert.ok(client.calls.some((call) => /FOR UPDATE SKIP LOCKED/u.test(call.sql)));
   assert.ok(client.calls.some((call) => /recovery_lease_until/u.test(call.sql)));
   assert.ok(client.calls.some((call) =>
+    /updated_at\s*< NOW\(\) - \(\$4::text/u.test(call.sql)));
+  assert.ok(client.calls.some((call) =>
     /status = 'MANUAL_REVIEW'/u.test(call.sql)
     && /unreconciledExecution/u.test(call.sql)));
 });

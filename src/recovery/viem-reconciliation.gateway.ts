@@ -29,6 +29,10 @@ interface ReconciliationPublicClient {
   getTransactionReceipt(input: { hash: Hash }): Promise<ReceiptLike>;
   getTransaction(input: { hash: Hash }): Promise<unknown>;
   getBalance(input: { address: Address; blockNumber: bigint }): Promise<bigint>;
+  getCode(input: {
+    address: Address;
+    blockNumber: bigint;
+  }): Promise<Hex | undefined>;
   getBlock(input: {
     blockNumber: bigint;
     includeTransactions: true;
@@ -141,6 +145,12 @@ export class ViemReconciliationGateway implements ReconciliationGateway {
       ) {
         return true;
       }
+      if (!transaction.to) return true;
+      const destinationCode = await this.client.getCode({
+        address: transaction.to,
+        blockNumber,
+      });
+      if (destinationCode && destinationCode !== '0x') return true;
       const receipt = await this.client.getTransactionReceipt({
         hash: transaction.hash,
       });

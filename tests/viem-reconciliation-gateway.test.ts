@@ -38,6 +38,7 @@ function client(input: {
   transaction?: object | Error;
   blockTransactions?: TestBlockTransaction[];
   laterReceipt?: TestReceipt;
+  code?: Hex;
 }) {
   return {
     async getTransactionReceipt(request: { hash: Hash }): Promise<TestReceipt> {
@@ -54,6 +55,9 @@ function client(input: {
     },
     async getBalance(): Promise<bigint> {
       return 1n;
+    },
+    async getCode(): Promise<Hex> {
+      return input.code ?? '0x';
     },
     async getBlock(): Promise<{
       transactions: TestBlockTransaction[];
@@ -207,6 +211,22 @@ test('détecte un transfert direct ou BEP-20 ultérieur vers le wallet', async (
       10n,
       0,
     ),
+    true,
+  );
+});
+
+test('refuse un appel de contrat ultérieur aux effets natifs non traçables', async () => {
+  const otherWallet = `0x${'5'.repeat(40)}` as Address;
+  const gateway = new ViemReconciliationGateway(client({
+    blockTransactions: [
+      { hash: HASH, from: WALLET, to: TOKEN },
+      { hash: OTHER_HASH, from: otherWallet, to: TOKEN },
+    ],
+    code: '0x1234',
+  }));
+
+  assert.equal(
+    await gateway.hasLaterWalletActivityInBlock(WALLET, TOKEN, 10n, 0),
     true,
   );
 });

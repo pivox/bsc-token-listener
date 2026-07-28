@@ -12,6 +12,9 @@ ALTER TABLE token_sessions
 CREATE INDEX IF NOT EXISTS idx_token_sessions_recovery
   ON token_sessions(status, recovery_lease_until);
 
+CREATE INDEX IF NOT EXISTS idx_token_sessions_recovery_stale
+  ON token_sessions(status, updated_at, recovery_lease_until);
+
 CREATE TABLE IF NOT EXISTS reconciliation_decisions (
   decision_id TEXT PRIMARY KEY,
   idempotency_key TEXT NOT NULL UNIQUE,

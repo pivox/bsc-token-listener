@@ -164,6 +164,7 @@ export const config = {
   reconcileSeconds: readInteger('RECONCILE_SECONDS', 15, 5, 300, 'EVENT_RECONCILE_SECONDS'),
   recoveryIntervalSeconds: readInteger('RECOVERY_INTERVAL_SECONDS', 30, 5, 300),
   recoveryLeaseSeconds: readInteger('RECOVERY_LEASE_SECONDS', 60, 15, 600),
+  recoveryStaleSeconds: readInteger('RECOVERY_STALE_SECONDS', 180, 30, 3600),
   riskPolicy,
   riskMinScore: readInteger('RISK_MIN_SCORE', 80, 0, 100),
   riskAllowUnknownReviews: readBoolean('RISK_ALLOW_UNKNOWN_REVIEWS', false),

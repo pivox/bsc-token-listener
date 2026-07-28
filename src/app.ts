@@ -114,6 +114,7 @@ async function main(): Promise<void> {
     {
       intervalMs: config.recoveryIntervalSeconds * 1_000,
       leaseMs: config.recoveryLeaseSeconds * 1_000,
+      staleAfterMs: config.recoveryStaleSeconds * 1_000,
       onPeriodicPassCompleted: () => synchronizeRecoveredSessions(),
       onPeriodicBarrierReleased: () => activateRecoveredSessions(),
     },
