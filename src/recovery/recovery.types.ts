@@ -52,3 +52,9 @@ export interface ReconciliationStore {
   tryAcquirePassLock(): Promise<boolean>;
   releasePassLock(): Promise<void>;
 }
+
+export interface RecoveryIntentExecutor {
+  resumeRiskAndBuy(session: TokenSession): Promise<TokenSession>;
+  resumeBuy(session: TokenSession): Promise<TokenSession>;
+  resumeSell(session: TokenSession): Promise<TokenSession>;
+}
