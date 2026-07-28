@@ -303,6 +303,15 @@ export class RiskReportRepository {
       ],
     );
   }
+
+  async findById(id: string): Promise<TokenRiskReport | null> {
+    const result = await pool.query<{ report: unknown }>(
+      'SELECT report FROM token_risk_reports WHERE id = $1 LIMIT 1',
+      [id],
+    );
+    const row = result.rows[0];
+    return row ? parseJson<TokenRiskReport>(row.report) : null;
+  }
 }
 
 export class DiscoveredTokenRepository {

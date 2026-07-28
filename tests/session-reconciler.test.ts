@@ -6,6 +6,7 @@ import type {
   ChainObservation,
   ClaimedRecovery,
   RecoveryDecision,
+  RecoveryIntentExecutor,
   ReconciliationGateway,
   ReconciliationStore,
 } from '../src/recovery/recovery.types.js';
@@ -137,6 +138,29 @@ class FakeGateway implements ReconciliationGateway {
   }
 }
 
+class FakeIntents implements RecoveryIntentExecutor {
+  buyCalls = 0;
+  sellCalls = 0;
+  riskCalls = 0;
+
+  async resumeRiskAndBuy(value: TokenSession): Promise<TokenSession> {
+    this.riskCalls += 1;
+    return value;
+  }
+
+  async resumeBuy(value: TokenSession): Promise<TokenSession> {
+    this.buyCalls += 1;
+    value.status = 'HOLDING';
+    return value;
+  }
+
+  async resumeSell(value: TokenSession): Promise<TokenSession> {
+    this.sellCalls += 1;
+    value.status = 'CLOSED';
+    return value;
+  }
+}
+
 function claim(
   currentSession: TokenSession,
   currentTrade: TradeRecord,
@@ -257,4 +281,99 @@ test('un revert de vente revient à HOLDING', async () => {
 
   assert.equal(store.applied.at(-1)?.session.status, 'HOLDING');
   assert.equal(store.applied.at(-1)?.trade?.status, 'REVERTED');
+});
+
+test('reprend un achat uniquement lorsqu’aucune transaction enfant n’existe', async () => {
+  const store = new MemoryStore();
+  const gateway = new FakeGateway();
+  const intents = new FakeIntents();
+  const currentTrade = trade('BUY');
+  const current: ClaimedRecovery = {
+    owner: 'worker',
+    statusBefore: 'BUY_PENDING',
+    snapshot: {
+      session: session('BUY_PENDING'),
+      trades: [currentTrade],
+      transactions: [],
+    },
+  };
+  const reconciler = new SessionReconciler(store, gateway, intents, () => 20);
+
+  await reconciler.reconcile(current);
+
+  assert.equal(intents.buyCalls, 1);
+  assert.equal(store.applied.at(-1)?.session.status, 'HOLDING');
+});
+
+test('un approval confirmé reprend la vente sans rediffuser l’approval', async () => {
+  const store = new MemoryStore();
+  const gateway = new FakeGateway();
+  const intents = new FakeIntents();
+  const currentSession = session('SELL_PENDING');
+  currentSession.entry = {
+    mode: 'live',
+    amountInWei: 100n,
+    amountOutToken: 100n,
+    confirmedAtMs: 1,
+    cursor: { blockNumber: 1n, transactionIndex: 0, logIndex: 0 },
+  };
+  const currentTrade = trade('SELL');
+  const approval = {
+    ...transaction(currentTrade, 'SELL'),
+    id: 'transaction-approval',
+    step: 'APPROVE' as const,
+  };
+  const current = claim(currentSession, currentTrade, approval);
+  const reconciler = new SessionReconciler(store, gateway, intents, () => 20);
+
+  await reconciler.reconcile(current);
+
+  assert.equal(intents.sellCalls, 1);
+  assert.equal(store.applied.at(-1)?.action, 'APPROVAL_CONFIRMED');
+});
+
+test('reconstruit un achat dry-run déjà simulé sans le rejouer', async () => {
+  const store = new MemoryStore();
+  const gateway = new FakeGateway();
+  const intents = new FakeIntents();
+  const currentSession = session('BUY_PENDING');
+  currentSession.firstBuy = {
+    id: 'event',
+    pair: PAIR,
+    transactionHash: HASH,
+    kind: 'BUY',
+    sender: WALLET,
+    recipient: WALLET,
+    amount0In: 1n,
+    amount1In: 0n,
+    amount0Out: 0n,
+    amount1Out: 1n,
+    amountWbnb: 1n,
+    amountToken: 1n,
+    cursor: { blockNumber: 2n, transactionIndex: 0, logIndex: 0 },
+    observedAtMs: 2,
+  };
+  const simulated = {
+    ...trade('BUY'),
+    mode: 'dry-run' as const,
+    status: 'SIMULATED' as const,
+    amountIn: 100n,
+    amountOut: 200n,
+  };
+  const current: ClaimedRecovery = {
+    owner: 'worker',
+    statusBefore: 'BUY_PENDING',
+    snapshot: {
+      session: currentSession,
+      trades: [simulated],
+      transactions: [],
+    },
+  };
+  const reconciler = new SessionReconciler(store, gateway, intents, () => 20);
+
+  await reconciler.reconcile(current);
+
+  assert.equal(intents.buyCalls, 0);
+  assert.equal(store.applied.at(-1)?.session.status, 'HOLDING');
+  assert.equal(store.applied.at(-1)?.session.entry?.amountOutToken, 200n);
 });

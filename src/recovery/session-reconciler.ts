@@ -112,6 +112,16 @@ export class SessionReconciler {
     if (recovery.kind === 'RESUME_INTENT') {
       throw new Error('Décision de reprise incohérente avec une transaction.');
     }
+    if (transaction.step === 'APPROVE') {
+      await this.reconcileConfirmedApproval(
+        claimed,
+        session,
+        trade,
+        transaction,
+        recovery.receipt,
+      );
+      return;
+    }
 
     try {
       if (trade.side === 'BUY' && transaction.step === 'BUY') {
@@ -122,13 +132,7 @@ export class SessionReconciler {
         await this.measureSell(claimed, session, trade, transaction, recovery.receipt);
         return;
       }
-      await this.reconcileConfirmedApproval(
-        claimed,
-        session,
-        trade,
-        transaction,
-        recovery.receipt,
-      );
+      throw new Error(`Étape de mesure non supportée: ${transaction.step}.`);
     } catch (error) {
       this.applyReceipt(trade, transaction, recovery.receipt);
       trade.status = 'CONFIRMED';
@@ -191,6 +195,10 @@ export class SessionReconciler {
     session: TokenSession,
     trade: TradeRecord | undefined,
   ): Promise<void> {
+    if (trade?.status === 'SIMULATED') {
+      await this.restoreSimulatedTrade(claimed, session, trade);
+      return;
+    }
     if (!this.intents || session.status === 'MANUAL_REVIEW') {
       const reason = session.status === 'MANUAL_REVIEW'
         ? 'Aucune transaction réconciliable; intervention manuelle requise.'
@@ -217,6 +225,60 @@ export class SessionReconciler {
       action: 'RESUME_INTENT',
       reason: 'Intention sans transaction reprise.',
       ...(trade ? { trade } : {}),
+    });
+  }
+
+  private async restoreSimulatedTrade(
+    claimed: ClaimedRecovery,
+    session: TokenSession,
+    trade: TradeRecord,
+  ): Promise<void> {
+    if (trade.side === 'BUY') {
+      const reference =
+        session.entryObservationBuys?.[session.entryObservationBuys.length - 1]
+        ?? session.firstBuy;
+      if (!reference) {
+        throw new Error('Curseur dry-run d’achat absent.');
+      }
+      session.entry = {
+        mode: 'dry-run',
+        tradeId: trade.id,
+        amountInWei: trade.amountIn,
+        ...(trade.quotedAmountOut === undefined
+          ? {}
+          : { quotedAmountOutToken: trade.quotedAmountOut }),
+        amountOutToken: trade.amountOut,
+        confirmedAtMs: trade.updatedAtMs,
+        cursor: {
+          blockNumber: reference.cursor.blockNumber,
+          transactionIndex: Number.MAX_SAFE_INTEGER,
+          logIndex: Number.MAX_SAFE_INTEGER,
+        },
+      };
+      session.status = 'HOLDING';
+    } else {
+      if (!session.entry) throw new Error('Entrée dry-run absente.');
+      session.exit = {
+        mode: 'dry-run',
+        tradeId: trade.id,
+        ...(trade.relatedTradeId ? { entryTradeId: trade.relatedTradeId } : {}),
+        amountInToken: trade.amountIn,
+        ...(trade.quotedAmountOut === undefined
+          ? {}
+          : { quotedAmountOutWei: trade.quotedAmountOut }),
+        amountOutWei: trade.amountOut,
+        confirmedAtMs: trade.updatedAtMs,
+      };
+      session.status = 'CLOSED';
+    }
+    delete session.rejectionReason;
+    delete session.unreconciledExecution;
+    this.recordRecovery(session, 'SIMULATION_RESTORED', 'Simulation persistée restaurée.');
+    await this.apply(claimed, {
+      session,
+      action: 'SIMULATION_RESTORED',
+      reason: 'Simulation persistée restaurée.',
+      trade,
     });
   }
 
@@ -359,6 +421,9 @@ export class SessionReconciler {
       trade,
       transaction,
     });
+    if (this.intents) {
+      await this.intents.resumeSell(session);
+    }
   }
 
   private applyReceipt(
