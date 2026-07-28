@@ -4,6 +4,7 @@ import { EntryAmountService } from '../execution/entry-amount.service.js';
 import { TradeExecutor } from '../execution/trade-executor.js';
 import { TokenRiskService } from '../security/token-risk.service.js';
 import { recordEntryObservationBuy } from './entry-observation.js';
+import { requiresExecutionManualReview } from './execution-failure-policy.js';
 import {
   RiskReportRepository,
   SessionRepository,
@@ -228,7 +229,22 @@ export class SessionEngine {
           'Entrée effectuée.',
         );
       } catch (error) {
-        await this.reject(session, `Achat impossible: ${errorMessage(error)}`);
+        if (requiresExecutionManualReview(error)) {
+          session.status = 'MANUAL_REVIEW';
+          session.rejectionReason = `Achat à réconcilier: ${errorMessage(error)}`;
+          session.updatedAtMs = Date.now();
+          await this.sessions.save(session);
+          logger.error(
+            {
+              pair: session.pair.pair,
+              token: session.pair.token,
+              reason: errorMessage(error),
+            },
+            'Résultat de l’achat incertain; intervention manuelle requise.',
+          );
+        } else {
+          await this.reject(session, `Achat impossible: ${errorMessage(error)}`);
+        }
       }
       return;
     }

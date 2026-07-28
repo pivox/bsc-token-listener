@@ -14,3 +14,14 @@ test('dashboard affiche les champs heartbeat dans la page', () => {
   assert.match(html, /snapshot\.heartbeat\.activeSwapMonitors/);
   assert.match(html, /snapshot\.heartbeat\.http\.status/);
 });
+
+test('dashboard distingue PnL brut, gas, PnL net et simulation', () => {
+  const html = renderDashboardPage('nonce', 5);
+  assert.match(html, /PnL brut/u);
+  assert.match(html, /Gas total/u);
+  assert.match(html, /PnL net/u);
+  assert.match(html, /Simulation/u);
+  assert.match(html, /realizedGrossBnb/u);
+  assert.match(html, /realizedNetBnb/u);
+  assert.match(html, /gasBnb/u);
+});
