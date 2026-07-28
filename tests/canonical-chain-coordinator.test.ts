@@ -115,6 +115,36 @@ class MemoryCheckpoints {
   }
 }
 
+class CleanupFailureError extends Error {}
+
+class MemoryHeaderSpool {
+  readonly stored: CanonicalBlock[] = [];
+
+  async append(header: CanonicalBlock): Promise<void> {
+    this.stored.push(header);
+  }
+
+  async finish(): Promise<void> {}
+
+  async *headers(): AsyncGenerator<CanonicalBlock> {
+    for (const header of this.stored) yield header;
+  }
+
+  async dispose(): Promise<void> {
+    throw new CleanupFailureError('cleanup failed');
+  }
+}
+
+class ThrowingCleanupSpoolFactory {
+  readonly spools: MemoryHeaderSpool[] = [];
+
+  async create(): Promise<MemoryHeaderSpool> {
+    const spool = new MemoryHeaderSpool();
+    this.spools.push(spool);
+    return spool;
+  }
+}
+
 type HasConfigurableRetention =
   'retention' extends keyof CanonicalChainCoordinatorOptions ? true : false;
 const hasConfigurableRetention: HasConfigurableRetention = false;
@@ -248,7 +278,7 @@ test('bootstrappe au plus 128 vrais headers continus, y compris depuis le bloc z
   assert.deepEqual(canonicalStore.pruneCalls, [0n]);
 });
 
-test('réutilise le journal partagé au lieu de rescanner pour un second listener', async () => {
+test('réutilise le journal partagé sans nouvelle persistence pour un second listener', async () => {
   const reader = new MemoryBlockReader(20n);
   const canonicalStore = new MemoryCanonicalStore();
   const subject = coordinator(reader, canonicalStore, new MemoryCheckpoints());
@@ -262,7 +292,10 @@ test('réutilise le journal partagé au lieu de rescanner pour un second listene
   const readsAfterFirstListener = reader.reads.length;
   await subject.reconcile(request('swaps'));
 
-  assert.equal(reader.reads.length, readsAfterFirstListener);
+  assert.equal(
+    reader.reads.length,
+    readsAfterFirstListener + 16,
+  );
   assert.equal(canonicalStore.saves.length, 1);
 });
 
@@ -315,6 +348,38 @@ test('ancre un checkpoint legacy exact avant de traiter sans sauter de bloc', as
     checkpoint: { blockNumber: 12n, blockHash: hash(13n) },
   });
   assert.deepEqual(ranges, [[13n, 15n]]);
+});
+
+test('laisse inchangé un checkpoint legacy au-delà du head confirmé', async () => {
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', { blockNumber: 20n, blockHash: null });
+  const canonicalStore = new MemoryCanonicalStore();
+  const reader = new MemoryBlockReader(20n);
+  let processCalls = 0;
+  const subject = coordinator(
+    reader,
+    canonicalStore,
+    checkpoints,
+  );
+
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 10n,
+    processChunk: async () => {
+      processCalls += 1;
+      return true;
+    },
+  });
+
+  assert.equal(processCalls, 0);
+  assert.deepEqual(checkpoints.values.get('pairs'), {
+    blockNumber: 20n,
+    blockHash: null,
+  });
+  assert.deepEqual(checkpoints.writes, []);
+  assert.deepEqual(reader.reads, []);
+  assert.deepEqual(canonicalStore.saves, []);
+  assert.deepEqual(canonicalStore.pruneCalls, []);
 });
 
 test('une erreur RPC pendant le bootstrap legacy ne mute aucun état', async () => {
@@ -527,7 +592,22 @@ test('ne prune aucun header requis par le plus ancien checkpoint', async () => {
   });
 
   assert.deepEqual(canonicalStore.pruneCalls, [100n]);
-  assert.equal(canonicalStore.blocks.has(100n), true);
+  const persisted = [...canonicalStore.blocks.values()]
+    .sort((left, right) => left.number < right.number ? -1 : 1);
+  assert.equal(persisted.length, 196);
+  assert.equal(persisted[0]?.number, 100n);
+  assert.equal(persisted.at(-1)?.number, 295n);
+  assert.ok(canonicalStore.saves.every((saved) => saved.length <= 128));
+  for (let index = 1; index < persisted.length; index += 1) {
+    assert.equal(
+      persisted[index]?.number,
+      (persisted[index - 1]?.number ?? 0n) + 1n,
+    );
+    assert.equal(
+      persisted[index]?.parentHash,
+      persisted[index - 1]?.hash,
+    );
+  }
 });
 
 test('prune après avancée d’un checkpoint même si le journal est déjà au head', async () => {
@@ -621,6 +701,41 @@ test('revalide par RPC les headers cachés du tip avant tout traitement', async 
   assert.deepEqual(checkpoints.writes, []);
 });
 
+test('revalide la fenêtre canonique même quand tip et checkpoint sont au head', async () => {
+  const reader = new MemoryBlockReader(20n);
+  const originalGetBlock = reader.getBlock.bind(reader);
+  reader.getBlock = async (number) => {
+    const header = await originalGetBlock(number);
+    return number === 10n ? { ...header, hash: hash(999n) } : header;
+  };
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 16 }, (_, index) => block(BigInt(index))),
+  );
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', {
+    blockNumber: 15n,
+    blockHash: hash(16n),
+  });
+  const subject = coordinator(reader, canonicalStore, checkpoints);
+
+  await assert.rejects(
+    subject.reconcile({
+      listenerKey: 'pairs',
+      startBlock: 1n,
+      processChunk: async () => true,
+    }),
+    CanonicalChainContinuityError,
+  );
+
+  assert.deepEqual(reader.reads, [
+    0n, 1n, 2n, 3n, 4n, 5n, 6n, 7n,
+    8n, 9n, 10n,
+  ]);
+  assert.deepEqual(canonicalStore.saves, []);
+  assert.deepEqual(canonicalStore.pruneCalls, []);
+  assert.deepEqual(checkpoints.writes, []);
+});
+
 test('une erreur RPC au milieu du scan historique ne produit aucune mutation', async () => {
   const reader = new MemoryBlockReader(3_010n);
   reader.failAt = 2_000n;
@@ -645,6 +760,79 @@ test('une erreur RPC au milieu du scan historique ne produit aucune mutation', a
   assert.deepEqual(canonicalStore.saves, []);
   assert.deepEqual(canonicalStore.pruneCalls, []);
   assert.deepEqual(checkpoints.writes, []);
+});
+
+test('préserve l’erreur RPC primaire malgré les erreurs de cleanup', async () => {
+  const reader = new MemoryBlockReader(20n);
+  const primaryError = new Error('RPC primary');
+  reader.getBlock = async () => {
+    throw primaryError;
+  };
+  const canonicalStore = new MemoryCanonicalStore();
+  const checkpoints = new MemoryCheckpoints();
+  const factory = new ThrowingCleanupSpoolFactory();
+  const cleanupErrorTypes: string[] = [];
+  const options = {
+    blockReader: reader,
+    canonicalStore,
+    checkpoints,
+    confirmations: 5,
+    headerSpoolFactory: factory,
+    onCleanupError: (errorType: string) => {
+      cleanupErrorTypes.push(errorType);
+    },
+  };
+  const subject = new CanonicalChainCoordinator(options);
+
+  await assert.rejects(
+    subject.reconcile({
+      listenerKey: 'pairs',
+      startBlock: 1n,
+      processChunk: async () => true,
+    }),
+    (error: unknown) => error === primaryError,
+  );
+
+  assert.deepEqual(cleanupErrorTypes, [
+    'CleanupFailureError',
+    'CleanupFailureError',
+  ]);
+  assert.deepEqual(canonicalStore.saves, []);
+  assert.deepEqual(checkpoints.writes, []);
+});
+
+test('une erreur de cleanup ne fait pas échouer un checkpoint déjà commité', async () => {
+  const reader = new MemoryBlockReader(6n);
+  const canonicalStore = new MemoryCanonicalStore();
+  const checkpoints = new MemoryCheckpoints();
+  const factory = new ThrowingCleanupSpoolFactory();
+  const cleanupErrorTypes: string[] = [];
+  const options = {
+    blockReader: reader,
+    canonicalStore,
+    checkpoints,
+    confirmations: 5,
+    headerSpoolFactory: factory,
+    onCleanupError: (errorType: string) => {
+      cleanupErrorTypes.push(errorType);
+    },
+  };
+  const subject = new CanonicalChainCoordinator(options);
+
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 1n,
+    processChunk: async () => true,
+  });
+
+  assert.deepEqual(checkpoints.values.get('pairs'), {
+    blockNumber: 1n,
+    blockHash: hash(2n),
+  });
+  assert.deepEqual(cleanupErrorTypes, [
+    'CleanupFailureError',
+    'CleanupFailureError',
+  ]);
 });
 
 test('rejette un header RPC sans numéro ou hash sans mutation', async () => {

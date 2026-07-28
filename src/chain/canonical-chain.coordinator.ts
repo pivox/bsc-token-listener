@@ -18,6 +18,7 @@ import type {
   ListenerCheckpoint,
 } from './canonical-chain.types.js';
 import { confirmedHead } from './confirmed-blocks.js';
+import { logger } from '../utils/logger.js';
 
 export const DEFAULT_CONFIRMED_CHUNK_SIZE = 1_500;
 export const DEFAULT_CANONICAL_RETENTION = 128;
@@ -38,12 +39,25 @@ export interface ListenerCheckpointStore {
   ): Promise<void>;
 }
 
+export interface CanonicalHeaderSpool {
+  append(header: CanonicalBlock): Promise<void>;
+  finish(): Promise<void>;
+  headers(): AsyncGenerator<CanonicalBlock>;
+  dispose(): Promise<void>;
+}
+
+export interface CanonicalHeaderSpoolFactory {
+  create(): Promise<CanonicalHeaderSpool>;
+}
+
 export interface CanonicalChainCoordinatorOptions {
   blockReader: CanonicalBlockReader;
   canonicalStore: CanonicalChainStore;
   checkpoints: ListenerCheckpointStore;
   confirmations?: number;
   chunkSize?: number;
+  headerSpoolFactory?: CanonicalHeaderSpoolFactory;
+  onCleanupError?: (errorType: string) => void;
 }
 
 export interface CanonicalChainCoordinatorStatus {
@@ -124,11 +138,10 @@ function minimum(values: bigint[]): bigint | null {
 }
 
 interface PreparedCanonicalScan {
-  journalHeaders: CanonicalBlock[];
   legacyHeader: CanonicalBlock | null;
 }
 
-class TemporaryChunkHeaderStore {
+class TemporaryCanonicalHeaderSpool implements CanonicalHeaderSpool {
   private handle: FileHandle | null;
 
   private constructor(
@@ -138,12 +151,12 @@ class TemporaryChunkHeaderStore {
     this.handle = handle;
   }
 
-  static async create(): Promise<TemporaryChunkHeaderStore> {
+  static async create(): Promise<TemporaryCanonicalHeaderSpool> {
     const path = join(
       tmpdir(),
       `bsc-canonical-chunks-${randomUUID()}.tmp`,
     );
-    return new TemporaryChunkHeaderStore(
+    return new TemporaryCanonicalHeaderSpool(
       path,
       await open(path, 'wx', 0o600),
     );
@@ -205,17 +218,34 @@ class TemporaryChunkHeaderStore {
   }
 
   async dispose(): Promise<void> {
-    await this.finish().catch(() => undefined);
-    await unlink(this.path).catch((error: unknown) => {
+    let cleanupError: unknown;
+    try {
+      await this.finish();
+    } catch (error: unknown) {
+      cleanupError = error;
+    }
+    try {
+      await unlink(this.path);
+    } catch (error: unknown) {
       if (
         !(error instanceof Error)
         || !('code' in error)
         || error.code !== 'ENOENT'
       ) {
-        throw error;
+        cleanupError ??= error;
       }
-    });
+    }
+    if (cleanupError !== undefined) throw cleanupError;
   }
+}
+
+const DEFAULT_HEADER_SPOOL_FACTORY: CanonicalHeaderSpoolFactory = {
+  create: () => TemporaryCanonicalHeaderSpool.create(),
+};
+
+function safeErrorType(error: unknown): string {
+  if (!(error instanceof Error)) return typeof error;
+  return error.name !== 'Error' ? error.name : error.constructor.name;
 }
 
 export class CanonicalChainCoordinator {
@@ -224,6 +254,8 @@ export class CanonicalChainCoordinator {
   private readonly checkpoints: ListenerCheckpointStore;
   private readonly confirmations: number;
   private readonly chunkSize: bigint;
+  private readonly headerSpoolFactory: CanonicalHeaderSpoolFactory;
+  private readonly onCleanupError: ((errorType: string) => void) | undefined;
   private tail: Promise<void> = Promise.resolve();
   private status: CanonicalChainCoordinatorStatus = {
     running: false,
@@ -234,6 +266,9 @@ export class CanonicalChainCoordinator {
     this.blockReader = options.blockReader;
     this.canonicalStore = options.canonicalStore;
     this.checkpoints = options.checkpoints;
+    this.headerSpoolFactory =
+      options.headerSpoolFactory ?? DEFAULT_HEADER_SPOOL_FACTORY;
+    this.onCleanupError = options.onCleanupError;
     this.confirmations = boundedInteger(
       options.confirmations ?? 5,
       'confirmations',
@@ -283,8 +318,16 @@ export class CanonicalChainCoordinator {
     const head = confirmedHead(latestBlock, this.confirmations);
     if (head === null) return;
 
-    const [checkpoint, tip, descending] = await Promise.all([
-      this.checkpoints.get(request.listenerKey),
+    const checkpoint = await this.checkpoints.get(request.listenerKey);
+    if (
+      checkpoint?.blockHash === null
+      && checkpoint.blockNumber > head
+    ) {
+      return;
+    }
+
+    const [oldestCheckpointBefore, tip, descending] = await Promise.all([
+      this.checkpoints.getOldestBlockNumber(),
       this.canonicalStore.getCanonicalTip(),
       this.canonicalStore.listCanonicalDescending(
         DEFAULT_CANONICAL_RETENTION,
@@ -304,8 +347,22 @@ export class CanonicalChainCoordinator {
     const fromBlock = checkpoint
       ? checkpoint.blockNumber + 1n
       : request.startBlock;
-    const chunkHeaders = await TemporaryChunkHeaderStore.create();
+    const windowStart = this.canonicalWindowStart(head);
+    const journalStart =
+      oldestCheckpointBefore !== null && oldestCheckpointBefore < windowStart
+        ? oldestCheckpointBefore
+        : windowStart;
+    const journalNeedsPersistence = !this.hasContinuousCachedJournal(
+      knownHeaders,
+      journalStart,
+      head,
+    );
+    const spools: CanonicalHeaderSpool[] = [];
     try {
+      const chunkHeaders = await this.headerSpoolFactory.create();
+      spools.push(chunkHeaders);
+      const journalHeaders = await this.headerSpoolFactory.create();
+      spools.push(journalHeaders);
       const prepared = await this.prepareCanonicalScan(
         checkpoint,
         tip,
@@ -313,16 +370,23 @@ export class CanonicalChainCoordinator {
         fromBlock,
         head,
         chunkHeaders,
+        journalHeaders,
+        journalStart,
+        journalNeedsPersistence,
       );
-      await chunkHeaders.finish();
-      const saved = prepared.journalHeaders.length > 0;
-      if (saved) {
-        await this.canonicalStore.saveCanonicalBlocks(
-          prepared.journalHeaders,
-        );
-      }
+      await Promise.all([
+        chunkHeaders.finish(),
+        journalHeaders.finish(),
+      ]);
+      await this.validateSpools(chunkHeaders, journalHeaders);
+      const saved = journalNeedsPersistence
+        ? await this.persistJournal(journalHeaders)
+        : false;
       let checkpointPersisted = false;
-      if (checkpoint?.blockHash === null) {
+      if (
+        checkpoint?.blockHash === null
+        && checkpoint.blockNumber <= head
+      ) {
         const legacyHeader = prepared.legacyHeader;
         if (!legacyHeader) {
           throw new Error(
@@ -352,7 +416,6 @@ export class CanonicalChainCoordinator {
       }
 
       if (saved || checkpointPersisted) {
-        const windowStart = this.canonicalWindowStart(head);
         const oldestCheckpoint = await this.checkpoints.getOldestBlockNumber();
         const cutoff =
           oldestCheckpoint === null || windowStart < oldestCheckpoint
@@ -361,7 +424,7 @@ export class CanonicalChainCoordinator {
         await this.canonicalStore.pruneCanonicalBefore(cutoff);
       }
     } finally {
-      await chunkHeaders.dispose();
+      await this.disposeSpools(spools);
     }
   }
 
@@ -371,13 +434,16 @@ export class CanonicalChainCoordinator {
     knownHeaders: Map<bigint, CanonicalBlock>,
     fromBlock: bigint,
     head: bigint,
-    chunkHeaders: TemporaryChunkHeaderStore,
+    chunkHeaders: CanonicalHeaderSpool,
+    journalHeaders: CanonicalHeaderSpool,
+    journalStart: bigint,
+    journalNeedsPersistence: boolean,
   ): Promise<PreparedCanonicalScan> {
-    const scanCandidates: bigint[] = [];
-    const journalNeedsExtension = !tip || tip.number < head;
-    if (journalNeedsExtension) {
-      scanCandidates.push(tip ? tip.number : this.canonicalWindowStart(head));
-    }
+    const scanCandidates: bigint[] = [
+      journalNeedsPersistence && tip && tip.number < journalStart
+        ? tip.number
+        : journalStart,
+    ];
     if (fromBlock <= head) {
       scanCandidates.push(
         checkpoint?.blockHash === null
@@ -388,7 +454,6 @@ export class CanonicalChainCoordinator {
     const scanStart = minimum(scanCandidates);
     if (scanStart === null) {
       return {
-        journalHeaders: [],
         legacyHeader: null,
       };
     }
@@ -405,7 +470,6 @@ export class CanonicalChainCoordinator {
               parentHash: checkpoint.blockHash,
             }
           : null;
-    const journalHeaders: CanonicalBlock[] = [];
     let legacyHeader: CanonicalBlock | null = null;
 
     for (let number = scanStart; number <= head; number += 1n) {
@@ -430,14 +494,8 @@ export class CanonicalChainCoordinator {
           `Checkpoint divergent au bloc ${number}.`,
         );
       }
-      if (
-        journalNeedsExtension
-        && (!tip || number > tip.number)
-      ) {
-        journalHeaders.push(header);
-        if (journalHeaders.length > DEFAULT_CANONICAL_RETENTION) {
-          journalHeaders.shift();
-        }
+      if (journalNeedsPersistence && number >= journalStart) {
+        await journalHeaders.append(header);
       }
       if (
         number >= fromBlock
@@ -453,7 +511,90 @@ export class CanonicalChainCoordinator {
       }
       previous = header;
     }
-    return { journalHeaders, legacyHeader };
+    return { legacyHeader };
+  }
+
+  private hasContinuousCachedJournal(
+    knownHeaders: Map<bigint, CanonicalBlock>,
+    start: bigint,
+    head: bigint,
+  ): boolean {
+    if (head - start + 1n > BigInt(DEFAULT_CANONICAL_RETENTION)) {
+      return false;
+    }
+    let previous: CanonicalBlock | null = null;
+    for (let number = start; number <= head; number += 1n) {
+      const header = knownHeaders.get(number);
+      if (!header) return false;
+      if (previous) assertContinuous(previous, header);
+      previous = header;
+    }
+    return true;
+  }
+
+  private async validateSpools(
+    chunkHeaders: CanonicalHeaderSpool,
+    journalHeaders: CanonicalHeaderSpool,
+  ): Promise<void> {
+    for await (const _header of chunkHeaders.headers()) {
+      // Le parsing strict du spool est la validation attendue ici.
+    }
+    let previous: CanonicalBlock | null = null;
+    for await (const header of journalHeaders.headers()) {
+      if (previous) assertContinuous(previous, header);
+      previous = header;
+    }
+  }
+
+  private async persistJournal(
+    journalHeaders: CanonicalHeaderSpool,
+  ): Promise<boolean> {
+    let saved = false;
+    let batch: CanonicalBlock[] = [];
+    for await (const header of journalHeaders.headers()) {
+      batch.push(header);
+      if (batch.length === DEFAULT_CANONICAL_RETENTION) {
+        await this.canonicalStore.saveCanonicalBlocks(batch);
+        saved = true;
+        batch = [];
+      }
+    }
+    if (batch.length > 0) {
+      await this.canonicalStore.saveCanonicalBlocks(batch);
+      saved = true;
+    }
+    return saved;
+  }
+
+  private async disposeSpools(
+    spools: CanonicalHeaderSpool[],
+  ): Promise<void> {
+    for (const spool of spools) {
+      try {
+        await spool.dispose();
+      } catch (error: unknown) {
+        const errorType = safeErrorType(error);
+        try {
+          if (this.onCleanupError) {
+            this.onCleanupError(errorType);
+          } else {
+            logger.warn(
+              { errorType },
+              'Nettoyage du spool canonique échoué.',
+            );
+          }
+        } catch {
+          try {
+            logger.warn(
+              { errorType },
+              'Rapport du nettoyage du spool canonique échoué.',
+            );
+          } catch {
+            // Le cleanup reste strictement secondaire.
+          }
+        }
+      }
+    }
   }
 
   private canonicalWindowStart(head: bigint): bigint {
