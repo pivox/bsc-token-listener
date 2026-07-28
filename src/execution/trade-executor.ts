@@ -216,7 +216,7 @@ export class TradeExecutor {
       token: session.pair.token,
       side,
       mode: config.executionMode,
-      status: 'PENDING',
+      status: 'CREATED',
       amountIn,
       amountOut,
       createdAtMs: now,
