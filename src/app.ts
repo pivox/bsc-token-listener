@@ -169,6 +169,7 @@ async function main(): Promise<void> {
       pair,
       metadata,
       status: 'WAITING_FIRST_BUY',
+      entryObservationBuys: [],
       subsequentBuyCount: 0,
       targetBuysAfterEntry: config.targetBuysAfterEntry,
       countedBuyTransactionHashes: [],
