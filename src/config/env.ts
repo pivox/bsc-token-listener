@@ -105,6 +105,22 @@ if (executionMode === 'live') {
   }
 }
 
+const minBuyBnbWei = parseEther(read('MIN_BUY_BNB', '0.002'));
+const maxBuyBnbWei = parseEther(read('MAX_BUY_BNB', '0.005'));
+const buyAmountStepWei = parseEther(read('BUY_AMOUNT_STEP_BNB', '0.0001'));
+
+if (maxBuyBnbWei < minBuyBnbWei) {
+  throw new Error('MAX_BUY_BNB doit être supérieur ou égal à MIN_BUY_BNB.');
+}
+
+if (buyAmountStepWei <= 0n) {
+  throw new Error('BUY_AMOUNT_STEP_BNB doit être strictement positif.');
+}
+
+if (buyAmountStepWei > minBuyBnbWei) {
+  throw new Error('BUY_AMOUNT_STEP_BNB doit être inférieur ou égal à MIN_BUY_BNB.');
+}
+
 export const config = {
   network,
   httpRpcUrl: read('BSC_HTTP_RPC_URL', firstUrl('BSC_HTTP_URLS')),
@@ -131,6 +147,13 @@ export const config = {
   executionMode,
   privateKey,
   buyAmountWei: parseEther(read('BUY_AMOUNT_BNB', '0.01')),
+  minBuyBnbWei,
+  maxBuyBnbWei,
+  buyAmountStepWei,
+  buyLiquidityShareBps: readInteger('BUY_LIQUIDITY_SHARE_BPS', 50, 1, 10000),
+  buyMedianFactorBps: readInteger('BUY_MEDIAN_FACTOR_BPS', 5000, 1, 10000),
+  buyWalletShareBps: readInteger('BUY_WALLET_SHARE_BPS', 1000, 1, 10000),
+  gasReserveWei: parseEther(read('GAS_RESERVE_BNB', '0.005')),
   slippageBps: readInteger('SLIPPAGE_BPS', 1500, 0, 5000, 'BUY_SLIPPAGE_BPS'),
   txDeadlineSeconds: readInteger('TX_DEADLINE_SECONDS', 90, 15, 600),
   targetBuysAfterEntry: readInteger('TARGET_BUYS_AFTER_ENTRY', 3, 1, 1000),
