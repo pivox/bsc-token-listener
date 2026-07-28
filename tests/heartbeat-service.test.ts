@@ -44,13 +44,26 @@ test('collecte et expose un heartbeat complet avec RPC disponibles', async () =>
     },
   );
 
-  const snapshot = await heartbeat.refresh(2);
+  const snapshot = await heartbeat.refresh(2, {
+    capacity: 5,
+    activeMonitors: 2,
+    waitingSessions: 3,
+    abandonedSessions: 1,
+    oldestWaitingAgeMs: 12_000,
+  });
 
   assert.equal(snapshot.executionMode, 'dry-run');
   assert.equal(snapshot.latestBlock, '12345');
   assert.equal(snapshot.pairCreatedCheckpoint, '3456');
   assert.equal(snapshot.activeSwapMonitors, 2);
   assert.equal(snapshot.activeSessions, 4);
+  assert.deepEqual(snapshot.monitoring, {
+    capacity: 5,
+    activeMonitors: 2,
+    waitingSessions: 3,
+    abandonedSessions: 1,
+    oldestWaitingAgeMs: 12_000,
+  });
   assert.equal(snapshot.http.status, 'up');
   assert.equal(snapshot.webSocket.status, 'up');
   assert.equal(snapshot.http.blockNumber, '12345');

@@ -15,7 +15,11 @@ test('dashboard affiche les champs heartbeat dans la page', () => {
   assert.match(html, /id="recovery-manual-review"/);
   assert.match(html, /id="recovery-last-completed"/);
   assert.match(html, /snapshot\.heartbeat\.latestBlock/);
-  assert.match(html, /snapshot\.heartbeat\.activeSwapMonitors/);
+  assert.match(html, /snapshot\.heartbeat\.monitoring\.activeMonitors/);
+  assert.match(html, /snapshot\.heartbeat\.monitoring\.capacity/);
+  assert.match(html, /snapshot\.heartbeat\.monitoring\.waitingSessions/);
+  assert.match(html, /snapshot\.heartbeat\.monitoring\.abandonedSessions/);
+  assert.match(html, /snapshot\.heartbeat\.monitoring\.oldestWaitingAgeMs/);
   assert.match(html, /snapshot\.heartbeat\.http\.status/);
   assert.match(html, /snapshot\.heartbeat\.recovery\.pendingSessions/);
 });

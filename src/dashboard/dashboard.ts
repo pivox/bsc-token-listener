@@ -208,6 +208,13 @@ interface DashboardSnapshot {
     pairCreatedCheckpoint: string | null;
     activeSwapMonitors: number;
     activeSessions: number;
+    monitoring: {
+      capacity: number;
+      activeMonitors: number;
+      waitingSessions: number;
+      abandonedSessions: number;
+      oldestWaitingAgeMs: number | null;
+    };
     http: {
       status: 'up' | 'down';
       blockNumber: string | null;

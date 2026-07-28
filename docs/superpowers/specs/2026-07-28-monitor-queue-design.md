@@ -1,0 +1,62 @@
+# Monitor Queue Design
+
+## Goal
+
+Never leave an eligible token session indefinitely without a swap monitor when
+`MAX_ACTIVE_PAIR_MONITORS` is saturated.
+
+## Queue model
+
+The queue is reconstructed from `token_sessions`; no second source of truth is
+introduced. A session is eligible when its state is monitorable and it does not
+already own an in-process monitor.
+
+Priority is deterministic and safety-first:
+
+1. `HOLDING` sessions, oldest first, because an open position must be watched;
+2. `WAITING_FIRST_BUY` sessions, oldest first (FIFO by `createdAtMs`);
+3. pair address as the final stable tie-breaker.
+
+`RISK_CHECKING`, `BUY_PENDING`, `SELL_PENDING`, `MANUAL_REVIEW`, ignored assets
+and terminal sessions are not admitted.
+
+## Scheduling
+
+`MonitorScheduler.reconcile()` is serialized. It:
+
+1. reloads active sessions from PostgreSQL;
+2. stops monitors whose sessions are no longer monitorable;
+3. expires every queued `WAITING_FIRST_BUY` older than the configured TTL;
+4. removes ignored assets through the existing ignore workflow;
+5. sorts remaining candidates with the policy above;
+6. admits candidates while capacity remains;
+7. continues with the next candidate if one listener fails to start.
+
+The scheduler reserves a pair before awaiting listener startup. This prevents
+two local monitor starts for the same pair. Listener termination releases the
+reservation and triggers another serialized pass.
+
+On restart, the first pass reconstructs the queue from PostgreSQL and admits it
+using the same policy.
+
+## Diagnostics
+
+The scheduler exposes:
+
+- total capacity;
+- active monitors;
+- queued sessions;
+- failed admissions in the latest pass ("abandoned");
+- age of the oldest queued session.
+
+Heartbeat and dashboard consume this snapshot. Logs cover admission, waiting,
+expiration, ignored removal, startup failure and capacity release.
+
+## Failure rules
+
+- A listener startup error never blocks the next candidate.
+- Failed candidates remain persisted and become retryable on a later pass.
+- Expiration is persisted before admission.
+- No RPC failure advances a blockchain checkpoint.
+- The monitor cap is never increased automatically.
+

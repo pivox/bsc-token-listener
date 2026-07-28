@@ -13,6 +13,7 @@ import { TradeExecutor } from './execution/trade-executor.js';
 import { HeartbeatService } from './heartbeat/heartbeat.js';
 import { PairCreatedListener } from './listeners/pair-created.listener.js';
 import { SwapListener } from './listeners/swap.listener.js';
+import { MonitorScheduler } from './monitoring/monitor-scheduler.js';
 import { RecoveryCoordinator } from './recovery/recovery-coordinator.js';
 import { RecoveryIntentService } from './recovery/recovery-intent.service.js';
 import { ReconciliationRepository } from './recovery/reconciliation.repository.js';
@@ -133,26 +134,40 @@ async function main(): Promise<void> {
   const monitors = new Map<string, SwapListener>();
   const activeSessionsByToken = new Map<string, TokenSession>();
   const activeTokenByPair = new Map<string, string>();
+  let monitorSchedulingEnabled = true;
+  let requestMonitorReconcile = (): void => {};
 
-  const removeMonitor = (pair: Address): void => {
+  const removeMonitor = (
+    pair: Address,
+    scheduleNext = true,
+    logRelease = true,
+  ): void => {
     const pairKey = pair.toLowerCase();
     const tokenKey = activeTokenByPair.get(pairKey);
-    monitors.delete(pairKey);
+    const removed = monitors.delete(pairKey);
     activeTokenByPair.delete(pairKey);
     if (tokenKey) activeSessionsByToken.delete(tokenKey);
+    if (removed && logRelease) {
+      logger.info({ pair }, 'Capacité de monitoring libérée.');
+    }
+    if (scheduleNext && monitorSchedulingEnabled) requestMonitorReconcile();
   };
 
-  const stopMonitor = (pair: Address): void => {
+  const stopMonitor = (
+    pair: Address,
+    scheduleNext = true,
+    logRelease = true,
+  ): void => {
     const key = pair.toLowerCase();
     monitors.get(key)?.stop();
-    removeMonitor(pair);
+    removeMonitor(pair, scheduleNext, logRelease);
   };
 
   const dashboardActions = new DashboardActionService(
     ignoredAssets,
     engine,
     (token) => activeSessionsByToken.get(token.toLowerCase()) ?? null,
-    stopMonitor,
+    (pair) => stopMonitor(pair),
   );
   const dashboard = config.dashboardEnabled
     ? new ActionDashboardServer(
@@ -167,19 +182,12 @@ async function main(): Promise<void> {
     const key = session.pair.pair.toLowerCase();
     const tokenKey = session.pair.token.toLowerCase();
     if (monitors.has(key)) return;
-    if (monitors.size >= config.maxActivePairMonitors) {
-      logger.warn(
-        { pair: session.pair.pair, max: config.maxActivePairMonitors },
-        'Moniteur ignoré: capacité maximale atteinte.',
-      );
-      return;
-    }
     const listener = new SwapListener(
       session,
       checkpoints,
       events,
       engine,
-      removeMonitor,
+      (pair) => removeMonitor(pair),
     );
     monitors.set(key, listener);
     activeSessionsByToken.set(tokenKey, session);
@@ -187,9 +195,35 @@ async function main(): Promise<void> {
     try {
       await listener.start();
     } catch (error) {
-      removeMonitor(session.pair.pair);
+      listener.stop();
+      removeMonitor(session.pair.pair, false, false);
       throw error;
     }
+  };
+
+  const monitorScheduler = new MonitorScheduler({
+    capacity: config.maxActivePairMonitors,
+    ttlMs: config.pairMonitorTtlMinutes * 60_000,
+    loadSessions: () => sessions.loadActive(),
+    activePairs: () => [...monitors.keys()],
+    isIgnored: (token) => ignoredAssets.isIgnored(token),
+    expire: async (session) => {
+      await engine.expireIfNeeded(session);
+    },
+    ignore: async (session) => {
+      await engine.ignoreManually(session);
+    },
+    canStart: () => !recovery.currentStatus.running,
+    start: startMonitor,
+    stop: (pair) => stopMonitor(pair, false, false),
+  });
+  requestMonitorReconcile = (): void => {
+    if (recovery.currentStatus.running) return;
+    void monitorScheduler.reconcile().catch((error: unknown) =>
+      logger.error(
+        { reason: errorMessage(error) },
+        'Réconciliation de la file de monitoring échouée.',
+      ));
   };
 
   synchronizeRecoveredSessions = async (): Promise<void> => {
@@ -200,11 +234,11 @@ async function main(): Promise<void> {
     for (const [pairKey] of monitors) {
       const current = refreshedByPair.get(pairKey);
       if (!current) {
-        stopMonitor(pairKey as Address);
+        stopMonitor(pairKey as Address, false);
         continue;
       }
       if (!isSessionMonitorable(current)) {
-        stopMonitor(pairKey as Address);
+        stopMonitor(pairKey as Address, false);
         refreshedByPair.delete(pairKey);
         continue;
       }
@@ -218,8 +252,7 @@ async function main(): Promise<void> {
   };
 
   activateRecoveredSessions = async (): Promise<void> => {
-    const refreshed = await sessions.loadActive();
-    for (const session of refreshed) await startMonitor(session);
+    await monitorScheduler.reconcile();
   };
 
   const onPair = async (pair: PairInfo): Promise<void> => {
@@ -271,7 +304,7 @@ async function main(): Promise<void> {
       },
       'Nouvelle paire Token/WBNB enregistrée.',
     );
-    await startMonitor(session);
+    await monitorScheduler.reconcile();
   };
 
   const initialRecovery = await recovery.reconcileInitial();
@@ -280,27 +313,31 @@ async function main(): Promise<void> {
     'Réconciliation initiale terminée; activation des listeners autorisée.',
   );
 
-  const restored = await sessions.loadActive();
-  for (const session of restored) {
-    if (await ignoredAssets.isIgnored(session.pair.token)) {
-      await engine.ignoreManually(session);
-      continue;
-    }
-    await startMonitor(session);
-  }
+  await monitorScheduler.reconcile();
 
   const pairListener = new PairCreatedListener(checkpoints, onPair);
   await pairListener.start();
   recovery.start();
+  const monitorQueueInterval = setInterval(() => {
+    requestMonitorReconcile();
+  }, config.reconcileSeconds * 1_000);
+  monitorQueueInterval.unref();
 
   const refreshHeartbeat = async (): Promise<void> => {
-    const snapshot = await heartbeat.refresh(monitors.size);
+    const snapshot = await heartbeat.refresh(
+      monitors.size,
+      monitorScheduler.currentStatus,
+    );
     logger.info(
       {
         latestBlock: snapshot.latestBlock,
         pairCreatedCheckpoint: snapshot.pairCreatedCheckpoint,
         activeSwapMonitors: snapshot.activeSwapMonitors,
         activeSessions: snapshot.activeSessions,
+        monitorCapacity: snapshot.monitoring.capacity,
+        waitingMonitorSessions: snapshot.monitoring.waitingSessions,
+        abandonedMonitorSessions: snapshot.monitoring.abandonedSessions,
+        oldestMonitorWaitingAgeMs: snapshot.monitoring.oldestWaitingAgeMs,
         executionMode: snapshot.executionMode,
         httpStatus: snapshot.http.status,
         wsStatus: snapshot.webSocket.status,
@@ -359,8 +396,10 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
+    monitorSchedulingEnabled = false;
     logger.info({ signal }, 'Arrêt du bot.');
     await recovery.stop();
+    clearInterval(monitorQueueInterval);
     clearInterval(heartbeatInterval);
     pairListener.stop();
     for (const listener of monitors.values()) listener.stop();

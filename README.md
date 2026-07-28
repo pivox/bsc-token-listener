@@ -181,6 +181,27 @@ ORDER BY updated_at DESC;
 Ne jamais rediffuser manuellement une transaction tant que son hash et son reçu
 n’ont pas été vérifiés sur le réseau configuré.
 
+### Saturation des moniteurs
+
+Lorsque `MAX_ACTIVE_PAIR_MONITORS` est atteint, les sessions éligibles restent
+persistées dans `token_sessions` et forment une file reconstructible. Une place
+libérée déclenche automatiquement une nouvelle admission. La priorité est
+déterministe et orientée sécurité :
+
+1. positions `HOLDING`, de la plus ancienne à la plus récente ;
+2. sessions `WAITING_FIRST_BUY`, de la plus ancienne à la plus récente ;
+3. adresse de paire comme dernier critère stable.
+
+Le plafond n’est jamais augmenté automatiquement. Une erreur au démarrage d’un
+listener laisse la session en file pour une nouvelle tentative et n’empêche pas
+l’admission de la suivante. Les sessions `WAITING_FIRST_BUY` expirent après
+`PAIR_MONITOR_TTL_MINUTES`, même sans avoir obtenu de listener. Les actifs
+ignorés et les sessions terminales sont retirés de la file.
+
+Le heartbeat et le dashboard exposent la capacité totale, les moniteurs actifs,
+la profondeur de file, les admissions échouées lors de la dernière passe et
+l’âge de la plus ancienne attente.
+
 ## Dashboard minimal
 
 Le bot expose une interface de supervision **strictement en lecture seule**. Elle affiche :

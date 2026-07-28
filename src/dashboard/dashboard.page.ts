@@ -105,7 +105,7 @@ export function renderDashboardPage(nonce: string, refreshSeconds: number): stri
 
   <section class="cards" aria-label="Synthèse">
       <article class="card"><div class="card-label">Dernier bloc BSC</div><div class="card-value" id="heartbeat-latest-block">—</div><div class="card-note" id="heartbeat-pair-created">Checkpoint pair-created: —</div></article>
-      <article class="card"><div class="card-label">Moniteurs / Sessions</div><div class="card-value" id="heartbeat-swap-monitors">—</div><div class="card-note" id="heartbeat-active-sessions">Sessions actives: —</div></article>
+      <article class="card"><div class="card-label">Monitoring</div><div class="card-value" id="heartbeat-swap-monitors">—</div><div class="card-note" id="heartbeat-monitor-queue">File: —</div><div class="card-note" id="heartbeat-monitor-wait">Attente max: —</div><div class="card-note" id="heartbeat-active-sessions">Sessions actives: —</div></article>
       <article class="card"><div class="card-label">Etat RPC</div><div class="card-value" id="heartbeat-http-status">—</div><div class="card-note" id="heartbeat-ws-status">WS : —</div></article>
       <article class="card"><div class="card-label">Réconciliation</div><div class="card-value" id="recovery-pending-sessions">—</div><div class="card-note" id="recovery-manual-review">Revue manuelle: —</div><div class="card-note" id="recovery-last-completed">Dernière passe: —</div></article>
       <article class="card"><div class="card-label">Solde wallet</div><div class="card-value" id="wallet-balance">—</div><div class="card-note" id="wallet-address">Wallet non configuré</div></article>
@@ -216,7 +216,19 @@ export function renderDashboardPage(nonce: string, refreshSeconds: number): stri
         + (snapshot.heartbeat && snapshot.heartbeat.pairCreatedCheckpoint
           ? snapshot.heartbeat.pairCreatedCheckpoint
           : '—');
-      byId('heartbeat-swap-monitors').textContent = String(snapshot.heartbeat ? snapshot.heartbeat.activeSwapMonitors : 0);
+      byId('heartbeat-swap-monitors').textContent = snapshot.heartbeat
+        ? String(snapshot.heartbeat.monitoring.activeMonitors)
+          + ' / ' + String(snapshot.heartbeat.monitoring.capacity)
+        : '0 / 0';
+      byId('heartbeat-monitor-queue').textContent = snapshot.heartbeat
+        ? 'File: ' + String(snapshot.heartbeat.monitoring.waitingSessions)
+          + ' · Échecs: ' + String(snapshot.heartbeat.monitoring.abandonedSessions)
+        : 'File: 0 · Échecs: 0';
+      byId('heartbeat-monitor-wait').textContent = snapshot.heartbeat
+        && snapshot.heartbeat.monitoring.oldestWaitingAgeMs !== null
+        ? 'Attente max: '
+          + String(Math.floor(snapshot.heartbeat.monitoring.oldestWaitingAgeMs / 1000)) + ' s'
+        : 'Attente max: —';
       byId('heartbeat-active-sessions').textContent = 'Sessions actives: '
         + String(snapshot.heartbeat ? snapshot.heartbeat.activeSessions : 0);
       byId('heartbeat-http-status').textContent = snapshot.heartbeat
