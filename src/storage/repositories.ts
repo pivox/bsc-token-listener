@@ -11,16 +11,30 @@ import type {
 } from '../types/domain.js';
 import type { TokenRiskReport } from '../security/token-risk.types.js';
 
+interface SessionDatabase {
+  query<T = Record<string, unknown>>(
+    sql: string,
+    values?: unknown[],
+  ): Promise<{ rows: T[] }>;
+}
+
 export class SessionRepository {
+  constructor(
+    private readonly database: SessionDatabase =
+      pool as unknown as SessionDatabase,
+  ) {}
+
   async save(session: TokenSession): Promise<void> {
-    await pool.query(
+    const result = await this.database.query<{ pair_address: string }>(
       `INSERT INTO token_sessions(pair_address, token_address, status, payload, created_at, updated_at)
        VALUES ($1, $2, $3, $4::jsonb, to_timestamp($5 / 1000.0), to_timestamp($6 / 1000.0))
        ON CONFLICT (pair_address) DO UPDATE SET
          token_address = EXCLUDED.token_address,
          status = EXCLUDED.status,
          payload = EXCLUDED.payload,
-         updated_at = EXCLUDED.updated_at`,
+         updated_at = EXCLUDED.updated_at
+       WHERE token_sessions.recovery_owner IS NULL
+       RETURNING pair_address`,
       [
         session.pair.pair.toLowerCase(),
         session.pair.token.toLowerCase(),
@@ -30,10 +44,13 @@ export class SessionRepository {
         session.updatedAtMs,
       ],
     );
+    if (result.rows.length !== 1) {
+      throw new Error('Session verrouillée par une réconciliation active.');
+    }
   }
 
   async loadActive(): Promise<TokenSession[]> {
-    const result = await pool.query<{ payload: unknown }>(
+    const result = await this.database.query<{ payload: unknown }>(
       `SELECT payload FROM token_sessions
        WHERE status IN ('WAITING_FIRST_BUY', 'RISK_CHECKING', 'BUY_PENDING', 'HOLDING', 'SELL_PENDING', 'MANUAL_REVIEW')`,
     );
@@ -41,7 +58,7 @@ export class SessionRepository {
   }
 
   async countOpenPositions(): Promise<number> {
-    const result = await pool.query<{ count: string }>(
+    const result = await this.database.query<{ count: string }>(
       `SELECT COUNT(*)::text AS count FROM token_sessions
        WHERE status IN ('BUY_PENDING', 'HOLDING', 'SELL_PENDING', 'MANUAL_REVIEW')`,
     );
@@ -49,7 +66,7 @@ export class SessionRepository {
   }
 
   async countActive(): Promise<number> {
-    const result = await pool.query<{ count: string }>(
+    const result = await this.database.query<{ count: string }>(
       `SELECT COUNT(*)::text AS count FROM token_sessions
        WHERE status IN ('WAITING_FIRST_BUY', 'RISK_CHECKING', 'BUY_PENDING', 'HOLDING', 'SELL_PENDING', 'MANUAL_REVIEW')`,
     );

@@ -418,11 +418,19 @@ export class SessionReconciler {
       session,
       action: 'APPROVAL_CONFIRMED',
       reason,
+      retainLease: this.intents !== null,
       trade,
       transaction,
     });
     if (this.intents) {
-      await this.intents.resumeSell(session);
+      const resumed = await this.intents.resumeSell(session);
+      const resumeReason = 'Vente reprise après confirmation de l’approval.';
+      this.recordRecovery(resumed, 'RESUME_INTENT', resumeReason);
+      await this.apply(claimed, {
+        session: resumed,
+        action: 'RESUME_INTENT',
+        reason: resumeReason,
+      });
     }
   }
 

@@ -145,3 +145,48 @@ test('la barrière initiale attend aussi le verrou détenu par une autre instanc
   assert.equal(store.lockAcquired, 2);
   assert.equal(store.lockReleased, 1);
 });
+
+test('la passe périodique resynchronise les sessions même après une erreur', async () => {
+  const store = new MemoryStore();
+  store.claims.push({
+    owner: 'worker',
+    statusBefore: 'BUY_PENDING',
+    snapshot: {
+      session: {
+        pair: { pair: '0x0000000000000000000000000000000000000001' },
+      } as unknown as ClaimedRecovery['snapshot']['session'],
+      trades: [],
+      transactions: [],
+    },
+  });
+  const synchronized = deferred();
+  let synchronizationCalls = 0;
+  let coordinator: RecoveryCoordinator;
+  coordinator = new RecoveryCoordinator(
+    store,
+    {
+      reconcile: async () => {
+        const error = new Error('détail sensible');
+        error.name = 'RpcUnavailableError';
+        throw error;
+      },
+    },
+    {
+      intervalMs: 1,
+      leaseMs: 60_000,
+      owner: 'worker',
+      onPeriodicPassCompleted: async () => {
+        synchronizationCalls += 1;
+        coordinator.stop();
+        synchronized.resolve();
+      },
+    },
+  );
+
+  coordinator.start();
+  await synchronized.promise;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(synchronizationCalls, 1);
+  assert.equal(coordinator.currentStatus.lastErrorType, 'RpcUnavailableError');
+});

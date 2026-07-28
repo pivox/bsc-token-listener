@@ -82,9 +82,9 @@ async function main(): Promise<void> {
     },
   });
   const engine = new SessionEngine(sessions, reports, risk, executor, amountService);
+  let synchronizeRecoveredSessions = async (): Promise<void> => {};
   const reconciliationStore = new ReconciliationRepository();
   const recoveryIntents = new RecoveryIntentService({
-    sessions,
     reports,
     risk,
     amounts: amountService,
@@ -101,6 +101,7 @@ async function main(): Promise<void> {
     {
       intervalMs: config.recoveryIntervalSeconds * 1_000,
       leaseMs: config.recoveryLeaseSeconds * 1_000,
+      onPeriodicPassCompleted: () => synchronizeRecoveredSessions(),
     },
   );
   const heartbeat = new HeartbeatService(
@@ -172,6 +173,27 @@ async function main(): Promise<void> {
       removeMonitor(session.pair.pair);
       throw error;
     }
+  };
+
+  synchronizeRecoveredSessions = async (): Promise<void> => {
+    const refreshed = await sessions.loadActive();
+    const refreshedByPair = new Map(
+      refreshed.map((session) => [session.pair.pair.toLowerCase(), session]),
+    );
+    for (const [pairKey] of monitors) {
+      const current = refreshedByPair.get(pairKey);
+      if (!current) {
+        stopMonitor(pairKey as Address);
+        continue;
+      }
+      const active = activeSessionsByToken.get(current.pair.token.toLowerCase());
+      if (active) {
+        for (const key of Object.keys(active)) Reflect.deleteProperty(active, key);
+        Object.assign(active, structuredClone(current));
+      }
+      refreshedByPair.delete(pairKey);
+    }
+    for (const session of refreshedByPair.values()) await startMonitor(session);
   };
 
   const onPair = async (pair: PairInfo): Promise<void> => {
@@ -312,7 +334,7 @@ async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info({ signal }, 'Arrêt du bot.');
-    recovery.stop();
+    await recovery.stop();
     clearInterval(heartbeatInterval);
     pairListener.stop();
     for (const listener of monitors.values()) listener.stop();

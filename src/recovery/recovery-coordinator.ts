@@ -14,6 +14,7 @@ interface RecoveryCoordinatorOptions {
   leaseMs: number;
   owner?: string;
   initialRetryMs?: number;
+  onPeriodicPassCompleted?: () => Promise<void>;
 }
 
 export interface RecoveryPassResult {
@@ -42,6 +43,7 @@ export class RecoveryCoordinator {
   private readonly owner: string;
   private currentPass: Promise<RecoveryPassResult> | null = null;
   private initialBarrier: Promise<RecoveryPassResult> | null = null;
+  private periodicPass: Promise<void> | null = null;
   private interval: NodeJS.Timeout | null = null;
   private status: RecoveryCoordinatorStatus = {
     running: false,
@@ -73,7 +75,7 @@ export class RecoveryCoordinator {
   start(): void {
     if (this.interval) return;
     this.interval = setInterval(() => {
-      void this.runPass().catch((error: unknown) => {
+      void this.runPeriodicPass().catch((error: unknown) => {
         logger.error(
           { errorType: safeErrorType(error) },
           'Passe périodique de réconciliation échouée.',
@@ -83,10 +85,27 @@ export class RecoveryCoordinator {
     this.interval.unref();
   }
 
-  stop(): void {
-    if (!this.interval) return;
-    clearInterval(this.interval);
-    this.interval = null;
+  private runPeriodicPass(): Promise<void> {
+    if (this.periodicPass) return this.periodicPass;
+    const pass = (async () => {
+      try {
+        await this.runPass();
+      } finally {
+        await this.options.onPeriodicPassCompleted?.();
+      }
+    })().finally(() => {
+      this.periodicPass = null;
+    });
+    this.periodicPass = pass;
+    return pass;
+  }
+
+  async stop(): Promise<void> {
+    if (this.interval) {
+      clearInterval(this.interval);
+      this.interval = null;
+    }
+    await (this.periodicPass ?? this.currentPass)?.catch(() => undefined);
   }
 
   private runPass(): Promise<RecoveryPassResult> {

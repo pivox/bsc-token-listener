@@ -81,15 +81,9 @@ function report(verdict: TokenRiskReport['verdict'] = 'ALLOW'): TokenRiskReport 
 }
 
 test('reprend RISK_CHECKING jusqu’à l’achat avec un rapport ALLOW persisté', async () => {
-  const savedSessions: TokenSession[] = [];
   const savedReports: TokenRiskReport[] = [];
   let buyCalls = 0;
   const service = new RecoveryIntentService({
-    sessions: {
-      save: async (value) => {
-        savedSessions.push(structuredClone(value));
-      },
-    },
     reports: {
       save: async (value) => {
         savedReports.push(structuredClone(value));
@@ -100,6 +94,7 @@ test('reprend RISK_CHECKING jusqu’à l’achat avec un rapport ALLOW persisté
     amounts: { resolve: async () => 100n },
     executor: {
       buy: async () => {
+        assert.equal(savedReports.length, 1);
         buyCalls += 1;
         return {
           mode: 'dry-run',
@@ -120,7 +115,6 @@ test('reprend RISK_CHECKING jusqu’à l’achat avec un rapport ALLOW persisté
   const resumed = await service.resumeRiskAndBuy(session('RISK_CHECKING'));
 
   assert.equal(savedReports.length, 1);
-  assert.equal(savedSessions.some((value) => value.status === 'BUY_PENDING'), true);
   assert.equal(buyCalls, 1);
   assert.equal(resumed.status, 'HOLDING');
 });
@@ -130,7 +124,6 @@ test('refuse un achat de reprise sans rapport ALLOW', async () => {
   const current = session('BUY_PENDING');
   current.riskReportId = 'report';
   const service = new RecoveryIntentService({
-    sessions: { save: async () => undefined },
     reports: {
       save: async () => undefined,
       findById: async () => report('REVIEW'),
@@ -155,4 +148,34 @@ test('refuse un achat de reprise sans rapport ALLOW', async () => {
   assert.equal(buyCalls, 0);
   assert.equal(resumed.status, 'REJECTED');
   assert.match(resumed.rejectionReason ?? '', /ALLOW/u);
+});
+
+test('block-only refuse aussi un rapport BLOCK persisté', async () => {
+  let buyCalls = 0;
+  const current = session('BUY_PENDING');
+  current.riskReportId = 'report';
+  const service = new RecoveryIntentService({
+    reports: {
+      save: async () => undefined,
+      findById: async () => report('BLOCK'),
+    },
+    risk: { analyze: async () => report('BLOCK') },
+    amounts: { resolve: async () => 100n },
+    executor: {
+      buy: async () => {
+        buyCalls += 1;
+        throw new Error('achat interdit');
+      },
+      sell: async () => {
+        throw new Error('vente inattendue');
+      },
+    },
+    riskPolicy: 'block-only',
+    now: () => 3,
+  });
+
+  const resumed = await service.resumeBuy(current);
+
+  assert.equal(buyCalls, 0);
+  assert.equal(resumed.status, 'REJECTED');
 });

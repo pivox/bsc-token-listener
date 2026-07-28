@@ -1,12 +1,10 @@
 import type { EntryExecution, ExitExecution, TokenSession } from '../types/domain.js';
 import type { TokenRiskReport } from '../security/token-risk.types.js';
-import { requiresExecutionManualReview } from '../strategy/execution-failure-policy.js';
-import { errorMessage } from '../utils/error.js';
+import {
+  executionToReconcile,
+  requiresExecutionManualReview,
+} from '../strategy/execution-failure-policy.js';
 import type { RecoveryIntentExecutor } from './recovery.types.js';
-
-interface SessionStore {
-  save(session: TokenSession): Promise<void>;
-}
 
 interface RiskReportStore {
   save(report: TokenRiskReport): Promise<void>;
@@ -31,7 +29,6 @@ interface RecoveryTradeExecutor {
 }
 
 interface RecoveryIntentDependencies {
-  sessions: SessionStore;
   reports: RiskReportStore;
   risk: RiskAnalyzer;
   amounts: AmountResolver;
@@ -68,11 +65,9 @@ export class RecoveryIntentService implements RecoveryIntentExecutor {
         session.status = 'REJECTED';
         session.rejectionReason =
           `Reprise bloquée par TokenRiskReport ${report.verdict}.`;
-        await this.dependencies.sessions.save(session);
         return session;
       }
       session.status = 'BUY_PENDING';
-      await this.dependencies.sessions.save(session);
       return this.resumeBuy(session);
     } catch (error) {
       session.recovery = {
@@ -82,7 +77,6 @@ export class RecoveryIntentService implements RecoveryIntentExecutor {
         lastAttemptAtMs: this.now(),
       };
       session.updatedAtMs = this.now();
-      await this.dependencies.sessions.save(session);
       return session;
     }
   }
@@ -94,15 +88,14 @@ export class RecoveryIntentService implements RecoveryIntentExecutor {
     const report = session.riskReportId
       ? await this.dependencies.reports.findById(session.riskReportId)
       : null;
-    if (!report || (
-      this.dependencies.riskPolicy === 'allow-only'
-      && report.verdict !== 'ALLOW'
-    )) {
+    const blocked = report && this.dependencies.riskPolicy === 'allow-only'
+      ? report.verdict !== 'ALLOW'
+      : report?.verdict === 'BLOCK';
+    if (!report || blocked) {
       session.status = 'REJECTED';
       session.rejectionReason =
         'Reprise d’achat interdite sans TokenRiskReport ALLOW persisté.';
       session.updatedAtMs = this.now();
-      await this.dependencies.sessions.save(session);
       return session;
     }
     const amountInWei = await this.dependencies.amounts.resolve(
@@ -113,7 +106,6 @@ export class RecoveryIntentService implements RecoveryIntentExecutor {
       session.status = 'REJECTED';
       session.rejectionReason = 'Montant de reprise d’achat non admissible.';
       session.updatedAtMs = this.now();
-      await this.dependencies.sessions.save(session);
       return session;
     }
     try {
@@ -122,13 +114,15 @@ export class RecoveryIntentService implements RecoveryIntentExecutor {
       delete session.rejectionReason;
       delete session.unreconciledExecution;
     } catch (error) {
+      const unresolvedExecution = executionToReconcile(error);
+      if (unresolvedExecution) session.unreconciledExecution = unresolvedExecution;
       session.status = requiresExecutionManualReview(error)
         ? 'MANUAL_REVIEW'
         : 'REJECTED';
-      session.rejectionReason = `Reprise d’achat impossible: ${errorMessage(error)}`;
+      session.rejectionReason =
+        `Reprise d’achat impossible (${this.safeErrorType(error)}).`;
     }
     session.updatedAtMs = this.now();
-    await this.dependencies.sessions.save(session);
     return session;
   }
 
@@ -142,11 +136,15 @@ export class RecoveryIntentService implements RecoveryIntentExecutor {
       delete session.rejectionReason;
       delete session.unreconciledExecution;
     } catch (error) {
-      session.status = 'MANUAL_REVIEW';
-      session.rejectionReason = `Reprise de vente impossible: ${errorMessage(error)}`;
+      const unresolvedExecution = executionToReconcile(error);
+      if (unresolvedExecution) session.unreconciledExecution = unresolvedExecution;
+      session.status = requiresExecutionManualReview(error)
+        ? 'MANUAL_REVIEW'
+        : 'HOLDING';
+      session.rejectionReason =
+        `Reprise de vente impossible (${this.safeErrorType(error)}).`;
     }
     session.updatedAtMs = this.now();
-    await this.dependencies.sessions.save(session);
     return session;
   }
 

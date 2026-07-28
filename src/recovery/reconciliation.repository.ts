@@ -181,8 +181,8 @@ export class ReconciliationRepository implements ReconciliationStore {
         `UPDATE token_sessions
          SET status = $3,
              payload = $4::jsonb,
-             recovery_owner = NULL,
-             recovery_lease_until = NULL,
+             recovery_owner = CASE WHEN $7 THEN recovery_owner ELSE NULL END,
+             recovery_lease_until = CASE WHEN $7 THEN recovery_lease_until ELSE NULL END,
              recovery_error = $5,
              last_reconciled_at = NOW(),
              updated_at = NOW()
@@ -197,6 +197,7 @@ export class ReconciliationRepository implements ReconciliationStore {
           stringifyJson(decision.session),
           decision.reason,
           claimed.statusBefore,
+          decision.retainLease ?? false,
         ],
       );
       if (updated.rows.length !== 1) {

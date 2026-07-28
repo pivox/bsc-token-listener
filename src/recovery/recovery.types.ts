@@ -42,6 +42,7 @@ export interface RecoveryDecision {
   session: TokenSession;
   action: string;
   reason: string;
+  retainLease?: boolean;
   trade?: TradeRecord;
   transaction?: TradeTransactionRecord;
 }

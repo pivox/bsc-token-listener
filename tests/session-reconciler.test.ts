@@ -336,7 +336,10 @@ test('un approval confirmé reprend la vente sans rediffuser l’approval', asyn
   await reconciler.reconcile(current);
 
   assert.equal(intents.sellCalls, 1);
-  assert.equal(store.applied.at(-1)?.action, 'APPROVAL_CONFIRMED');
+  assert.equal(store.applied[0]?.action, 'APPROVAL_CONFIRMED');
+  assert.equal(store.applied[0]?.retainLease, true);
+  assert.equal(store.applied.at(-1)?.action, 'RESUME_INTENT');
+  assert.equal(store.applied.at(-1)?.session.status, 'CLOSED');
 });
 
 test('reconstruit un achat dry-run déjà simulé sans le rejouer', async () => {
