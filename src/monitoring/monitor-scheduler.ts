@@ -70,6 +70,10 @@ export class MonitorScheduler {
     return { ...this.status };
   }
 
+  waitForIdle(): Promise<void> {
+    return this.running ?? Promise.resolve();
+  }
+
   reconcile(): Promise<void> {
     if (this.running) {
       this.rerunRequested = true;
@@ -156,14 +160,29 @@ export class MonitorScheduler {
     let abandonedSessions = 0;
     let reservedFailedHoldingSlots = 0;
     for (const session of eligible) {
-      const activePairs = this.activePairKeys();
+      let activePairs = this.activePairKeys();
       const pairKey = session.pair.pair.toLowerCase();
       if (activePairs.has(pairKey)) continue;
+      if (this.dependencies.canStart && !this.dependencies.canStart()) break;
       if (
         activePairs.size + reservedFailedHoldingSlots
         >= this.dependencies.capacity
-      ) break;
-      if (this.dependencies.canStart && !this.dependencies.canStart()) break;
+      ) {
+        const preempted = session.status === 'HOLDING'
+          ? this.lowestPriorityActiveObservation(eligible)
+          : null;
+        if (!preempted) break;
+        await this.dependencies.stop(preempted.pair.pair);
+        logger.info(
+          {
+            pair: preempted.pair.pair,
+            preemptedBy: session.pair.pair,
+          },
+          'Moniteur d’observation libéré pour une position ouverte.',
+        );
+        this.rerunRequested = true;
+        activePairs = this.activePairKeys();
+      }
 
       try {
         await this.dependencies.start(session);
@@ -222,5 +241,19 @@ export class MonitorScheduler {
     return new Set(
       this.dependencies.activePairs().map((pair) => pair.toLowerCase()),
     );
+  }
+
+  private lowestPriorityActiveObservation(
+    eligible: readonly TokenSession[],
+  ): TokenSession | null {
+    const activePairs = this.activePairKeys();
+    return eligible
+      .filter(
+        (session) =>
+          session.status === 'WAITING_FIRST_BUY'
+          && activePairs.has(session.pair.pair.toLowerCase()),
+      )
+      .sort(compareMonitorPriority)
+      .at(-1) ?? null;
   }
 }

@@ -196,9 +196,12 @@ Le plafond n’est jamais augmenté automatiquement. Une erreur au démarrage d�
 listener laisse la session en file pour une nouvelle tentative. Un échec
 `WAITING_FIRST_BUY` n’empêche pas l’admission de la suivante ; un échec
 `HOLDING` réserve en revanche sa place afin qu’une position ouverte ne soit
-jamais évincée par une simple observation. Les sessions `WAITING_FIRST_BUY`
-expirent après `PAIR_MONITOR_TTL_MINUTES`, même sans avoir obtenu de listener.
-Les actifs ignorés et les sessions terminales sont retirés de la file.
+jamais évincée par une simple observation. Si une position `HOLDING` réapparaît
+après reprise alors que la capacité est pleine, elle préempte le listener
+`WAITING_FIRST_BUY` actif le moins prioritaire. Les sessions
+`WAITING_FIRST_BUY` expirent après `PAIR_MONITOR_TTL_MINUTES`, même sans avoir
+obtenu de listener. Les actifs ignorés et les sessions terminales sont retirés
+de la file.
 
 Le heartbeat et le dashboard exposent la capacité totale, les moniteurs actifs,
 la profondeur de file, les admissions échouées lors de la dernière passe et

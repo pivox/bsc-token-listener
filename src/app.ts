@@ -213,7 +213,8 @@ async function main(): Promise<void> {
     ignore: async (session) => {
       await engine.ignoreManually(session);
     },
-    canStart: () => !recovery.currentStatus.running,
+    canStart: () =>
+      monitorSchedulingEnabled && !recovery.currentStatus.running,
     start: startMonitor,
     stop: (pair) => stopMonitor(pair, false, false),
   });
@@ -398,8 +399,9 @@ async function main(): Promise<void> {
     shuttingDown = true;
     monitorSchedulingEnabled = false;
     logger.info({ signal }, 'Arrêt du bot.');
-    await recovery.stop();
     clearInterval(monitorQueueInterval);
+    await recovery.stop();
+    await monitorScheduler.waitForIdle();
     clearInterval(heartbeatInterval);
     pairListener.stop();
     for (const listener of monitors.values()) listener.stop();

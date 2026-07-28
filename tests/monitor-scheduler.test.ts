@@ -58,6 +58,8 @@ class Harness {
   readonly ignoredSessions: string[] = [];
   readonly startFailures = new Set<string>();
   allowStart = true;
+  startBarrier: Promise<void> | null = null;
+  onStart: (() => void) | null = null;
 
   scheduler(capacity = 1, now = 10_000): MonitorScheduler {
     return new MonitorScheduler({
@@ -82,6 +84,8 @@ class Harness {
       canStart: () => this.allowStart,
       start: async (value) => {
         this.starts.push(value.pair.pair);
+        this.onStart?.();
+        if (this.startBarrier) await this.startBarrier;
         if (this.startFailures.has(value.pair.pair)) {
           throw new Error('listener indisponible');
         }
@@ -305,4 +309,48 @@ test('réserve la capacité après l’échec d’une position HOLDING', async (
   assert.equal(scheduler.currentStatus.abandonedSessions, 1);
   assert.equal(scheduler.currentStatus.activeMonitors, 0);
   assert.equal(scheduler.currentStatus.waitingSessions, 2);
+});
+
+test('préempte une observation pour une position HOLDING', async () => {
+  const harness = new Harness();
+  const observation = session('1', 'WAITING_FIRST_BUY', 9_500);
+  const holding = session('2', 'HOLDING', 9_600);
+  harness.sessions = [observation, holding];
+  harness.active.add(observation.pair.pair);
+  const scheduler = harness.scheduler(1);
+
+  await scheduler.reconcile();
+
+  assert.deepEqual(harness.stops, [observation.pair.pair]);
+  assert.deepEqual(harness.starts, [holding.pair.pair]);
+  assert.equal(scheduler.currentStatus.activeMonitors, 1);
+  assert.equal(scheduler.currentStatus.waitingSessions, 1);
+});
+
+test('attend la fin d’une admission déjà engagée', async () => {
+  const harness = new Harness();
+  harness.sessions = [session('1', 'WAITING_FIRST_BUY', 9_500)];
+  let releaseStart!: () => void;
+  let signalStart!: () => void;
+  const startEntered = new Promise<void>((resolve) => {
+    signalStart = resolve;
+  });
+  harness.startBarrier = new Promise<void>((resolve) => {
+    releaseStart = resolve;
+  });
+  harness.onStart = signalStart;
+  const scheduler = harness.scheduler();
+
+  void scheduler.reconcile();
+  await startEntered;
+  let idle = false;
+  const drained = scheduler.waitForIdle().then(() => {
+    idle = true;
+  });
+  await Promise.resolve();
+  assert.equal(idle, false);
+
+  releaseStart();
+  await drained;
+  assert.equal(idle, true);
 });

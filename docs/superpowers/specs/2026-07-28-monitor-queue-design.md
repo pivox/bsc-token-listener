@@ -41,6 +41,10 @@ waiting candidate is attempted. A failed `HOLDING` admission reserves its slot
 for the pass: an open position can never lose safety priority to a lower
 priority observation.
 
+If an unmonitored `HOLDING` session appears while capacity is already occupied,
+the scheduler deterministically preempts the lowest-priority active
+`WAITING_FIRST_BUY` observation and admits the open position.
+
 The scheduler reserves a pair before awaiting listener startup. This prevents
 two local monitor starts for the same pair. Listener termination releases the
 reservation and triggers another serialized pass.
@@ -70,3 +74,5 @@ expiration, ignored removal, startup failure and capacity release.
 - Expiration is persisted before admission.
 - No RPC failure advances a blockchain checkpoint.
 - The monitor cap is never increased automatically.
+- Shutdown disables new admissions and drains the current scheduler pass before
+  listeners and storage are closed.
