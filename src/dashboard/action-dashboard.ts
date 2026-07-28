@@ -30,7 +30,7 @@ function envBoolean(name: string, fallback = false): boolean {
   return ['1', 'true', 'yes', 'on'].includes(value);
 }
 
-function injectControls(page: string, nonce: string, minimumScore: number): string {
+export function injectControls(page: string, nonce: string, minimumScore: number): string {
   const style = `<style nonce="${nonce}">
     .risk-settings { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 20px; padding: 15px 17px; border: 1px solid #6a5529; border-radius: 14px; background: rgba(71,52,19,.34); }
     .risk-settings-copy strong { display: block; margin-bottom: 5px; }
@@ -155,9 +155,7 @@ function injectControls(page: string, nonce: string, minimumScore: number): stri
         banner.classList.add('visible');
       }
       function canSell(token) {
-        return Boolean(token && token.entry && !token.exit
-          && (!token.unreconciledExecution || token.unreconciledExecution.step !== 'SELL')
-          && (token.status === 'HOLDING' || token.status === 'MANUAL_REVIEW'));
+        return Boolean(token && token.canSell);
       }
       function canIgnore(token) {
         if (!token || (token.entry && !token.exit)) return false;

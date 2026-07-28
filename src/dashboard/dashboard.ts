@@ -24,6 +24,7 @@ import {
   applyBasisPointReduction,
   calculatePnl,
 } from './dashboard-metrics.js';
+import { canManuallySell } from './action-policy.js';
 import { HeartbeatService } from '../heartbeat/heartbeat.js';
 import { renderDashboardPage } from './dashboard.page.js';
 
@@ -119,6 +120,7 @@ interface DashboardTokenView {
   firstBuyAt: string | null;
   failedTradeCount: number;
   error: string | null;
+  canSell: boolean;
   swaps: {
     total: number;
     buys: number;
@@ -558,6 +560,7 @@ export class DashboardService {
       firstBuyAt: session?.firstBuy ? isoDate(session.firstBuy.observedAtMs) : null,
       failedTradeCount: record.failedTradeCount,
       error,
+      canSell: canManuallySell(session),
       swaps: record.swaps,
       risk: {
         score: riskReport?.score ?? null,
