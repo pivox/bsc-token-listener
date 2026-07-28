@@ -93,6 +93,7 @@ async function main(): Promise<void> {
     runtimeRecoveryBarrier,
   );
   let synchronizeRecoveredSessions = async (): Promise<void> => {};
+  let activateRecoveredSessions = async (): Promise<void> => {};
   const reconciliationStore = new ReconciliationRepository();
   const recoveryIntents = new RecoveryIntentService({
     reports,
@@ -114,6 +115,7 @@ async function main(): Promise<void> {
       intervalMs: config.recoveryIntervalSeconds * 1_000,
       leaseMs: config.recoveryLeaseSeconds * 1_000,
       onPeriodicPassCompleted: () => synchronizeRecoveredSessions(),
+      onPeriodicBarrierReleased: () => activateRecoveredSessions(),
     },
     runtimeRecoveryBarrier,
   );
@@ -212,7 +214,11 @@ async function main(): Promise<void> {
       }
       refreshedByPair.delete(pairKey);
     }
-    for (const session of refreshedByPair.values()) await startMonitor(session);
+  };
+
+  activateRecoveredSessions = async (): Promise<void> => {
+    const refreshed = await sessions.loadActive();
+    for (const session of refreshed) await startMonitor(session);
   };
 
   const onPair = async (pair: PairInfo): Promise<void> => {

@@ -244,3 +244,38 @@ test('la resynchronisation termine avant de réveiller un listener', async () =>
   await Promise.all([periodic, listener]);
   assert.deepEqual(order, ['sync-start', 'sync-end', 'listener']);
 });
+
+test('active les nouveaux listeners uniquement après libération de la barrière', async () => {
+  const store = new MemoryStore();
+  const barrier = new RuntimeRecoveryBarrier();
+  const order: string[] = [];
+  const coordinator = new RecoveryCoordinator(
+    store,
+    { reconcile: async () => {} },
+    {
+      intervalMs: 30_000,
+      leaseMs: 60_000,
+      owner: 'worker',
+      onPeriodicPassCompleted: async () => {
+        order.push('sync-inside');
+      },
+      onPeriodicBarrierReleased: async () => {
+        order.push('activate-start');
+        await barrier.runListener(async () => {
+          order.push('listener-started');
+        });
+        order.push('activate-end');
+      },
+    },
+    barrier,
+  );
+
+  await coordinator.reconcilePeriodic();
+
+  assert.deepEqual(order, [
+    'sync-inside',
+    'activate-start',
+    'listener-started',
+    'activate-end',
+  ]);
+});

@@ -128,6 +128,16 @@ export class SwapEventRepository {
     );
   }
 
+  async release(eventId: string): Promise<void> {
+    await pool.query(
+      `UPDATE swap_events
+       SET processing_status = 'PENDING', processing_error = NULL, updated_at = NOW()
+       WHERE event_id = $1
+         AND processing_status = 'PROCESSING'`,
+      [eventId],
+    );
+  }
+
   async markFailed(eventId: string, error: string): Promise<void> {
     await pool.query(
       `UPDATE swap_events

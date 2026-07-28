@@ -16,6 +16,7 @@ interface RecoveryCoordinatorOptions {
   owner?: string;
   initialRetryMs?: number;
   onPeriodicPassCompleted?: () => Promise<void>;
+  onPeriodicBarrierReleased?: () => Promise<void>;
 }
 
 export interface RecoveryPassResult {
@@ -89,9 +90,13 @@ export class RecoveryCoordinator {
 
   reconcilePeriodic(): Promise<void> {
     if (this.periodicPass) return this.periodicPass;
-    const pass = this.runPass(
-      this.options.onPeriodicPassCompleted,
-    ).then(() => undefined).finally(() => {
+    const pass = (async () => {
+      try {
+        await this.runPass(this.options.onPeriodicPassCompleted);
+      } finally {
+        await this.options.onPeriodicBarrierReleased?.();
+      }
+    })().finally(() => {
       this.periodicPass = null;
     });
     this.periodicPass = pass;

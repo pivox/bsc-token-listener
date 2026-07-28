@@ -158,7 +158,13 @@ export class SwapListener {
       });
       if (!(await this.events.claim(event))) continue;
       try {
-        await this.engine.onSwap(this.session, event);
+        const consumed = await this.engine.onSwap(this.session, event);
+        if (!consumed) {
+          await this.events.release(event.id);
+          this.stop();
+          this.onTerminal(this.session.pair.pair);
+          return false;
+        }
         await this.events.markProcessed(event.id);
         if (!isSessionMonitorable(this.session)) {
           this.stop();
