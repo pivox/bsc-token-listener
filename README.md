@@ -83,6 +83,7 @@ RISK_PROBE_REQUIRED=true
 - `trades` : achats et ventes simulés ou réels ;
 - `trade_transactions` : étapes on-chain `BUY`, `APPROVE` et `SELL`, avec hash,
   nonce, wallet, reçu, gas et snapshots de soldes ;
+- `reconciliation_decisions` : décisions de reprise idempotentes et auditables ;
 - `token_risk_reports` : rapports complets ;
 - `listener_checkpoints` : reprise après coupure.
 
@@ -122,8 +123,51 @@ LEFT JOIN trade_transactions x ON x.trade_id = t.trade_id
 ORDER BY t.created_at DESC, x.created_at;
 ```
 
-La reprise automatique et périodique de ces enregistrements est volontairement
-réservée à l'issue #7.
+### Reprise après crash
+
+Au démarrage, le bot réconcilie toutes les sessions interrompues avant d’activer
+le listener `PairCreated` et les listeners `Swap`. Une seule instance exécute une
+passe à la fois grâce à un verrou PostgreSQL ; les sessions sont réclamées avec
+un bail expirant et chaque session n’est traitée qu’une fois par passe.
+
+La réconciliation observe la blockchain en lecture seule avant toute décision :
+
+- une transaction `pending` est laissée en attente sans rediffusion ;
+- un reçu confirmé reconstruit les montants depuis les soldes et le gas ;
+- un revert applique un état métier sûr ;
+- un hash absent, une mesure impossible ou une exécution ambiguë passe en
+  `MANUAL_REVIEW` ;
+- une intention sans transaction enfant peut reprendre automatiquement, mais un
+  achat exige toujours un `TokenRiskReport` persisté et compatible avec la
+  politique de risque.
+
+Une erreur RPC ne fait avancer aucun checkpoint blockchain et son diagnostic ne
+conserve que le type d’erreur. Après la barrière initiale, une passe périodique
+non chevauchante s’exécute selon :
+
+```env
+RECOVERY_INTERVAL_SECONDS=30
+RECOVERY_LEASE_SECONDS=60
+```
+
+Le heartbeat et le dashboard affichent le nombre de sessions en reprise, le
+nombre de revues manuelles, la dernière passe terminée et le dernier type
+d’erreur sûr. Pour investiguer une revue manuelle :
+
+```sql
+SELECT
+  pair_address,
+  status,
+  recovery_attempts,
+  recovery_error,
+  last_reconciled_at
+FROM token_sessions
+WHERE status = 'MANUAL_REVIEW'
+ORDER BY updated_at DESC;
+```
+
+Ne jamais rediffuser manuellement une transaction tant que son hash et son reçu
+n’ont pas été vérifiés sur le réseau configuré.
 
 ## Dashboard minimal
 
@@ -134,6 +178,7 @@ Le bot expose une interface de supervision **strictement en lecture seule**. Ell
 - les positions ouvertes et leur progression vers le nombre cible d’achats ;
 - le PnL latent estimé et le profit réalisé en BNB ;
 - le score `TokenRiskReport`, les taxes estimées, les swaps observés et une chronologie ;
+- l’état et le backlog de la réconciliation après crash ;
 - les liens vers BscScan pour le token, la paire et les transactions.
 
 Configuration par défaut :

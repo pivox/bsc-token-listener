@@ -55,6 +55,10 @@ export interface ReconciliationStore {
   applyDecision(claimed: ClaimedRecovery, decision: RecoveryDecision): Promise<void>;
   tryAcquirePassLock(): Promise<boolean>;
   releasePassLock(): Promise<void>;
+  getBacklogCounts(): Promise<{
+    pendingSessions: number;
+    manualReviewSessions: number;
+  }>;
 }
 
 export interface RecoveryIntentExecutor {

@@ -1,6 +1,7 @@
 import { errorMessage } from '../utils/error.js';
 import type { CheckpointRepository, SessionRepository } from '../storage/repositories.js';
 import type { ExecutionMode } from '../types/domain.js';
+import type { RecoveryCoordinatorStatus } from '../recovery/recovery-coordinator.js';
 
 export type RpcStatus = 'up' | 'down';
 
@@ -19,11 +20,23 @@ export interface HeartbeatSnapshot {
   activeSessions: number;
   http: RpcHealth;
   webSocket: RpcHealth;
+  recovery: {
+    running: boolean;
+    lastCompletedAt: string | null;
+    lastErrorType: string | null;
+    lastProcessedSessions: number;
+    pendingSessions: number;
+    manualReviewSessions: number;
+  };
 }
 
 export interface HeartbeatDependencies {
   getHttpLatestBlock: () => Promise<bigint>;
   getWsLatestBlock: () => Promise<bigint>;
+}
+
+interface RecoveryStatusProvider {
+  readonly currentStatus: RecoveryCoordinatorStatus;
 }
 
 export class HeartbeatService {
@@ -34,6 +47,7 @@ export class HeartbeatService {
     private readonly sessions: SessionRepository,
     private readonly dependencies: HeartbeatDependencies,
     private readonly executionMode: ExecutionMode,
+    private readonly recovery?: RecoveryStatusProvider,
   ) {}
 
   get currentSnapshot(): HeartbeatSnapshot | null {
@@ -64,9 +78,24 @@ export class HeartbeatService {
       activeSessions,
       http,
       webSocket,
+      recovery: this.recoverySnapshot(),
     };
 
     return this.snapshot;
+  }
+
+  private recoverySnapshot(): HeartbeatSnapshot['recovery'] {
+    const status = this.recovery?.currentStatus;
+    return {
+      running: status?.running ?? false,
+      lastCompletedAt: status?.lastCompletedAtMs
+        ? new Date(status.lastCompletedAtMs).toISOString()
+        : null,
+      lastErrorType: status?.lastErrorType ?? null,
+      lastProcessedSessions: status?.lastProcessedSessions ?? 0,
+      pendingSessions: status?.pendingSessions ?? 0,
+      manualReviewSessions: status?.manualReviewSessions ?? 0,
+    };
   }
 
   private async fetchRpcHealth(

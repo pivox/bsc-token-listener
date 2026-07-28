@@ -109,6 +109,13 @@ class MemoryStore implements ReconciliationStore {
   }
 
   async releasePassLock(): Promise<void> {}
+
+  async getBacklogCounts(): Promise<{
+    pendingSessions: number;
+    manualReviewSessions: number;
+  }> {
+    return { pendingSessions: 0, manualReviewSessions: 0 };
+  }
 }
 
 class FakeGateway implements ReconciliationGateway {

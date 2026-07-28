@@ -19,6 +19,8 @@ interface RecoveryCoordinatorOptions {
 export interface RecoveryPassResult {
   acquired: boolean;
   processedSessions: number;
+  pendingSessions: number;
+  manualReviewSessions: number;
   completedAtMs: number;
 }
 
@@ -27,6 +29,8 @@ export interface RecoveryCoordinatorStatus {
   lastCompletedAtMs: number | null;
   lastErrorType: string | null;
   lastProcessedSessions: number;
+  pendingSessions: number;
+  manualReviewSessions: number;
 }
 
 function safeErrorType(error: unknown): string {
@@ -44,6 +48,8 @@ export class RecoveryCoordinator {
     lastCompletedAtMs: null,
     lastErrorType: null,
     lastProcessedSessions: 0,
+    pendingSessions: 0,
+    manualReviewSessions: 0,
   };
 
   constructor(
@@ -93,6 +99,8 @@ export class RecoveryCoordinator {
           lastCompletedAtMs: result.completedAtMs,
           lastErrorType: null,
           lastProcessedSessions: result.processedSessions,
+          pendingSessions: result.pendingSessions,
+          manualReviewSessions: result.manualReviewSessions,
         };
         return result;
       })
@@ -126,6 +134,8 @@ export class RecoveryCoordinator {
       return {
         acquired: false,
         processedSessions: 0,
+        pendingSessions: this.status.pendingSessions,
+        manualReviewSessions: this.status.manualReviewSessions,
         completedAtMs: Date.now(),
       };
     }
@@ -142,9 +152,11 @@ export class RecoveryCoordinator {
         processedPairs.push(claimed.snapshot.session.pair.pair);
         await this.reconciler.reconcile(claimed);
       }
+      const backlog = await this.store.getBacklogCounts();
       return {
         acquired: true,
         processedSessions: processedPairs.length,
+        ...backlog,
         completedAtMs: Date.now(),
       };
     } finally {

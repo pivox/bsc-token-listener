@@ -30,6 +30,16 @@ class MemoryStore implements ReconciliationStore {
   async releasePassLock(): Promise<void> {
     this.lockReleased += 1;
   }
+
+  async getBacklogCounts(): Promise<{
+    pendingSessions: number;
+    manualReviewSessions: number;
+  }> {
+    return {
+      pendingSessions: this.claims.length,
+      manualReviewSessions: 0,
+    };
+  }
 }
 
 function deferred(): {

@@ -84,7 +84,7 @@ export class ReconciliationRepository implements ReconciliationStore {
         `WITH candidate AS (
            SELECT pair_address
            FROM token_sessions
-           WHERE status IN ('RISK_CHECKING', 'BUY_PENDING', 'SELL_PENDING', 'MANUAL_REVIEW')
+           WHERE status IN ('RISK_CHECKING', 'BUY_PENDING', 'SELL_PENDING')
              AND (recovery_lease_until IS NULL OR recovery_lease_until < NOW())
              AND NOT (pair_address = ANY($3::text[]))
            ORDER BY updated_at
@@ -137,6 +137,34 @@ export class ReconciliationRepository implements ReconciliationStore {
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async getBacklogCounts(): Promise<{
+    pendingSessions: number;
+    manualReviewSessions: number;
+  }> {
+    const client = await this.database.connect();
+    try {
+      const result = await client.query<{
+        pending_sessions: string;
+        manual_review_sessions: string;
+      }>(
+        `SELECT
+           COUNT(*) FILTER (
+             WHERE status IN ('RISK_CHECKING', 'BUY_PENDING', 'SELL_PENDING')
+           )::text AS pending_sessions,
+           COUNT(*) FILTER (
+             WHERE status = 'MANUAL_REVIEW'
+           )::text AS manual_review_sessions
+         FROM token_sessions`,
+      );
+      return {
+        pendingSessions: Number(result.rows[0]?.pending_sessions ?? '0'),
+        manualReviewSessions: Number(result.rows[0]?.manual_review_sessions ?? '0'),
+      };
     } finally {
       client.release();
     }

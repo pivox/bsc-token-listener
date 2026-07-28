@@ -72,15 +72,6 @@ async function main(): Promise<void> {
   const checkpoints = new CheckpointRepository();
   const ignoredAssets = new IgnoredAssetRepository();
   const riskSettings = new RiskSettingsStore();
-  const heartbeat = new HeartbeatService(
-    checkpoints,
-    sessions,
-    {
-      getHttpLatestBlock: () => publicClient.getBlockNumber(),
-      getWsLatestBlock: () => wsClient.getBlockNumber(),
-    },
-    config.executionMode,
-  );
   const metadataService = new TokenMetadataService(publicClient);
   const risk = new TokenRiskService(publicClient, riskSettings);
   const executor = new TradeExecutor(trades);
@@ -91,6 +82,37 @@ async function main(): Promise<void> {
     },
   });
   const engine = new SessionEngine(sessions, reports, risk, executor, amountService);
+  const reconciliationStore = new ReconciliationRepository();
+  const recoveryIntents = new RecoveryIntentService({
+    sessions,
+    reports,
+    risk,
+    amounts: amountService,
+    executor,
+    riskPolicy: config.riskPolicy,
+  });
+  const recovery = new RecoveryCoordinator(
+    reconciliationStore,
+    new SessionReconciler(
+      reconciliationStore,
+      new ViemReconciliationGateway(),
+      recoveryIntents,
+    ),
+    {
+      intervalMs: config.recoveryIntervalSeconds * 1_000,
+      leaseMs: config.recoveryLeaseSeconds * 1_000,
+    },
+  );
+  const heartbeat = new HeartbeatService(
+    checkpoints,
+    sessions,
+    {
+      getHttpLatestBlock: () => publicClient.getBlockNumber(),
+      getWsLatestBlock: () => wsClient.getBlockNumber(),
+    },
+    config.executionMode,
+    recovery,
+  );
   const monitors = new Map<string, SwapListener>();
   const activeSessionsByToken = new Map<string, TokenSession>();
   const activeTokenByPair = new Map<string, string>();
@@ -151,28 +173,6 @@ async function main(): Promise<void> {
       throw error;
     }
   };
-
-  const reconciliationStore = new ReconciliationRepository();
-  const recoveryIntents = new RecoveryIntentService({
-    sessions,
-    reports,
-    risk,
-    amounts: amountService,
-    executor,
-    riskPolicy: config.riskPolicy,
-  });
-  const recovery = new RecoveryCoordinator(
-    reconciliationStore,
-    new SessionReconciler(
-      reconciliationStore,
-      new ViemReconciliationGateway(),
-      recoveryIntents,
-    ),
-    {
-      intervalMs: config.recoveryIntervalSeconds * 1_000,
-      leaseMs: config.recoveryLeaseSeconds * 1_000,
-    },
-  );
 
   const onPair = async (pair: PairInfo): Promise<void> => {
     const key = pair.pair.toLowerCase();
@@ -256,6 +256,11 @@ async function main(): Promise<void> {
         executionMode: snapshot.executionMode,
         httpStatus: snapshot.http.status,
         wsStatus: snapshot.webSocket.status,
+        recoveryRunning: snapshot.recovery.running,
+        recoveryPendingSessions: snapshot.recovery.pendingSessions,
+        recoveryManualReviewSessions: snapshot.recovery.manualReviewSessions,
+        recoveryLastCompletedAt: snapshot.recovery.lastCompletedAt,
+        recoveryLastErrorType: snapshot.recovery.lastErrorType,
       },
       'Heartbeat.',
     );

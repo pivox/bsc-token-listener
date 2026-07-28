@@ -218,6 +218,14 @@ interface DashboardSnapshot {
       blockNumber: string | null;
       error: string | null;
     };
+    recovery: {
+      running: boolean;
+      lastCompletedAt: string | null;
+      lastErrorType: string | null;
+      lastProcessedSessions: number;
+      pendingSessions: number;
+      manualReviewSessions: number;
+    };
   } | null;
   tokens: DashboardTokenView[];
 }

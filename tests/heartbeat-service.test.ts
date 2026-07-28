@@ -30,6 +30,18 @@ test('collecte et expose un heartbeat complet avec RPC disponibles', async () =>
       getWsLatestBlock: async () => 12_346n,
     },
     'dry-run',
+    {
+      get currentStatus() {
+        return {
+          running: false,
+          lastCompletedAtMs: 1_753_700_000_000,
+          lastErrorType: null,
+          lastProcessedSessions: 2,
+          pendingSessions: 1,
+          manualReviewSessions: 3,
+        };
+      },
+    },
   );
 
   const snapshot = await heartbeat.refresh(2);
@@ -45,6 +57,13 @@ test('collecte et expose un heartbeat complet avec RPC disponibles', async () =>
   assert.equal(snapshot.webSocket.blockNumber, '12346');
   assert.equal(snapshot.http.error, null);
   assert.equal(snapshot.webSocket.error, null);
+  assert.equal(snapshot.recovery.pendingSessions, 1);
+  assert.equal(snapshot.recovery.manualReviewSessions, 3);
+  assert.equal(snapshot.recovery.lastProcessedSessions, 2);
+  assert.equal(
+    snapshot.recovery.lastCompletedAt,
+    new Date(1_753_700_000_000).toISOString(),
+  );
   assert.equal(heartbeat.currentSnapshot?.activeSessions, 4);
 });
 
