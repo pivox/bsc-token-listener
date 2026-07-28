@@ -35,6 +35,7 @@ interface ReorgFixtureState {
 
 class StatefulReorgDatabase {
   readonly calls: Array<{ sql: string; values?: unknown[] }> = [];
+  connectCalls = 0;
   readonly state: ReorgFixtureState = {
     auditCount: 0,
     auditStatus: null,
@@ -49,6 +50,7 @@ class StatefulReorgDatabase {
   private pending: ReorgFixtureState | null = null;
 
   async connect(): Promise<this> {
+    this.connectCalls += 1;
     return this;
   }
 
@@ -173,14 +175,18 @@ class StatefulReorgDatabase {
       && normalized.includes("SET status = 'RECOVERED'")
     ) {
       if (
-        !normalized.includes("AND status = 'RECONCILING'")
+        !normalized.includes("status = 'RECONCILING'")
         || staged.auditStatus === 'RECONCILING'
       ) {
         staged.auditStatus = 'RECOVERED';
         staged.replayedEvents = Number(values?.[1]);
       }
       staged.mutations.push('complete');
-      return { rows: [] };
+      return {
+        rows: normalized.includes('SELECT status') && staged.auditCount > 0
+          ? [{ status: staged.auditStatus }] as T[]
+          : [],
+      };
     }
     if (
       normalized.includes('UPDATE chain_reorgs')
@@ -188,7 +194,7 @@ class StatefulReorgDatabase {
     ) {
       if (
         (
-          !normalized.includes("AND status = 'RECONCILING'")
+          !normalized.includes("status = 'RECONCILING'")
           && staged.auditStatus !== 'RECOVERED'
         )
         || staged.auditStatus === 'RECONCILING'
@@ -197,7 +203,11 @@ class StatefulReorgDatabase {
         Object.assign(staged.details, JSON.parse(String(values?.[1])));
       }
       staged.mutations.push('manual');
-      return { rows: [] };
+      return {
+        rows: normalized.includes('SELECT status') && staged.auditCount > 0
+          ? [{ status: staged.auditStatus }] as T[]
+          : [],
+      };
     }
     if (
       normalized.startsWith('UPDATE')
@@ -546,6 +556,99 @@ test('rewind un reorg superficiel dans une transaction ordonnée et retourne un 
   );
 });
 
+for (const [name, invalidReorg] of [
+  ['ancêtre absent', { ...SHALLOW_REORG, ancestor: null }],
+  ['depth nul', { ...SHALLOW_REORG, depth: null }],
+  ['depth zéro', { ...SHALLOW_REORG, depth: 0 }],
+  ['depth décimal', { ...SHALLOW_REORG, depth: 1.5 }],
+  ['depth supérieur à 128', { ...SHALLOW_REORG, depth: 129 }],
+  ['depth incohérent', { ...SHALLOW_REORG, depth: 1 }],
+  [
+    'numéro ancêtre non bigint',
+    {
+      ...SHALLOW_REORG,
+      ancestor: { ...SHALLOW_REORG.ancestor!, number: 10 },
+    },
+  ],
+  [
+    'numéro ancêtre négatif',
+    {
+      ...SHALLOW_REORG,
+      ancestor: { ...SHALLOW_REORG.ancestor!, number: -1n },
+    },
+  ],
+  [
+    'hash ancêtre invalide',
+    {
+      ...SHALLOW_REORG,
+      ancestor: { ...SHALLOW_REORG.ancestor!, hash: 'invalid' },
+    },
+  ],
+  [
+    'parentHash ancêtre invalide',
+    {
+      ...SHALLOW_REORG,
+      ancestor: { ...SHALLOW_REORG.ancestor!, parentHash: 'invalid' },
+    },
+  ],
+  [
+    'numéro ancien tip négatif',
+    { ...SHALLOW_REORG, oldTip: { ...SHALLOW_REORG.oldTip, number: -1n } },
+  ],
+  [
+    'hash ancien tip invalide',
+    { ...SHALLOW_REORG, oldTip: { ...SHALLOW_REORG.oldTip, hash: 'invalid' } },
+  ],
+  [
+    'parentHash ancien tip invalide',
+    {
+      ...SHALLOW_REORG,
+      oldTip: { ...SHALLOW_REORG.oldTip, parentHash: 'invalid' },
+    },
+  ],
+  [
+    'numéro nouveau tip non bigint',
+    { ...SHALLOW_REORG, newTip: { ...SHALLOW_REORG.newTip, number: 13 } },
+  ],
+  [
+    'hash nouveau tip invalide',
+    { ...SHALLOW_REORG, newTip: { ...SHALLOW_REORG.newTip, hash: 'invalid' } },
+  ],
+  [
+    'parentHash nouveau tip invalide',
+    {
+      ...SHALLOW_REORG,
+      newTip: { ...SHALLOW_REORG.newTip, parentHash: 'invalid' },
+    },
+  ],
+  [
+    'ancêtre non antérieur',
+    {
+      ...SHALLOW_REORG,
+      ancestor: { ...SHALLOW_REORG.ancestor!, number: 12n },
+    },
+  ],
+  [
+    'nouveau tip antérieur à l’ancien',
+    { ...SHALLOW_REORG, newTip: { ...SHALLOW_REORG.newTip, number: 11n } },
+  ],
+] as Array<[string, unknown]>) {
+  test(`refuse ${name} avant toute connexion ou requête`, async () => {
+    const database = new StatefulReorgDatabase();
+    const repository = new CanonicalChainRepository(database);
+
+    await assert.rejects(
+      repository.rewindToAncestor(
+        invalidReorg as ReorgReconciliation,
+      ),
+      /rollback automatique/u,
+    );
+
+    assert.equal(database.connectCalls, 0);
+    assert.equal(database.calls.length, 0);
+  });
+}
+
 for (const failure of [
   'INSERT INTO chain_reorgs',
   'FROM discovered_tokens',
@@ -633,10 +736,11 @@ test('un reorg profond persiste seulement un audit manuel sans ancêtre', async 
 test('complete et manual review écrivent compte et détail sûr sans régresser RECOVERED', async () => {
   const database = new StatefulReorgDatabase();
   const repository = new CanonicalChainRepository(database);
+  const impact = await repository.rewindToAncestor(SHALLOW_REORG);
 
-  await repository.completeReorg('reorg-id', 7);
+  await repository.completeReorg(impact.reorgId, 7);
   await repository.requireManualReview(
-    'reorg-id',
+    impact.reorgId,
     'WALLET_CONSEQUENCE_REQUIRES_REVIEW',
   );
 
@@ -644,14 +748,14 @@ test('complete et manual review écrivent compte et détail sûr sans régresser
     ({ sql }) => sql.includes("status = 'RECOVERED'"),
   );
   const manual = database.calls.find(
-    ({ sql }) => sql.includes("'MANUAL_REVIEW'"),
+    ({ sql }) => sql.includes("SET status = 'MANUAL_REVIEW'"),
   );
-  assert.deepEqual(complete?.values, ['reorg-id', 7]);
+  assert.deepEqual(complete?.values, [impact.reorgId, 7]);
   assert.deepEqual(manual?.values, [
-    'reorg-id',
+    impact.reorgId,
     '{"reason":"WALLET_CONSEQUENCE_REQUIRES_REVIEW"}',
   ]);
-  assert.match(manual?.sql ?? '', /AND status = 'RECONCILING'/u);
+  assert.match(manual?.sql ?? '', /status = 'RECONCILING'/u);
 });
 
 test('un retry de rewind conserve un audit MANUAL_REVIEW terminal', async () => {
@@ -699,4 +803,52 @@ test('requireManualReview laisse un audit RECOVERED intégralement inchangé', a
   assert.equal(database.state.auditStatus, 'RECOVERED');
   assert.equal(database.state.replayedEvents, 4);
   assert.deepEqual(database.state.details, detailsBefore);
+});
+
+for (const operation of ['complete', 'manual'] as const) {
+  test(`${operation} rejette atomiquement un audit absent`, async () => {
+    const database = new StatefulReorgDatabase();
+    const repository = new CanonicalChainRepository(database);
+
+    const call = operation === 'complete'
+      ? repository.completeReorg('missing-reorg', 1)
+      : repository.requireManualReview(
+        'missing-reorg',
+        'SESSION_RECONCILIATION_FAILED',
+      );
+    await assert.rejects(call, /Audit de reorg introuvable/u);
+
+    assert.equal(database.calls.at(-1)?.sql, 'ROLLBACK');
+    const mutation = database.calls.find(({ sql }) =>
+      sql.includes('UPDATE chain_reorgs')
+    );
+    assert.match(mutation?.sql ?? '', /WITH existing AS/u);
+    assert.match(mutation?.sql ?? '', /updated AS/u);
+    assert.match(mutation?.sql ?? '', /RETURNING .*status/u);
+  });
+}
+
+test('complete et manual mettent atomiquement à jour un audit RECONCILING', async () => {
+  const completeDatabase = new StatefulReorgDatabase();
+  const completeRepository = new CanonicalChainRepository(completeDatabase);
+  const completeImpact = await completeRepository.rewindToAncestor(SHALLOW_REORG);
+
+  await completeRepository.completeReorg(completeImpact.reorgId, 6);
+
+  assert.equal(completeDatabase.state.auditStatus, 'RECOVERED');
+  assert.equal(completeDatabase.state.replayedEvents, 6);
+
+  const manualDatabase = new StatefulReorgDatabase();
+  const manualRepository = new CanonicalChainRepository(manualDatabase);
+  const manualImpact = await manualRepository.rewindToAncestor(SHALLOW_REORG);
+
+  await manualRepository.requireManualReview(
+    manualImpact.reorgId,
+    'SESSION_RECONCILIATION_FAILED',
+  );
+
+  assert.equal(manualDatabase.state.auditStatus, 'MANUAL_REVIEW');
+  assert.deepEqual(manualDatabase.state.details, {
+    reason: 'SESSION_RECONCILIATION_FAILED',
+  });
 });

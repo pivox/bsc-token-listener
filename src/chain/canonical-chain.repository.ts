@@ -53,6 +53,10 @@ interface ReorgAuditUpsertRow {
   details: unknown;
 }
 
+interface ReorgAuditStatusRow {
+  status: ChainReorgStatus;
+}
+
 interface DiscoveryImpactRow {
   pair_address: string | null;
 }
@@ -128,6 +132,19 @@ function compareSwapRows(left: SwapImpactRow, right: SwapImpactRow): number {
     || left.event_id.localeCompare(right.event_id);
 }
 
+function isValidCanonicalBlock(value: unknown): value is CanonicalBlock {
+  if (typeof value !== 'object' || value === null) return false;
+  const block = value as Record<string, unknown>;
+  return (
+    typeof block.number === 'bigint'
+    && block.number >= 0n
+    && typeof block.hash === 'string'
+    && isHash(block.hash)
+    && typeof block.parentHash === 'string'
+    && isHash(block.parentHash)
+  );
+}
+
 function validateShallowReorg(
   reorg: ReorgReconciliation,
 ): asserts reorg is ReorgReconciliation & {
@@ -135,13 +152,22 @@ function validateShallowReorg(
   depth: number;
 } {
   if (
-    reorg.ancestor === null
+    typeof reorg !== 'object'
+    || reorg === null
+    || !isValidCanonicalBlock(reorg.ancestor)
+    || !isValidCanonicalBlock(reorg.oldTip)
+    || !isValidCanonicalBlock(reorg.newTip)
     || reorg.depth === null
     || !Number.isSafeInteger(reorg.depth)
     || reorg.depth < 1
     || reorg.depth > 128
+    || reorg.ancestor.number >= reorg.oldTip.number
+    || BigInt(reorg.depth) !== reorg.oldTip.number - reorg.ancestor.number
+    || reorg.newTip.number < reorg.oldTip.number
   ) {
-    throw new Error('Un rollback automatique exige un ancêtre et une profondeur entre 1 et 128.');
+    throw new Error(
+      'Un rollback automatique exige des blocs valides et une profondeur cohérente entre 1 et 128.',
+    );
   }
 }
 
@@ -467,13 +493,31 @@ export class CanonicalChainRepository {
       throw new Error('Le nombre d’événements rejoués doit être un entier positif.');
     }
     await this.withTransaction(async (client) => {
-      await client.query(
-        `UPDATE chain_reorgs
-         SET status = 'RECOVERED', replayed_events = $2
-         WHERE reorg_id = $1
-           AND status = 'RECONCILING'`,
+      const result = await client.query<ReorgAuditStatusRow>(
+        `WITH existing AS (
+           SELECT reorg_id, status
+           FROM chain_reorgs
+           WHERE reorg_id = $1
+           FOR UPDATE
+         ),
+         updated AS (
+           UPDATE chain_reorgs AS audit
+           SET status = 'RECOVERED', replayed_events = $2
+           FROM existing
+           WHERE audit.reorg_id = existing.reorg_id
+             AND existing.status = 'RECONCILING'
+           RETURNING audit.status AS status
+         )
+         SELECT status FROM updated
+         UNION ALL
+         SELECT status FROM existing
+         WHERE status <> 'RECONCILING'
+         LIMIT 1`,
         [reorgIdValue, replayedEvents],
       );
+      if (!result.rows[0]) {
+        throw new Error('Audit de reorg introuvable.');
+      }
     });
   }
 
@@ -483,14 +527,32 @@ export class CanonicalChainRepository {
   ): Promise<void> {
     validateManualReason(reason);
     await this.withTransaction(async (client) => {
-      await client.query(
-        `UPDATE chain_reorgs
-         SET status = 'MANUAL_REVIEW',
-             details = details || $2::jsonb
-         WHERE reorg_id = $1
-           AND status = 'RECONCILING'`,
+      const result = await client.query<ReorgAuditStatusRow>(
+        `WITH existing AS (
+           SELECT reorg_id, status
+           FROM chain_reorgs
+           WHERE reorg_id = $1
+           FOR UPDATE
+         ),
+         updated AS (
+           UPDATE chain_reorgs AS audit
+           SET status = 'MANUAL_REVIEW',
+               details = details || $2::jsonb
+           FROM existing
+           WHERE audit.reorg_id = existing.reorg_id
+             AND existing.status = 'RECONCILING'
+           RETURNING audit.status AS status
+         )
+         SELECT status FROM updated
+         UNION ALL
+         SELECT status FROM existing
+         WHERE status <> 'RECONCILING'
+         LIMIT 1`,
         [reorgIdValue, stringifyJson({ reason })],
       );
+      if (!result.rows[0]) {
+        throw new Error('Audit de reorg introuvable.');
+      }
     });
   }
 
