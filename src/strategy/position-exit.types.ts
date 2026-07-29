@@ -31,6 +31,7 @@ export interface PositionExitState {
   nextEvaluationAtMs?: number;
   trailingArmedAtMs?: number;
   lastProbeStatus?: SellabilityStatus;
+  lastSellTaxBps?: number;
   pendingDecisionId?: string;
   lastPrimaryRule?: ExitRuleCode;
   lastReason?: string;

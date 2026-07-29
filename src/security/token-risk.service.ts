@@ -9,35 +9,21 @@ import {
 } from 'viem';
 import { ownableAbi } from '../abi/ownable.abi.js';
 import { pancakePairAbi } from '../abi/pancake-pair.abi.js';
-import { safetyProbeAbi } from '../abi/safety-probe.abi.js';
 import { config } from '../config/env.js';
-import { account } from '../rpc/clients.js';
 import type { PairInfo, TokenMetadata } from '../types/domain.js';
 import { errorMessage } from '../utils/error.js';
 import { scanSensitiveSelectors } from './bytecode-scanner.js';
 import { evaluateRisk } from './risk-evaluator.js';
 import { RiskSettingsStore } from './risk-settings.store.js';
+import {
+  SafetyProbeService,
+  type SafetyProbeResult,
+} from './safety-probe.service.js';
 import type { RiskCheck, TokenRiskReport } from './token-risk.types.js';
 
 const EIP1967_IMPLEMENTATION_SLOT =
   '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc' as Hex;
 const DEAD = '0x000000000000000000000000000000000000dEaD' as Address;
-
-interface ProbeResult {
-  buyTaxBps: number;
-  sellTaxBps: number;
-  roundTripLossBps: number;
-  quotedTokens: bigint;
-  receivedTokens: bigint;
-  quotedNative: bigint;
-  recoveredNative: bigint;
-}
-
-function bpsLoss(expected: bigint, actual: bigint): number {
-  if (expected <= 0n) return 10_000;
-  if (actual >= expected) return 0;
-  return Number(((expected - actual) * 10_000n) / expected);
-}
 
 function storageAddress(storage: Hex | undefined): Address | null {
   if (!storage || storage === '0x') return null;
@@ -50,6 +36,7 @@ export class TokenRiskService {
   constructor(
     private readonly client: PublicClient,
     private readonly riskSettings: RiskSettingsStore,
+    private readonly safetyProbe = new SafetyProbeService(client),
   ) {}
 
   async analyze(input: {
@@ -200,9 +187,9 @@ export class TokenRiskService {
       evidence: { lpBurnedBps },
     });
 
-    let probe: ProbeResult | null = null;
+    let probe: SafetyProbeResult | null = null;
     try {
-      probe = await this.runProbe(input.pair);
+      probe = await this.safetyProbe.probe(input.pair);
       const probeFailure =
         probe.buyTaxBps > config.riskMaxBuyTaxBps ||
         probe.sellTaxBps > config.riskMaxSellTaxBps ||
@@ -296,30 +283,4 @@ export class TokenRiskService {
     }
   }
 
-  private async runProbe(pair: PairInfo): Promise<ProbeResult> {
-    if (!config.safetyProbeAddress) throw new Error('SAFETY_PROBE_ADDRESS non configurée.');
-    const caller = config.riskProbeCaller ?? account?.address;
-    if (!caller) throw new Error('RISK_PROBE_CALLER ou PRIVATE_KEY non configuré.');
-
-    const deadline = BigInt(Math.floor(Date.now() / 1000) + config.txDeadlineSeconds);
-    const { result } = await this.client.simulateContract({
-      address: config.safetyProbeAddress,
-      abi: safetyProbeAbi,
-      functionName: 'probe',
-      args: [pair.router, pair.token, deadline],
-      account: caller,
-      value: config.riskProbeAmountWei,
-    });
-
-    const [quotedTokens, receivedTokens, quotedNative, recoveredNative] = result;
-    return {
-      buyTaxBps: bpsLoss(quotedTokens, receivedTokens),
-      sellTaxBps: bpsLoss(quotedNative, recoveredNative),
-      roundTripLossBps: bpsLoss(config.riskProbeAmountWei, recoveredNative),
-      quotedTokens,
-      receivedTokens,
-      quotedNative,
-      recoveredNative,
-    };
-  }
 }

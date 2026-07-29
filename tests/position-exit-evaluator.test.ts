@@ -67,6 +67,7 @@ test('conserve la position lorsqu’aucune règle ne correspond', () => {
   assert.equal(result.action, 'HOLD');
   assert.deepEqual(result.triggeredRules, []);
   assert.equal(result.state.latestNetValueWei, 1_000n);
+  assert.equal(result.state.lastSellTaxBps, 0);
 });
 
 test('un probe inconnu prime sur toutes les ventes', () => {
