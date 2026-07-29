@@ -35,6 +35,7 @@ export class PositionMetricsService {
     settings: Readonly<PositionExitSettings>,
     state: Readonly<PositionExitState>,
     nowMs: number,
+    options: { forceProbe?: boolean } = {},
   ): Promise<PositionMetricsSnapshot> {
     if (!session.entry) {
       throw new StalePositionMetricsError('MISSING_ENTRY');
@@ -54,6 +55,7 @@ export class PositionMetricsService {
     }
 
     const probeDue =
+      options.forceProbe === true ||
       state.lastProbeAtMs === undefined ||
       nowMs - state.lastProbeAtMs >= settings.probeIntervalSeconds * 1_000;
     let probeStatus: SellabilityStatus = state.lastProbeStatus ?? 'UNKNOWN';

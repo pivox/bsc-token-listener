@@ -117,6 +117,33 @@ test('réutilise un probe encore frais sans nouvel appel', async () => {
   assert.equal(metrics.probeMeasuredAtMs, 50_000);
 });
 
+test('force un probe immédiat juste avant une vente', async () => {
+  let probes = 0;
+  await new PositionMetricsService(
+    gateway({
+      probeSellability: async () => {
+        probes += 1;
+        return {
+          buyTaxBps: 0,
+          sellTaxBps: 0,
+          roundTripLossBps: 0,
+          quotedTokens: 1n,
+          receivedTokens: 1n,
+          quotedNative: 1n,
+          recoveredNative: 1n,
+        };
+      },
+    }),
+  ).collect(
+    session(),
+    defaultPositionExitSettings(),
+    { lastProbeAtMs: 60_000, lastProbeStatus: 'SAFE', lastSellTaxBps: 0 },
+    61_000,
+    { forceProbe: true },
+  );
+  assert.equal(probes, 1);
+});
+
 test('un probe RPC en échec devient UNKNOWN sans transaction', async () => {
   let sentTransactions = 0;
   const metrics = await new PositionMetricsService(
