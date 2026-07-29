@@ -85,7 +85,8 @@ RISK_PROBE_REQUIRED=true
   nonce, wallet, reçu, gas et snapshots de soldes ;
 - `reconciliation_decisions` : décisions de reprise idempotentes et auditables ;
 - `token_risk_reports` : rapports complets ;
-- `listener_checkpoints` : reprise après coupure.
+- `listener_checkpoints` : progression des listeners pendant l’exécution courante ;
+- `fresh_start_runs` : cutoff confirmé immutable installé à chaque lancement.
 
 Exemple :
 
@@ -123,16 +124,41 @@ LEFT JOIN trade_transactions x ON x.trade_id = t.trade_id
 ORDER BY t.created_at DESC, x.created_at;
 ```
 
-### Reprise après crash
+### Fresh-start obligatoire
 
-Au démarrage, le bot réconcilie toutes les sessions interrompues avant d’activer
-le listener `PairCreated` et les listeners `Swap`. Une seule instance exécute une
-passe à la fois grâce à un verrou PostgreSQL ; les sessions sont réclamées avec
-un bail expirant et chaque session n’est traitée qu’une fois par passe. Les
-passes périodiques drainent les opérations listener déjà engagées et empêchent
-qu’une nouvelle opération métier démarre pendant la reprise.
+Chaque lancement commence au head BSC actuellement confirmé. Le bot ne rejoue
+aucun bloc antérieur et ne reprend aucune ancienne intention d’achat,
+d’approbation ou de vente.
 
-La réconciliation observe la blockchain en lecture seule avant toute décision :
+Avant le dashboard et les listeners, une transaction PostgreSQL atomique :
+
+- place toutes les anciennes sessions non terminales en `MANUAL_REVIEW` avec
+  la raison `FRESH_START_CUTOFF` ;
+- place les décisions de sortie `PENDING` ou `EXECUTING` en
+  `MANUAL_REVIEW` ;
+- ancre tous les checkpoints sur le cutoff et remplace le journal canonique par
+  son header ;
+- écrit un audit immutable dans `fresh_start_runs`.
+
+Les sessions `CLOSED`, `REJECTED` et `EXPIRED` ne sont pas modifiées. Les
+tokens, rapports, trades, transactions et diagnostics historiques restent dans
+PostgreSQL. Les sessions mises en quarantaine sont exclues de la récupération
+périodique, même si elles conservent une référence d’exécution historique.
+
+Une erreur RPC pendant la lecture du head ou du header empêche entièrement le
+fresh-start : aucune session, décision ou checkpoint n’est alors modifié. Deux
+instances partageant PostgreSQL sérialisent l’opération avec un verrou
+transactionnel.
+
+### Récupération pendant l’exécution courante
+
+La passe initiale de réconciliation après crash n’existe plus. Après activation
+des listeners, les passes périodiques restent disponibles uniquement pour les
+incidents créés depuis le cutoff de l’exécution courante. Une seule instance
+exécute une passe à la fois ; les sessions sont réclamées avec un bail expirant
+et les opérations listener déjà engagées sont drainées avant la reprise.
+
+Cette récupération observe la blockchain en lecture seule avant toute décision :
 
 - une transaction `pending` est laissée en attente sans rediffusion ;
 - un reçu confirmé reconstruit les montants depuis les snapshots persistés ou
@@ -141,16 +167,15 @@ La réconciliation observe la blockchain en lecture seule avant toute décision 
 - un revert applique un état métier sûr ;
 - un hash absent, une mesure impossible ou une exécution ambiguë passe en
   `MANUAL_REVIEW` ;
-- une `MANUAL_REVIEW` qui conserve une référence d’exécution est réexaminée
-  périodiquement en lecture seule ; une revue manuelle sans référence ne l’est
-  jamais ;
+- une `MANUAL_REVIEW` créée pendant l’exécution courante et conservant une
+  référence d’exécution peut être réexaminée en lecture seule ;
 - une intention sans transaction enfant peut reprendre automatiquement, mais un
   achat exige toujours un `TokenRiskReport` persisté et compatible avec la
   politique de risque.
 
 Une erreur RPC ne fait avancer aucun checkpoint blockchain et son diagnostic ne
-conserve que le type d’erreur. Après la barrière initiale, une passe périodique
-non chevauchante s’exécute selon :
+conserve que le type d’erreur. Une passe périodique non chevauchante s’exécute
+selon :
 
 ```env
 RECOVERY_INTERVAL_SECONDS=30
@@ -213,7 +238,7 @@ l’âge de la plus ancienne attente.
 
 ### Continuité de chaîne
 
-`BLOCK_CONFIRMATIONS=5` est la latence de sécurité par défaut. Un événement WebSocket ne déclenche qu’une lecture HTTP canonique : il ne fournit jamais seul un log métier. Le journal garde les 128 derniers headers ; les reorgs dans cette fenêtre sont rembobinés et rejoués automatiquement. Un ancêtre absent de cette fenêtre suspend la chaîne en `MANUAL_REVIEW`, notamment si un wallet peut avoir été affecté.
+`BLOCK_CONFIRMATIONS=5` est la latence de sécurité par défaut. Un événement WebSocket ne déclenche qu’une lecture HTTP canonique : il ne fournit jamais seul un log métier. À chaque lancement, seuls les blocs dont le numéro est strictement supérieur au cutoff fresh-start sont traitables. Le journal garde ensuite les 128 derniers headers ; les reorgs dans cette fenêtre sont rembobinés et rejoués automatiquement. Une reorg qui nécessiterait de lire au niveau du cutoff ou avant suspend la chaîne en `MANUAL_REVIEW`.
 
 Le heartbeat et le dashboard indiquent le head confirmé, le tip/hash canonique,
 l’état `HEALTHY` / `RECONCILING` / `MANUAL_REVIEW`, ainsi que le dernier reorg
@@ -234,6 +259,10 @@ Le bot expose une interface locale de supervision. Elle affiche :
 - les liens vers BscScan pour le token, la paire et les transactions.
 - la prochaine évaluation de sortie, le PnL économique net, la liquidité de
   référence, le probe de vente et l’état trailing.
+
+La liste applique sa priorité avant pagination : `MANUAL_REVIEW` apparaît en
+premier, puis `WAITING_FIRST_BUY`, puis les autres états actifs. Le mode
+`EXECUTION_MODE=dry-run` reste la valeur par défaut.
 
 Configuration par défaut :
 

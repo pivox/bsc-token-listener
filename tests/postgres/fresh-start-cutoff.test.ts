@@ -454,14 +454,14 @@ test('sérialise les lancements et refuse les cutoffs régressifs', async () => 
       hash: `0x${'c'.repeat(64)}` as Hash,
       parentHash: HASH,
     };
-    await first.apply(newer, 5_000);
+    await first.apply(newer, 3_000);
     const beforeRejected = await client.query<{
       cutoff_block_number: string;
       cutoff_block_hash: string;
     }>(
       `SELECT cutoff_block_number::text, cutoff_block_hash
        FROM fresh_start_runs
-       ORDER BY applied_at DESC, run_id DESC
+       ORDER BY cutoff_block_number DESC, applied_at DESC, run_id DESC
        LIMIT 1`,
     );
     await assert.rejects(
@@ -484,7 +484,7 @@ test('sérialise les lancements et refuse les cutoffs régressifs', async () => 
     }>(
       `SELECT cutoff_block_number::text, cutoff_block_hash
        FROM fresh_start_runs
-       ORDER BY applied_at DESC, run_id DESC
+       ORDER BY cutoff_block_number DESC, applied_at DESC, run_id DESC
        LIMIT 1`,
     );
     assert.deepEqual(afterRejected.rows, beforeRejected.rows);

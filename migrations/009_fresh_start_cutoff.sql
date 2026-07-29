@@ -13,3 +13,10 @@ CREATE TABLE IF NOT EXISTS fresh_start_runs (
 
 CREATE INDEX IF NOT EXISTS idx_fresh_start_runs_latest
   ON fresh_start_runs(applied_at DESC, run_id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_fresh_start_runs_cutoff
+  ON fresh_start_runs(
+    cutoff_block_number DESC,
+    applied_at DESC,
+    run_id DESC
+  );

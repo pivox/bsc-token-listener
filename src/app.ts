@@ -620,6 +620,7 @@ async function main(): Promise<void> {
     config.blockConfirmations,
     canonicalCoordinator,
     chainRepository,
+    freshStartRun.appliedAtMs,
   );
 
   const onPair = async (pair: PairInfo): Promise<void> => {

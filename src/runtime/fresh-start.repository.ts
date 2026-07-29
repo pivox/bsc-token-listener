@@ -96,7 +96,10 @@ export class FreshStartRepository {
       );
       const latest = await client.query<RunRow>(
         `SELECT * FROM fresh_start_runs
-         ORDER BY applied_at DESC, run_id DESC
+         ORDER BY
+           cutoff_block_number DESC,
+           applied_at DESC,
+           run_id DESC
          LIMIT 1 FOR UPDATE`,
       );
       const previous = latest.rows[0];
