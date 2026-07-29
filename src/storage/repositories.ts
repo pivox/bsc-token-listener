@@ -44,6 +44,7 @@ export class SessionRepository {
          token_address = EXCLUDED.token_address,
          status = EXCLUDED.status,
          payload = EXCLUDED.payload,
+         canonical = TRUE,
          updated_at = EXCLUDED.updated_at
        WHERE token_sessions.recovery_owner IS NULL
        RETURNING pair_address`,
@@ -76,6 +77,36 @@ export class SessionRepository {
     );
     const row = result.rows[0];
     return row ? parseJson<TokenSession>(row.payload) : null;
+  }
+
+  async saveReconciledSession(
+    session: TokenSession,
+    canonical: boolean,
+  ): Promise<void> {
+    const result = await this.database.query<{ pair_address: string }>(
+      `UPDATE token_sessions
+       SET token_address = $2,
+           status = $3,
+           payload = $4::jsonb,
+           canonical = $5,
+           updated_at = to_timestamp($6 / 1000.0)
+       WHERE pair_address = $1
+         AND recovery_owner IS NULL
+       RETURNING pair_address`,
+      [
+        session.pair.pair.toLowerCase(),
+        session.pair.token.toLowerCase(),
+        session.status,
+        stringifyJson(session),
+        canonical,
+        session.updatedAtMs,
+      ],
+    );
+    if (result.rows.length !== 1) {
+      throw new Error(
+        'Session réconciliée introuvable ou verrouillée par une recovery active.',
+      );
+    }
   }
 
   async countOpenPositions(): Promise<number> {
@@ -197,6 +228,21 @@ export class SwapEventRepository {
        WHERE event_id = $1`,
       [eventId, error.slice(0, 4000)],
     );
+  }
+
+  async listCanonicalProcessedEvents(
+    pair: Address,
+  ): Promise<readonly SwapEvent[]> {
+    const result = await this.database.query<{ payload: unknown }>(
+      `SELECT payload
+       FROM swap_events
+       WHERE pair_address = $1
+         AND canonical = TRUE
+         AND processing_status = 'PROCESSED'
+       ORDER BY block_number, transaction_index, log_index, event_id`,
+      [pair.toLowerCase()],
+    );
+    return result.rows.map(({ payload }) => parseJson<SwapEvent>(payload));
   }
 }
 
@@ -522,6 +568,24 @@ export class CheckpointRepository {
         checkpoint.blockHash.toLowerCase(),
       ],
     );
+  }
+
+  async delete(key: string): Promise<void> {
+    await this.database.query(
+      'DELETE FROM listener_checkpoints WHERE listener_key = $1',
+      [key],
+    );
+  }
+
+  async deleteNonMonitorableSwapCheckpoints(): Promise<number> {
+    const result = await this.database.query<{ listener_key: string }>(
+      `DELETE FROM listener_checkpoints AS checkpoints
+       USING token_sessions AS sessions
+       WHERE checkpoints.listener_key = 'swap:' || LOWER(sessions.pair_address)
+         AND sessions.status NOT IN ('WAITING_FIRST_BUY', 'HOLDING')
+       RETURNING checkpoints.listener_key`,
+    );
+    return result.rows.length;
   }
 }
 

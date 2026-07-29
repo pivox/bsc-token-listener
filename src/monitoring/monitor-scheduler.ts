@@ -27,7 +27,7 @@ interface MonitorSchedulerDependencies {
   expire: (session: TokenSession) => Promise<void>;
   ignore: (session: TokenSession) => Promise<void>;
   canStart?: () => boolean;
-  start: (session: TokenSession) => Promise<void>;
+  start: (session: TokenSession) => Promise<void | boolean>;
   stop: (pair: Address) => void | Promise<void>;
 }
 
@@ -214,7 +214,8 @@ export class MonitorScheduler {
       }
 
       try {
-        await this.dependencies.start(session);
+        const started = await this.dependencies.start(session);
+        if (started === false) break;
         if (!this.activePairKeys().has(pairKey)) {
           throw new Error('Le listener ne s’est pas déclaré actif.');
         }

@@ -15,7 +15,13 @@ export interface CanonicalBlockReader {
 export interface ConfirmedRangeRequest {
   listenerKey: string;
   startBlock: bigint;
-  processChunk(fromBlock: bigint, toBlock: bigint): Promise<boolean>;
+  bootstrap?: 'confirmed-head';
+  signal?: AbortSignal;
+  processChunk(
+    fromBlock: bigint,
+    toBlock: bigint,
+    canonicalHeaders: readonly CanonicalBlock[],
+  ): Promise<boolean>;
 }
 
 export interface AnchoredListenerCheckpoint {
@@ -46,6 +52,7 @@ export interface ReorgImpact {
   readonly depth: number | null;
   readonly orphanedEvents: number;
   readonly replayedEvents: number;
+  readonly requiresManualReview?: boolean;
 }
 
 export interface ReorgReconciliation {
@@ -60,6 +67,8 @@ export interface CanonicalReorgHandler {
 }
 
 export interface CanonicalReorgSummary extends ReorgReconciliation {
+  readonly detectedAtMs: number;
+  readonly status: ChainReorgStatus;
   readonly impact: ReorgImpact;
 }
 

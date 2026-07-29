@@ -211,6 +211,16 @@ Le heartbeat et le dashboard exposent la capacité totale, les moniteurs actifs,
 la profondeur de file, les admissions échouées lors de la dernière passe et
 l’âge de la plus ancienne attente.
 
+### Continuité de chaîne
+
+`BLOCK_CONFIRMATIONS=5` est la latence de sécurité par défaut. Un événement WebSocket ne déclenche qu’une lecture HTTP canonique : il ne fournit jamais seul un log métier. Le journal garde les 128 derniers headers ; les reorgs dans cette fenêtre sont rembobinés et rejoués automatiquement. Un ancêtre absent de cette fenêtre suspend la chaîne en `MANUAL_REVIEW`, notamment si un wallet peut avoir été affecté.
+
+Le heartbeat et le dashboard indiquent le head confirmé, le tip/hash canonique,
+l’état `HEALTHY` / `RECONCILING` / `MANUAL_REVIEW`, ainsi que le dernier reorg
+(heure de détection, profondeur, ancêtre, événements orphelins et rejoués). En
+cas d’échec RPC, les dernières valeurs validées restent visibles mais sont
+marquées `STALE`; elles ne sont jamais affichées comme saines.
+
 ## Dashboard minimal
 
 Le bot expose une interface de supervision **strictement en lecture seule**. Elle affiche :

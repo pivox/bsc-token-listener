@@ -1,10 +1,13 @@
 import type { Address, Hash } from 'viem';
 import { pancakeFactoryAbi } from '../abi/pancake-factory.abi.js';
+import type {
+  CanonicalBlock,
+  ConfirmedRangeRequest,
+} from '../chain/canonical-chain.types.js';
 import { config } from '../config/env.js';
 import { publicClient, wsClient } from '../rpc/clients.js';
-import { CheckpointRepository } from '../storage/repositories.js';
+import type { CheckpointRepository } from '../storage/repositories.js';
 import type { PairInfo } from '../types/domain.js';
-import { errorMessage } from '../utils/error.js';
 import { logger } from '../utils/logger.js';
 
 interface PairCreatedLog {
@@ -16,38 +19,162 @@ interface PairCreatedLog {
   blockNumber: bigint | null;
   blockHash: Hash | null;
   transactionHash: Hash | null;
+  transactionIndex: number | null;
   logIndex: number | null;
 }
 
+function assertPairCreatedLogIdentity(
+  log: PairCreatedLog,
+): asserts log is PairCreatedLog & {
+  blockNumber: bigint;
+  blockHash: Hash;
+  transactionHash: Hash;
+  transactionIndex: number;
+  logIndex: number;
+} {
+  if (typeof log.blockNumber !== 'bigint') {
+    throw new Error(
+      'Log PairCreated HTTP confirmé invalide: blockNumber absent.',
+    );
+  }
+  if (!log.blockHash) {
+    throw new Error(
+      'Log PairCreated HTTP confirmé invalide: blockHash absent.',
+    );
+  }
+  if (!log.transactionHash) {
+    throw new Error(
+      'Log PairCreated HTTP confirmé invalide: transactionHash absent.',
+    );
+  }
+  if (
+    !Number.isSafeInteger(log.transactionIndex)
+    || (log.transactionIndex ?? -1) < 0
+  ) {
+    throw new Error(
+      'Log PairCreated HTTP confirmé invalide: transactionIndex absent.',
+    );
+  }
+  if (!Number.isSafeInteger(log.logIndex) || (log.logIndex ?? -1) < 0) {
+    throw new Error(
+      'Log PairCreated HTTP confirmé invalide: logIndex absent.',
+    );
+  }
+}
+
+interface ListenerWatcher {
+  watchContractEvent(options: {
+    address: Address;
+    abi: readonly unknown[];
+    eventName: string;
+    onLogs(logs: readonly unknown[]): void;
+    onError(error: unknown): void;
+  }): () => void;
+}
+
+interface PairCreatedLogReader {
+  getContractEvents(options: {
+    address: Address;
+    abi: readonly unknown[];
+    eventName: string;
+    fromBlock: bigint;
+    toBlock: bigint;
+  }): Promise<readonly unknown[]>;
+}
+
+interface ConfirmedRangeCoordinator {
+  reconcile(request: ConfirmedRangeRequest): Promise<void>;
+}
+
+export interface PairCreatedListenerDependencies {
+  watcher: ListenerWatcher;
+  logReader: PairCreatedLogReader;
+  coordinator: ConfirmedRangeCoordinator;
+  reconcileIntervalMs?: number;
+}
+
+const missingCoordinator: ConfirmedRangeCoordinator = {
+  reconcile: async () => {
+    throw new Error(
+      'CanonicalChainCoordinator requis pour ingérer les événements confirmés.',
+    );
+  },
+};
+
+const defaultDependencies: PairCreatedListenerDependencies = {
+  watcher: wsClient as unknown as ListenerWatcher,
+  logReader: publicClient as unknown as PairCreatedLogReader,
+  coordinator: missingCoordinator,
+};
+
+function safeErrorType(error: unknown): string {
+  if (!(error instanceof Error)) return typeof error;
+  return error.name !== 'Error' ? error.name : error.constructor.name;
+}
+
 export class PairCreatedListener {
+  private readonly onPair: (pair: PairInfo) => Promise<void>;
+  private readonly dependencies: PairCreatedListenerDependencies;
   private stopWatch?: () => void;
   private interval?: NodeJS.Timeout;
-  private running = false;
+  private reconciliation: Promise<void> | null = null;
+  private reconcilePending = false;
+  private stopped = false;
 
   constructor(
-    private readonly checkpoints: CheckpointRepository,
-    private readonly onPair: (pair: PairInfo) => Promise<void>,
-  ) {}
+    checkpoints: CheckpointRepository,
+    onPair: (pair: PairInfo) => Promise<void>,
+  );
+  constructor(
+    onPair: (pair: PairInfo) => Promise<void>,
+    dependencies: PairCreatedListenerDependencies,
+  );
+  constructor(
+    first: CheckpointRepository | ((pair: PairInfo) => Promise<void>),
+    second:
+      | ((pair: PairInfo) => Promise<void>)
+      | PairCreatedListenerDependencies,
+  ) {
+    if (typeof first === 'function') {
+      this.onPair = first;
+      this.dependencies = second as PairCreatedListenerDependencies;
+      return;
+    }
+    void first;
+    this.onPair = second as (pair: PairInfo) => Promise<void>;
+    this.dependencies = defaultDependencies;
+  }
 
   async start(): Promise<void> {
-    this.stopWatch = wsClient.watchContractEvent({
+    this.stopped = false;
+    this.stopWatch = this.dependencies.watcher.watchContractEvent({
       address: config.factory,
       abi: pancakeFactoryAbi,
       eventName: 'PairCreated',
-      onLogs: (logs: unknown[]) => {
-        void this.processLogs(logs as PairCreatedLog[]).catch((error: unknown) =>
-          logger.error({ error: errorMessage(error) }, 'Erreur PairCreated WebSocket.'),
+      onLogs: () => {
+        void this.requestReconcile().catch((error: unknown) =>
+          logger.error(
+            { errorType: safeErrorType(error) },
+            'Réconciliation PairCreated déclenchée par WebSocket échouée.',
+          ),
         );
       },
-      onError: (error: unknown) => logger.error({ error: errorMessage(error) }, 'WebSocket PairCreated en erreur.'),
+      onError: (error: unknown) => logger.error(
+        { errorType: safeErrorType(error) },
+        'WebSocket PairCreated en erreur.',
+      ),
     });
 
-    await this.reconcile();
+    await this.requestReconcile();
+    if (this.stopped) return;
     this.interval = setInterval(() => {
-      void this.reconcile().catch((error: unknown) =>
-        logger.error({ error: errorMessage(error) }, 'Réconciliation PairCreated échouée.'),
+      void this.requestReconcile().catch((error: unknown) =>
+        logger.error(
+          { errorType: safeErrorType(error) },
+          'Réconciliation PairCreated échouée.',
+        ),
       );
-    }, config.reconcileSeconds * 1000);
+    }, this.dependencies.reconcileIntervalMs ?? config.reconcileSeconds * 1_000);
 
     logger.info(
       { factory: config.factory, reconcileSeconds: config.reconcileSeconds },
@@ -56,54 +183,117 @@ export class PairCreatedListener {
   }
 
   stop(): void {
+    this.stopped = true;
     this.stopWatch?.();
     if (this.interval) clearInterval(this.interval);
   }
 
-  private async reconcile(): Promise<void> {
-    if (this.running) return;
-    this.running = true;
-    try {
-      const latest = await publicClient.getBlockNumber();
-      const stored = await this.checkpoints.get('pair-created');
-      let fromBlock = stored === null ? latest : stored.blockNumber + 1n;
-      const chunk = 1_500n;
-      while (fromBlock <= latest) {
-        const toBlock = fromBlock + chunk - 1n > latest ? latest : fromBlock + chunk - 1n;
-        const logs = await publicClient.getContractEvents({
-          address: config.factory,
-          abi: pancakeFactoryAbi,
-          eventName: 'PairCreated',
-          fromBlock,
-          toBlock,
-        });
-        await this.processLogs(logs as PairCreatedLog[]);
-        const block = await publicClient.getBlock({ blockNumber: toBlock });
-        await this.checkpoints.set('pair-created', {
-          blockNumber: toBlock,
-          blockHash: block.hash,
-        });
-        fromBlock = toBlock + 1n;
-      }
-    } finally {
-      this.running = false;
-    }
+  reconcileNow(): Promise<void> {
+    return this.requestReconcile();
   }
 
-  private async processLogs(logs: PairCreatedLog[]): Promise<void> {
-    const sorted = [...logs].sort((a, b) => {
-      if (a.blockNumber !== b.blockNumber) return (a.blockNumber ?? 0n) < (b.blockNumber ?? 0n) ? -1 : 1;
-      return (a.logIndex ?? 0) - (b.logIndex ?? 0);
+  private requestReconcile(): Promise<void> {
+    if (this.stopped) return Promise.resolve();
+    if (this.reconciliation) {
+      this.reconcilePending = true;
+      return this.reconciliation;
+    }
+
+    const execution = (async () => {
+      let firstFailure: unknown;
+      let failed = false;
+      do {
+        this.reconcilePending = false;
+        try {
+          await this.dependencies.coordinator.reconcile({
+            listenerKey: 'pair-created',
+            startBlock: 0n,
+            bootstrap: 'confirmed-head',
+            processChunk: (fromBlock, toBlock, canonicalHeaders) =>
+              this.processChunk(fromBlock, toBlock, canonicalHeaders),
+          });
+        } catch (error) {
+          if (!failed) firstFailure = error;
+          failed = true;
+        }
+      } while (this.reconcilePending && !this.stopped);
+      if (failed) throw firstFailure;
+    })();
+    this.reconciliation = execution.finally(() => {
+      this.reconciliation = null;
+    });
+    return this.reconciliation;
+  }
+
+  private async processChunk(
+    fromBlock: bigint,
+    toBlock: bigint,
+    canonicalHeaders: readonly CanonicalBlock[],
+  ): Promise<boolean> {
+    const logs = await this.dependencies.logReader.getContractEvents({
+      address: config.factory,
+      abi: pancakeFactoryAbi,
+      eventName: 'PairCreated',
+      fromBlock,
+      toBlock,
+    });
+    await this.processLogs(
+      logs as PairCreatedLog[],
+      fromBlock,
+      toBlock,
+      canonicalHeaders,
+    );
+    return true;
+  }
+
+  private async processLogs(
+    logs: PairCreatedLog[],
+    fromBlock: bigint,
+    toBlock: bigint,
+    canonicalHeaders: readonly CanonicalBlock[],
+  ): Promise<void> {
+    const expectedHashes = new Map(
+      canonicalHeaders.map((header) => [
+        header.number,
+        header.hash.toLowerCase(),
+      ]),
+    );
+    const identified = logs.map((log) => {
+      assertPairCreatedLogIdentity(log);
+      if (log.blockNumber < fromBlock || log.blockNumber > toBlock) {
+        throw new Error(
+          `Log PairCreated HTTP hors plage confirmée: ${log.blockNumber}.`,
+        );
+      }
+      if (
+        expectedHashes.get(log.blockNumber)
+        !== log.blockHash.toLowerCase()
+      ) {
+        throw new Error(
+          `Log PairCreated incohérent avec le header canonique préparé au bloc ${log.blockNumber}.`,
+        );
+      }
+      return log;
+    });
+    const sorted = [...identified].sort((a, b) => {
+      if (a.blockNumber !== b.blockNumber) {
+        return a.blockNumber < b.blockNumber ? -1 : 1;
+      }
+      if (a.transactionIndex !== b.transactionIndex) {
+        return a.transactionIndex - b.transactionIndex;
+      }
+      return a.logIndex - b.logIndex;
     });
 
     for (const log of sorted) {
       const { token0, token1, pair } = log.args;
       if (
-        !token0 || !token1 || !pair || log.blockNumber === null ||
-        !log.blockHash || !log.transactionHash
+        !token0 || !token1 || !pair
       ) continue;
-      const token0IsWbnb = token0.toLowerCase() === config.wbnb.toLowerCase();
-      const token1IsWbnb = token1.toLowerCase() === config.wbnb.toLowerCase();
+      const token0IsWbnb =
+        token0.toLowerCase() === config.wbnb.toLowerCase();
+      const token1IsWbnb =
+        token1.toLowerCase() === config.wbnb.toLowerCase();
       if (!token0IsWbnb && !token1IsWbnb) continue;
 
       await this.onPair({
@@ -117,7 +307,7 @@ export class PairCreatedListener {
         createdBlock: log.blockNumber,
         blockHash: log.blockHash,
         createdTransactionHash: log.transactionHash,
-        createdLogIndex: log.logIndex ?? 0,
+        createdLogIndex: log.logIndex,
         discoveredAtMs: Date.now(),
       });
     }

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { createReadStream } from 'node:fs';
@@ -17,6 +18,7 @@ import type {
   CanonicalChainState,
   CanonicalReorgHandler,
   CanonicalReorgSummary,
+  ChainBlockReference,
   ConfirmedRangeRequest,
   ListenerCheckpoint,
   ReorgImpact,
@@ -55,15 +57,46 @@ export interface CanonicalHeaderSpoolFactory {
   create(): Promise<CanonicalHeaderSpool>;
 }
 
+export interface CanonicalListenerBarrier {
+  runListener<T>(operation: () => Promise<T>): Promise<T>;
+}
+
 export interface CanonicalChainCoordinatorOptions {
   blockReader: CanonicalBlockReader;
   canonicalStore: CanonicalChainStore;
   checkpoints: ListenerCheckpointStore;
   reorgHandler: CanonicalReorgHandler;
+  runtimeBarrier?: CanonicalListenerBarrier;
   confirmations?: number;
   chunkSize?: number;
   headerSpoolFactory?: CanonicalHeaderSpoolFactory;
+  afterReorg?: (state: CanonicalChainState) => Promise<CanonicalReorgCompletion | void>;
+  onRecovered?: () => void;
   onCleanupError?: (errorType: string) => void;
+}
+
+export interface CanonicalReorgCompletion {
+  readonly identity: string;
+  readonly reorgId: string;
+  readonly replayedEvents: number;
+}
+
+export interface CanonicalReorgHydration {
+  readonly reorgId: string;
+  readonly detectedAtMs: number;
+  readonly ancestor: ChainBlockReference;
+  readonly oldTip: ChainBlockReference;
+  readonly newTip: ChainBlockReference;
+  readonly impact: ReorgImpact;
+}
+
+export interface CanonicalManualReviewHydration {
+  readonly reorgId: string;
+  readonly detectedAtMs: number;
+  readonly ancestor: ChainBlockReference | null;
+  readonly oldTip: ChainBlockReference;
+  readonly newTip: ChainBlockReference;
+  readonly impact: ReorgImpact;
 }
 
 export interface CanonicalChainCoordinatorStatus {
@@ -178,6 +211,14 @@ interface PreparedCanonicalScan {
   legacyHeader: CanonicalBlock | null;
 }
 
+interface PostReorgScope {
+  active: boolean;
+  reorgDetected: boolean;
+  inFlight: Set<Promise<void>>;
+  hasError: boolean;
+  firstError: unknown;
+}
+
 class TemporaryCanonicalHeaderSpool implements CanonicalHeaderSpool {
   private handle: FileHandle | null;
 
@@ -290,10 +331,19 @@ export class CanonicalChainCoordinator {
   private readonly canonicalStore: CanonicalChainStore;
   private readonly checkpoints: ListenerCheckpointStore;
   private readonly reorgHandler: CanonicalReorgHandler;
+  private readonly runtimeBarrier: CanonicalListenerBarrier | undefined;
   private readonly confirmations: number;
   private readonly chunkSize: bigint;
   private readonly headerSpoolFactory: CanonicalHeaderSpoolFactory;
+  private readonly afterReorg:
+    ((state: CanonicalChainState) => Promise<CanonicalReorgCompletion | void>) | undefined;
+  private readonly onRecovered: (() => void) | undefined;
   private readonly onCleanupError: ((errorType: string) => void) | undefined;
+  private readonly postReorgScopes =
+    new AsyncLocalStorage<PostReorgScope>();
+  private activeRequests = 0;
+  private reorgReadyForFinalization = false;
+  private hydratedReorgs: CanonicalReorgHydration[] = [];
   private tail: Promise<void> = Promise.resolve();
   private status: CanonicalChainCoordinatorStatus = {
     running: false,
@@ -307,8 +357,11 @@ export class CanonicalChainCoordinator {
     this.canonicalStore = options.canonicalStore;
     this.checkpoints = options.checkpoints;
     this.reorgHandler = options.reorgHandler;
+    this.runtimeBarrier = options.runtimeBarrier;
     this.headerSpoolFactory =
       options.headerSpoolFactory ?? DEFAULT_HEADER_SPOOL_FACTORY;
+    this.afterReorg = options.afterReorg;
+    this.onRecovered = options.onRecovered;
     this.onCleanupError = options.onCleanupError;
     this.confirmations = boundedInteger(
       options.confirmations ?? 5,
@@ -330,47 +383,422 @@ export class CanonicalChainCoordinator {
     return structuredClone(this.status);
   }
 
+  hydratePendingReorg(reorg: CanonicalReorgHydration): void {
+    this.hydratePendingReorgs([reorg]);
+  }
+
+  hydrateManualReviewReorg(reorg: CanonicalManualReviewHydration): void {
+    if (this.status.state !== 'HEALTHY' || this.status.lastReorg !== null) {
+      throw new Error('Une reorg runtime est déjà présente pendant l’hydratation.');
+    }
+    const validReference = (reference: ChainBlockReference): boolean =>
+      reference.number >= 0n && isHash(reference.hash);
+    const expectedId =
+      `reorg:${reorg.oldTip.hash.toLowerCase()}:${reorg.newTip.hash.toLowerCase()}`;
+    const shallow = reorg.ancestor !== null;
+    const validShallow = shallow
+      && validReference(reorg.ancestor as ChainBlockReference)
+      && reorg.impact.depth !== null
+      && Number.isSafeInteger(reorg.impact.depth)
+      && reorg.impact.depth >= 1
+      && reorg.impact.depth <= DEFAULT_CANONICAL_RETENTION
+      && reorg.oldTip.number > (reorg.ancestor as ChainBlockReference).number
+      && BigInt(reorg.impact.depth)
+        === reorg.oldTip.number - (reorg.ancestor as ChainBlockReference).number
+      && reorg.newTip.number >= reorg.oldTip.number;
+    const validDeep = !shallow && reorg.impact.depth === null;
+    if (
+      reorg.reorgId !== expectedId
+      || !Number.isSafeInteger(reorg.detectedAtMs)
+      || reorg.detectedAtMs < 0
+      || !validReference(reorg.oldTip)
+      || !validReference(reorg.newTip)
+      || !Number.isSafeInteger(reorg.impact.orphanedEvents)
+      || reorg.impact.orphanedEvents < 0
+      || !Number.isSafeInteger(reorg.impact.replayedEvents)
+      || reorg.impact.replayedEvents < 0
+      || reorg.impact.requiresManualReview !== true
+      || (!validShallow && !validDeep)
+    ) {
+      throw new Error('Hydratation MANUAL_REVIEW persistée invalide.');
+    }
+    const persistedBlock = (
+      reference: ChainBlockReference,
+    ): CanonicalBlock => ({
+      number: reference.number,
+      hash: reference.hash,
+      parentHash: reference.hash,
+    });
+    this.status = {
+      ...this.status,
+      state: 'MANUAL_REVIEW',
+      lastReorg: {
+        ancestor: reorg.ancestor === null
+          ? null
+          : persistedBlock(reorg.ancestor),
+        oldTip: persistedBlock(reorg.oldTip),
+        newTip: persistedBlock(reorg.newTip),
+        depth: reorg.impact.depth,
+        detectedAtMs: reorg.detectedAtMs,
+        status: 'MANUAL_REVIEW',
+        impact: cloneImpact(reorg.impact),
+      },
+    };
+    this.reorgReadyForFinalization = false;
+    this.hydratedReorgs = [];
+  }
+
+  hydratePendingReorgs(reorgs: readonly CanonicalReorgHydration[]): void {
+    if (this.status.state !== 'HEALTHY' || this.status.lastReorg !== null) {
+      throw new Error('Une reorg runtime est déjà présente pendant l’hydratation.');
+    }
+    if (reorgs.length === 0) {
+      throw new Error('Aucun rollback shallow persisté à hydrater.');
+    }
+    const identities = new Set<string>();
+    const reorgIds = new Set<string>();
+    let previousDetectedAtMs = -1;
+    for (const reorg of reorgs) {
+      this.validateHydratedReorg(reorg);
+      const identity =
+        `${reorg.oldTip.hash.toLowerCase()}:${reorg.newTip.hash.toLowerCase()}`;
+      if (
+        identities.has(identity)
+        || reorgIds.has(reorg.reorgId)
+        || reorg.detectedAtMs < previousDetectedAtMs
+      ) {
+        throw new Error('Cascade de rollbacks shallow persistés invalide.');
+      }
+      identities.add(identity);
+      reorgIds.add(reorg.reorgId);
+      previousDetectedAtMs = reorg.detectedAtMs;
+    }
+    this.hydratedReorgs = reorgs.map((reorg) => structuredClone(reorg));
+    this.installHydratedReorg(this.hydratedReorgs[0] as CanonicalReorgHydration);
+  }
+
+  requireManualReviewForPendingReorg(
+    identity: string,
+    reorgId: string,
+  ): void {
+    const lastReorg = this.status.lastReorg;
+    const hydrated = this.hydratedReorgs[0];
+    if (
+      this.status.state !== 'RECONCILING'
+      || lastReorg === null
+      || lastReorg.status !== 'RECONCILING'
+      || this.reorgIdentity(lastReorg) !== identity
+      || (
+        hydrated !== undefined
+        && hydrated.reorgId !== reorgId
+      )
+    ) {
+      throw new Error('Revue manuelle incompatible avec le rollback hydraté courant.');
+    }
+    this.status = {
+      ...this.status,
+      state: 'MANUAL_REVIEW',
+      lastReorg: {
+        ...lastReorg,
+        status: 'MANUAL_REVIEW',
+        impact: {
+          ...lastReorg.impact,
+          requiresManualReview: true,
+        },
+      },
+    };
+    this.reorgReadyForFinalization = false;
+    this.hydratedReorgs = [];
+  }
+
+  private validateHydratedReorg(reorg: CanonicalReorgHydration): void {
+    if (
+      reorg.reorgId.length === 0
+      || !Number.isSafeInteger(reorg.detectedAtMs)
+      || reorg.detectedAtMs < 0
+      || !Number.isSafeInteger(reorg.impact.depth)
+      || reorg.impact.depth === null
+      || reorg.impact.depth < 1
+      || reorg.impact.depth > DEFAULT_CANONICAL_RETENTION
+      || reorg.ancestor.number < 0n
+      || reorg.oldTip.number <= reorg.ancestor.number
+      || reorg.newTip.number < reorg.ancestor.number
+      || BigInt(reorg.impact.depth) !== reorg.oldTip.number - reorg.ancestor.number
+      || !isHash(reorg.ancestor.hash)
+      || !isHash(reorg.oldTip.hash)
+      || !isHash(reorg.newTip.hash)
+    ) {
+      throw new Error('Hydratation de rollback shallow persisté invalide.');
+    }
+  }
+
+  private installHydratedReorg(reorg: CanonicalReorgHydration): void {
+    const persistedBlock = (reference: ChainBlockReference): CanonicalBlock => ({
+      number: reference.number,
+      hash: reference.hash,
+      // L’audit persiste les références, pas les parent hashes; ils ne servent
+      // qu’à exposer l’état et ne sont jamais réutilisés pour une continuité RPC.
+      parentHash: reference.hash,
+    });
+    this.status = {
+      ...this.status,
+      state: 'RECONCILING',
+      lastReorg: {
+        ancestor: persistedBlock(reorg.ancestor),
+        oldTip: persistedBlock(reorg.oldTip),
+        newTip: persistedBlock(reorg.newTip),
+        depth: reorg.impact.depth,
+        detectedAtMs: reorg.detectedAtMs,
+        status: 'RECONCILING',
+        impact: cloneImpact(reorg.impact),
+      },
+    };
+    this.reorgReadyForFinalization = true;
+  }
+
   reconcile(request: ConfirmedRangeRequest): Promise<void> {
+    const scope = this.postReorgScopes.getStore();
     this.status = {
       ...this.status,
       pendingRequests: this.status.pendingRequests + 1,
     };
-    const execution = this.tail.then(async () => {
-      this.status = { ...this.status, running: true };
+    if (scope?.active === true) {
+      const execution = this.runRequest(request).then((reorgDetected) => {
+        if (reorgDetected) scope.reorgDetected = true;
+      });
+      let observed: Promise<void>;
+      observed = execution.then(
+        () => {
+          scope.inFlight.delete(observed);
+        },
+        (error: unknown) => {
+          if (!scope.hasError) {
+            scope.hasError = true;
+            scope.firstError = error;
+          }
+          scope.inFlight.delete(observed);
+        },
+      );
+      scope.inFlight.add(observed);
+      return execution;
+    }
+
+    let requestStarted = false;
+    let requestCancelled = false;
+    let pendingReleased = false;
+    const releasePending = (): void => {
+      if (pendingReleased) return;
+      pendingReleased = true;
+      this.status = {
+        ...this.status,
+        pendingRequests: this.status.pendingRequests - 1,
+      };
+    };
+    const cancelQueuedRequest = (): boolean => {
+      if (requestStarted || requestCancelled) return false;
+      requestCancelled = true;
+      releasePending();
+      return true;
+    };
+    const queuedRequestCancelled = (): boolean => {
+      if (!requestCancelled && request.signal?.aborted === true) {
+        cancelQueuedRequest();
+      }
+      return requestCancelled;
+    };
+
+    if (this.status.state === 'RECONCILING') {
+      const operation = this.tail.then(async () => {
+        try {
+          if (queuedRequestCancelled()) return;
+          if (this.status.state === 'RECONCILING') {
+            await this.finalizePendingReorg();
+          }
+          if (queuedRequestCancelled()) return;
+          requestStarted = true;
+          await this.runRequest(request);
+        } catch (error: unknown) {
+          if (!requestStarted) releasePending();
+          throw error;
+        }
+      });
+      this.tail = operation.catch(() => undefined);
+      return this.observeQueuedCancellation(
+        operation,
+        request.signal,
+        cancelQueuedRequest,
+      );
+    }
+
+    const operation = this.tail.then(() => {
+      if (queuedRequestCancelled()) return false;
+      requestStarted = true;
+      return this.runRequest(request);
+    });
+    const execution = operation.then(() => undefined);
+    const queued = operation.then(async (reorgDetected) => {
+      if (!reorgDetected) return;
       try {
-        await this.execute(request);
-      } finally {
-        this.status = {
-          ...this.status,
-          running: false,
-          pendingRequests: this.status.pendingRequests - 1,
-        };
+        await this.finalizePendingReorg();
+      } catch (error: unknown) {
+        if (this.status.state === 'HEALTHY') {
+          this.status = {
+            ...this.status,
+            state: 'RECONCILING',
+            lastReorg: this.status.lastReorg === null
+              ? null
+              : { ...this.status.lastReorg, status: 'RECONCILING' },
+          };
+        }
+        logger.error(
+          { errorType: safeErrorType(error) },
+          'Finalisation post-reorg échouée.',
+        );
+        throw error;
       }
     });
-    this.tail = execution.catch(() => undefined);
-    return execution;
+    this.tail = queued.catch(() => undefined);
+    return this.observeQueuedCancellation(
+      execution,
+      request.signal,
+      cancelQueuedRequest,
+    );
+  }
+
+  private observeQueuedCancellation(
+    operation: Promise<void>,
+    signal: AbortSignal | undefined,
+    cancel: () => boolean,
+  ): Promise<void> {
+    if (!signal) return operation;
+    return new Promise<void>((resolve, reject) => {
+      const onAbort = (): void => {
+        if (cancel()) resolve();
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) onAbort();
+      operation.then(
+        () => {
+          signal.removeEventListener('abort', onAbort);
+          resolve();
+        },
+        (error: unknown) => {
+          signal.removeEventListener('abort', onAbort);
+          reject(error);
+        },
+      );
+    });
+  }
+
+  private async finalizePendingReorg(): Promise<void> {
+    if (!this.reorgReadyForFinalization) {
+      throw new Error('Rollback shallow incomplet: finalisation post-reorg indisponible.');
+    }
+    const completion = await this.runPostReorg();
+    this.promoteRecoveredReorg(completion);
+    this.onRecovered?.();
   }
 
   waitForIdle(): Promise<void> {
     return this.tail;
   }
 
-  private async execute(request: ConfirmedRangeRequest): Promise<void> {
-    if (this.status.state !== 'HEALTHY') return;
+  private async runRequest(
+    request: ConfirmedRangeRequest,
+  ): Promise<boolean> {
+    this.activeRequests += 1;
+    this.status = { ...this.status, running: true };
+    try {
+      return await this.execute(request);
+    } finally {
+      this.activeRequests -= 1;
+      this.status = {
+        ...this.status,
+        running: this.activeRequests > 0,
+        pendingRequests: this.status.pendingRequests - 1,
+      };
+    }
+  }
+
+  private async runPostReorg(): Promise<CanonicalReorgCompletion | undefined> {
+    const afterReorg = this.afterReorg;
+    const scope: PostReorgScope = {
+      active: true,
+      reorgDetected: false,
+      inFlight: new Set(),
+      hasError: false,
+      firstError: undefined,
+    };
+    let completion: CanonicalReorgCompletion | undefined;
+    try {
+      await this.postReorgScopes.run(scope, async () => {
+        do {
+          scope.reorgDetected = false;
+          if (afterReorg) {
+            try {
+              const result = await afterReorg(this.status.state);
+              if (result !== undefined) completion = result;
+            } catch (error: unknown) {
+              if (!scope.hasError) {
+                scope.hasError = true;
+                scope.firstError = error;
+              }
+            }
+          }
+          while (scope.inFlight.size > 0) {
+            await Promise.all([...scope.inFlight]);
+          }
+          if (scope.hasError) throw scope.firstError;
+          if (
+            !scope.reorgDetected
+            && this.hydratedReorgs.length > 1
+            && (completion !== undefined || afterReorg === undefined)
+          ) {
+            this.promoteRecoveredReorg(completion);
+            const next = this.hydratedReorgs[0];
+            if (!next) {
+              throw new Error('Cascade de rollbacks hydratés incohérente.');
+            }
+            this.installHydratedReorg(next);
+            completion = undefined;
+            scope.reorgDetected = true;
+          }
+        } while (scope.reorgDetected);
+      });
+      return completion;
+    } finally {
+      scope.active = false;
+    }
+  }
+
+  private async execute(request: ConfirmedRangeRequest): Promise<boolean> {
+    const inPostReorgScope = this.postReorgScopes.getStore()?.active === true;
+    if (
+      this.status.state !== 'HEALTHY'
+      && !(this.status.state === 'RECONCILING' && inPostReorgScope)
+    ) return false;
+    if (
+      request.bootstrap !== undefined
+      && request.bootstrap !== 'confirmed-head'
+    ) {
+      throw new Error(
+        `Mode de bootstrap listener invalide: ${String(request.bootstrap)}.`,
+      );
+    }
 
     const latestBlock = await this.blockReader.getBlockNumber();
     const head = confirmedHead(latestBlock, this.confirmations);
-    if (head === null) return;
+    if (head === null) return false;
 
     const tip = await this.canonicalStore.getCanonicalTip();
-    if (tip && tip.number > head) return;
+    if (tip && tip.number > head) return false;
 
     const checkpoint = await this.checkpoints.get(request.listenerKey);
     if (
       checkpoint?.blockHash === null
       && checkpoint.blockNumber > head
     ) {
-      return;
+      return false;
     }
 
     const [oldestCheckpointBefore, descending] = await Promise.all([
@@ -386,7 +814,7 @@ export class CanonicalChainCoordinator {
       );
       if (remoteTip.hash.toLowerCase() !== tip.hash.toLowerCase()) {
         await this.reconcileDivergence(tip, remoteTip, descending, head);
-        return;
+        return true;
       }
     }
     const knownHeaders = new Map<bigint, CanonicalBlock>();
@@ -402,7 +830,9 @@ export class CanonicalChainCoordinator {
 
     const fromBlock = checkpoint
       ? checkpoint.blockNumber + 1n
-      : request.startBlock;
+      : request.bootstrap === 'confirmed-head'
+        ? head
+        : request.startBlock;
     const windowStart = this.canonicalWindowStart(head);
     const journalStart =
       oldestCheckpointBefore !== null && oldestCheckpointBefore < windowStart
@@ -457,11 +887,22 @@ export class CanonicalChainCoordinator {
       }
 
       let chunkStart = fromBlock;
+      let preparedChunk: CanonicalBlock[] = [];
       for await (const header of chunkHeaders.headers()) {
-        const processed = await request.processChunk(
-          chunkStart,
-          header.number,
-        );
+        preparedChunk.push(header);
+        if (
+          preparedChunk.length < Number(this.chunkSize)
+          && header.number !== head
+        ) {
+          continue;
+        }
+        const canonicalHeaders = preparedChunk;
+        preparedChunk = [];
+        const processChunk = () =>
+          request.processChunk(chunkStart, header.number, canonicalHeaders);
+        const processed = this.runtimeBarrier
+          ? await this.runtimeBarrier.runListener(processChunk)
+          : await processChunk();
         if (!processed) break;
         await this.checkpoints.set(request.listenerKey, {
           blockNumber: header.number,
@@ -482,6 +923,7 @@ export class CanonicalChainCoordinator {
     } finally {
       await this.disposeSpools(spools);
     }
+    return false;
   }
 
   private async reconcileDivergence(
@@ -533,26 +975,101 @@ export class CanonicalChainCoordinator {
       newTip,
       depth,
     };
-    this.status = { ...this.status, state: 'RECONCILING' };
+    const detectedAtMs = Date.now();
+    this.reorgReadyForFinalization = false;
+    this.status = {
+      ...this.status,
+      state: 'RECONCILING',
+      lastReorg: {
+        ...cloneReconciliation(reorg),
+        detectedAtMs,
+        status: 'RECONCILING',
+        impact: { depth, orphanedEvents: 0, replayedEvents: 0 },
+      },
+    };
     try {
       const impact = await this.reorgHandler.reconcileReorg(
         cloneReconciliation(reorg),
       );
+      const requiresManualReview = impact.requiresManualReview === true;
+      const canRecoverAutomatically = ancestor && !requiresManualReview;
       this.status = {
         ...this.status,
-        state: ancestor ? 'HEALTHY' : 'MANUAL_REVIEW',
+        state: canRecoverAutomatically ? 'RECONCILING' : 'MANUAL_REVIEW',
         lastReorg: {
           ...cloneReconciliation(reorg),
+          detectedAtMs,
+          status: canRecoverAutomatically ? 'RECONCILING' : 'MANUAL_REVIEW',
           impact: cloneImpact(impact),
         },
       };
+      this.reorgReadyForFinalization = Boolean(canRecoverAutomatically);
     } catch (error: unknown) {
       if (!ancestor) {
-        this.status = { ...this.status, state: 'MANUAL_REVIEW' };
+        this.status = {
+          ...this.status,
+          state: 'MANUAL_REVIEW',
+          lastReorg: this.status.lastReorg
+            ? { ...this.status.lastReorg, status: 'MANUAL_REVIEW' }
+            : null,
+        };
       }
       throw error;
     }
     if (!ancestor) throw new DeepReorgError();
+  }
+
+  private promoteRecoveredReorg(
+    completion: CanonicalReorgCompletion | undefined,
+  ): void {
+    const lastReorg = this.status.lastReorg;
+    if (
+      this.status.state !== 'RECONCILING'
+      || lastReorg === null
+      || lastReorg.status !== 'RECONCILING'
+    ) return;
+    const expectedIdentity = this.reorgIdentity(lastReorg);
+    const hydrated = this.hydratedReorgs[0];
+    const finalized = completion ?? (
+      this.afterReorg === undefined
+        ? {
+            identity: expectedIdentity,
+            reorgId: `runtime:${expectedIdentity}`,
+            replayedEvents: lastReorg.impact.replayedEvents,
+          }
+        : null
+    );
+    if (
+      finalized === null
+      || finalized.identity !== expectedIdentity
+      || (
+        hydrated !== undefined
+        && finalized.reorgId !== hydrated.reorgId
+      )
+      || finalized.reorgId.length === 0
+      || !Number.isSafeInteger(finalized.replayedEvents)
+      || finalized.replayedEvents < 0
+    ) {
+      throw new Error('Finalisation post-reorg incompatible avec le fork courant.');
+    }
+    this.status = {
+      ...this.status,
+      state: 'HEALTHY',
+      lastReorg: {
+        ...lastReorg,
+        status: 'RECOVERED',
+        impact: {
+          ...lastReorg.impact,
+          replayedEvents: finalized.replayedEvents,
+        },
+      },
+    };
+    if (hydrated !== undefined) this.hydratedReorgs.shift();
+    this.reorgReadyForFinalization = false;
+  }
+
+  private reorgIdentity(reorg: ReorgReconciliation): string {
+    return `${reorg.oldTip.hash.toLowerCase()}:${reorg.newTip.hash.toLowerCase()}`;
   }
 
   private validateDescendingWindow(
@@ -676,13 +1193,7 @@ export class CanonicalChainCoordinator {
       if (journalNeedsPersistence && number >= journalStart) {
         await journalHeaders.append(header);
       }
-      if (
-        number >= fromBlock
-        && (
-          (number - fromBlock + 1n) % this.chunkSize === 0n
-          || number === head
-        )
-      ) {
+      if (number >= fromBlock) {
         await chunkHeaders.append(header);
       }
       if (checkpoint?.blockHash === null && number === checkpoint.blockNumber) {

@@ -4,6 +4,7 @@ import type { Address, Hash } from 'viem';
 import {
   DiscoveredTokenRepository,
   RiskReportRepository,
+  SessionRepository,
   SwapEventRepository,
   TradeRepository,
 } from '../src/storage/repositories.js';
@@ -15,6 +16,7 @@ import type {
   TradeTransactionRecord,
 } from '../src/types/domain.js';
 import type { TokenRiskReport } from '../src/security/token-risk.types.js';
+import { stringifyJson } from '../src/utils/json.js';
 
 const ADDRESS = `0x${'1'.repeat(40)}` as Address;
 const TOKEN = `0x${'2'.repeat(40)}` as Address;
@@ -407,6 +409,78 @@ test('finalise un swap avec le snapshot de session après traitement', async () 
   assert.match(client.calls[0]?.sql ?? '', /processing_status = 'PROCESSED'/u);
   assert.deepEqual(client.calls[0]?.values?.slice(0, 1), ['event-1']);
   assert.match(String(client.calls[0]?.values?.[1]), /HOLDING/u);
+});
+
+test('liste uniquement les swaps canoniques traités dans l’ordre de chaîne', async () => {
+  const event = swapEvent();
+  const calls: Array<{ sql: string; values?: unknown[] }> = [];
+  const repository = new SwapEventRepository({
+    connect: async () => {
+      throw new Error('transaction inattendue');
+    },
+    query: async <T>(sql: string, values?: unknown[]) => {
+      calls.push({ sql, ...(values ? { values } : {}) });
+      return {
+        rows: [{ payload: stringifyJson(event) } as T],
+      };
+    },
+  });
+
+  const result = await repository.listCanonicalProcessedEvents(ADDRESS);
+
+  assert.deepEqual(result, [event]);
+  assert.match(calls[0]?.sql ?? '', /canonical = TRUE/u);
+  assert.match(
+    calls[0]?.sql ?? '',
+    /processing_status = 'PROCESSED'/u,
+  );
+  assert.match(
+    calls[0]?.sql ?? '',
+    /ORDER BY block_number, transaction_index, log_index, event_id/u,
+  );
+  assert.deepEqual(calls[0]?.values, [ADDRESS.toLowerCase()]);
+});
+
+test('persiste une session réconciliée avec son indicateur canonique sous barrière', async () => {
+  const calls: Array<{ sql: string; values?: unknown[] }> = [];
+  const repository = new SessionRepository({
+    query: async <T>(sql: string, values?: unknown[]) => {
+      calls.push({ sql, ...(values ? { values } : {}) });
+      return { rows: [{ pair_address: ADDRESS.toLowerCase() } as T] };
+    },
+  });
+  const reconciled = session('REJECTED');
+
+  await repository.saveReconciledSession(reconciled, false);
+
+  assert.match(calls[0]?.sql ?? '', /canonical = \$5/u);
+  assert.match(calls[0]?.sql ?? '', /recovery_owner IS NULL/u);
+  assert.match(calls[0]?.sql ?? '', /RETURNING pair_address/u);
+  assert.deepEqual(calls[0]?.values?.slice(0, 3), [
+    ADDRESS.toLowerCase(),
+    TOKEN.toLowerCase(),
+    'REJECTED',
+  ]);
+  assert.equal(calls[0]?.values?.[4], false);
+  assert.match(String(calls[0]?.values?.[3]), /REJECTED/u);
+});
+
+test('refuse d’écraser une session réconciliée détenue par un lease recovery', async () => {
+  const calls: Array<{ sql: string; values?: unknown[] }> = [];
+  const repository = new SessionRepository({
+    query: async <T>(sql: string, values?: unknown[]) => {
+      calls.push({ sql, ...(values ? { values } : {}) });
+      return { rows: [] as T[] };
+    },
+  });
+
+  await assert.rejects(
+    repository.saveReconciledSession(session('REJECTED'), false),
+    /session.*réconciliée.*verrouillée/iu,
+  );
+
+  assert.match(calls[0]?.sql ?? '', /recovery_owner IS NULL/u);
+  assert.match(calls[0]?.sql ?? '', /RETURNING pair_address/u);
 });
 
 test('persiste la provenance canonique de la découverte', async () => {

@@ -1,4 +1,4 @@
-import { isHash, type Address, type Hash } from 'viem';
+import { isAddress, isHash, type Address, type Hash } from 'viem';
 import type {
   CanonicalBlock,
   ChainReorgStatus,
@@ -12,6 +12,7 @@ import type {
 } from './canonical-chain.types.js';
 import { pool } from '../storage/database.js';
 import type { TokenSession } from '../types/domain.js';
+import { isTokenSession } from '../types/domain-validation.js';
 import { parseJson, stringifyJson } from '../utils/json.js';
 
 interface CanonicalChainDatabase {
@@ -50,11 +51,22 @@ interface ChainReorgRow {
 
 interface ReorgAuditUpsertRow {
   status: ChainReorgStatus;
+  orphaned_events: string;
+  replayed_events: string;
   details: unknown;
 }
 
 interface ReorgAuditStatusRow {
   status: ChainReorgStatus;
+}
+
+interface ReplayedEventCountRow {
+  replayed_events: string;
+}
+
+export interface PendingShallowReorg {
+  readonly audit: ChainReorgAudit;
+  readonly rollbackImpact: ReorgRollbackImpact;
 }
 
 interface DiscoveryImpactRow {
@@ -111,13 +123,158 @@ function reorgId(reorg: ReorgReconciliation): string {
 }
 
 function objectDetails(value: unknown): Record<string, unknown> {
-  return parseJson<Record<string, unknown>>(value ?? {});
+  return typeof value === 'string'
+    ? parseJson<Record<string, unknown>>(value)
+    : parseJson<Record<string, unknown>>(stringifyJson(value ?? {}));
 }
 
 function savedRollbackImpact(details: unknown): ReorgRollbackImpact | null {
   const value = objectDetails(details).rollbackImpact;
   if (typeof value !== 'object' || value === null) return null;
-  return parseJson<ReorgRollbackImpact>(value);
+  return parseJson<ReorgRollbackImpact>(stringifyJson(value));
+}
+
+function validNonNegativeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+function validSessionSnapshot(
+  session: unknown,
+  pairAddress: Address,
+): session is TokenSession | null {
+  return session === null || (
+    isTokenSession(session)
+    && session.pair.pair.toLowerCase() === pairAddress.toLowerCase()
+  );
+}
+
+function parsedSessionSnapshot(
+  value: unknown | null,
+  pairAddress: string,
+): TokenSession | null {
+  if (value === null) return null;
+  if (!isAddress(pairAddress)) {
+    throw new Error(`Adresse de paire invalide pour un snapshot de session: ${pairAddress}`);
+  }
+  const session = typeof value === 'string'
+    ? parseJson<TokenSession>(value)
+    : parseJson<TokenSession>(stringifyJson(value));
+  if (!validSessionSnapshot(session, pairAddress)) {
+    throw new Error(
+      `Snapshot de session invalide pour la paire ${pairAddress.toLowerCase()}.`,
+    );
+  }
+  return session;
+}
+
+interface RollbackImpactExpectation {
+  readonly reorgId: string;
+  readonly depth: number | null;
+  readonly orphanedEvents: number;
+  readonly replayedEvents: number;
+}
+
+function validateRollbackImpact(
+  details: unknown,
+  expected: RollbackImpactExpectation,
+): ReorgRollbackImpact {
+  try {
+    const impact = savedRollbackImpact(details);
+    if (
+      impact === null
+      || impact.reorgId !== expected.reorgId
+      || impact.depth !== expected.depth
+      || !validNonNegativeInteger(impact.orphanedEvents)
+      || !validNonNegativeInteger(impact.replayedEvents)
+      || impact.orphanedEvents !== expected.orphanedEvents
+      || impact.replayedEvents !== expected.replayedEvents
+      || !Array.isArray(impact.orphanedEventIds)
+      || impact.orphanedEventIds.length !== impact.orphanedEvents
+      || !impact.orphanedEventIds.every((eventId) => typeof eventId === 'string' && eventId.length > 0)
+      || new Set(
+        impact.orphanedEventIds.map((eventId) => eventId.toLowerCase()),
+      ).size !== impact.orphanedEventIds.length
+      || !Array.isArray(impact.affectedPairs)
+      || !impact.affectedPairs.every((pair) =>
+        typeof pair === 'object'
+        && pair !== null
+        && isAddress((pair as ReorgRollbackPairImpact).pairAddress)
+        && typeof (pair as ReorgRollbackPairImpact).discoveryOrphaned === 'boolean'
+        && typeof (pair as ReorgRollbackPairImpact).hasWalletConsequence === 'boolean'
+        && validSessionSnapshot(
+          (pair as ReorgRollbackPairImpact).earliestSessionBefore,
+          (pair as ReorgRollbackPairImpact).pairAddress,
+        )
+        && validSessionSnapshot(
+          (pair as ReorgRollbackPairImpact).latestCanonicalSessionAfter,
+          (pair as ReorgRollbackPairImpact).pairAddress,
+        )
+      )
+      || new Set(
+        impact.affectedPairs.map((pair) => pair.pairAddress.toLowerCase()),
+      ).size !== impact.affectedPairs.length
+    ) {
+      throw new Error('invalid');
+    }
+    return impact;
+  } catch {
+    throw new Error('Rollback persistant invalide pour un audit RECONCILING.');
+  }
+}
+
+function validatePendingRollbackImpact(
+  audit: ChainReorgAudit,
+): ReorgRollbackImpact {
+  return validateRollbackImpact(audit.details, {
+    reorgId: audit.id,
+    depth: audit.impact.depth,
+    orphanedEvents: audit.impact.orphanedEvents,
+    replayedEvents: audit.impact.replayedEvents,
+  });
+}
+
+function auditCounter(value: string, name: string): number {
+  const counter = Number(value);
+  if (!validNonNegativeInteger(counter)) {
+    throw new Error(`Compteur ${name} invalide dans l’audit de reorg.`);
+  }
+  return counter;
+}
+
+function validatePairAddress(value: string, source: string): Address {
+  if (!isAddress(value)) {
+    throw new Error(`Adresse de paire invalide lue depuis ${source}: ${value}`);
+  }
+  return value;
+}
+
+function chainReorgAudit(row: ChainReorgRow): ChainReorgAudit {
+  return {
+    id: row.reorg_id,
+    detectedAtMs: Number(row.detected_at_ms),
+    commonAncestor:
+      row.common_ancestor_number === null || row.common_ancestor_hash === null
+        ? null
+        : {
+            number: BigInt(row.common_ancestor_number),
+            hash: hash(row.common_ancestor_hash),
+          },
+    previousTip: {
+      number: BigInt(row.previous_tip_number),
+      hash: hash(row.previous_tip_hash),
+    },
+    replacementTip: {
+      number: BigInt(row.replacement_tip_number),
+      hash: hash(row.replacement_tip_hash),
+    },
+    status: row.status,
+    impact: {
+      depth: row.depth === null ? null : Number(row.depth),
+      orphanedEvents: Number(row.orphaned_events),
+      replayedEvents: Number(row.replayed_events),
+    },
+    details: objectDetails(row.details),
+  };
 }
 
 function compareSwapRows(left: SwapImpactRow, right: SwapImpactRow): number {
@@ -266,33 +423,142 @@ export class CanonicalChainRepository {
        ORDER BY detected_at DESC LIMIT 1`,
     );
     const row = result.rows[0];
+    return row ? chainReorgAudit(row) : null;
+  }
+
+  async getManualReviewReorg(): Promise<ChainReorgAudit | null> {
+    const result = await this.database.query<ChainReorgRow>(
+      `SELECT
+         reorg_id,
+         (EXTRACT(EPOCH FROM detected_at) * 1000)::bigint::text AS detected_at_ms,
+         common_ancestor_number::text,
+         common_ancestor_hash,
+         previous_tip_number::text,
+         previous_tip_hash,
+         replacement_tip_number::text,
+         replacement_tip_hash,
+         status,
+         depth::text,
+         orphaned_events::text,
+         replayed_events::text,
+         details
+       FROM chain_reorgs
+       WHERE status = 'MANUAL_REVIEW'
+       ORDER BY detected_at DESC, reorg_id DESC
+       LIMIT 1`,
+    );
+    const row = result.rows[0];
     if (!row) return null;
-    return {
-      id: row.reorg_id,
-      detectedAtMs: Number(row.detected_at_ms),
-      commonAncestor:
-        row.common_ancestor_number === null || row.common_ancestor_hash === null
-          ? null
-          : {
-              number: BigInt(row.common_ancestor_number),
-              hash: hash(row.common_ancestor_hash),
-            },
-      previousTip: {
-        number: BigInt(row.previous_tip_number),
-        hash: hash(row.previous_tip_hash),
-      },
-      replacementTip: {
-        number: BigInt(row.replacement_tip_number),
-        hash: hash(row.replacement_tip_hash),
-      },
-      status: row.status,
-      impact: {
-        depth: row.depth === null ? null : Number(row.depth),
-        orphanedEvents: Number(row.orphaned_events),
-        replayedEvents: Number(row.replayed_events),
-      },
-      details: row.details,
-    };
+    try {
+      if (
+        (row.common_ancestor_number === null)
+        !== (row.common_ancestor_hash === null)
+      ) {
+        throw new Error('invalid');
+      }
+      const audit = chainReorgAudit(row);
+      const expectedId =
+        `reorg:${audit.previousTip.hash.toLowerCase()}:${audit.replacementTip.hash.toLowerCase()}`;
+      const shallow = audit.commonAncestor !== null;
+      const validDepth = shallow
+        && audit.impact.depth !== null
+        && Number.isSafeInteger(audit.impact.depth)
+        && audit.impact.depth >= 1
+        && audit.impact.depth <= 128
+        && audit.previousTip.number > audit.commonAncestor!.number
+        && BigInt(audit.impact.depth)
+          === audit.previousTip.number - audit.commonAncestor!.number
+        && audit.replacementTip.number >= audit.previousTip.number
+        && typeof audit.details.reason === 'string'
+        && MANUAL_REVIEW_REASONS.has(
+          audit.details.reason as ReorgManualReviewReason,
+        );
+      const validDeep = !shallow
+        && audit.impact.depth === null
+        && audit.details.reason === 'NO_COMMON_ANCESTOR_WITHIN_RETENTION';
+      if (
+        audit.id !== expectedId
+        || audit.status !== 'MANUAL_REVIEW'
+        || !Number.isSafeInteger(audit.detectedAtMs)
+        || audit.detectedAtMs < 0
+        || audit.previousTip.number < 0n
+        || audit.replacementTip.number < 0n
+        || !validNonNegativeInteger(audit.impact.orphanedEvents)
+        || !validNonNegativeInteger(audit.impact.replayedEvents)
+        || (!validDepth && !validDeep)
+      ) {
+        throw new Error('invalid');
+      }
+      return audit;
+    } catch {
+      throw new Error('Audit MANUAL_REVIEW persistant invalide.');
+    }
+  }
+
+  async getPendingShallowReorg(): Promise<PendingShallowReorg | null> {
+    const pending = await this.listPendingShallowReorgs();
+    return pending[0] ?? null;
+  }
+
+  async listPendingShallowReorgs(): Promise<PendingShallowReorg[]> {
+    const result = await this.database.query<ChainReorgRow>(
+      `SELECT
+         reorg_id,
+         (EXTRACT(EPOCH FROM detected_at) * 1000)::bigint::text AS detected_at_ms,
+         common_ancestor_number::text,
+         common_ancestor_hash,
+         previous_tip_number::text,
+         previous_tip_hash,
+         replacement_tip_number::text,
+         replacement_tip_hash,
+         status,
+         depth::text,
+         orphaned_events::text,
+         replayed_events::text,
+         details
+       FROM chain_reorgs
+       WHERE status = 'RECONCILING'
+       ORDER BY detected_at ASC, reorg_id ASC`,
+    );
+    return result.rows.map((row) => {
+      const audit = chainReorgAudit(row);
+      if (
+        audit.status !== 'RECONCILING'
+        || audit.commonAncestor === null
+        || audit.impact.depth === null
+        || audit.impact.depth < 1
+        || audit.impact.depth > 128
+        || !Number.isSafeInteger(audit.impact.depth)
+        || BigInt(audit.impact.depth) !== audit.previousTip.number - audit.commonAncestor.number
+        || audit.replacementTip.number < audit.previousTip.number
+      ) {
+        throw new Error('Rollback persistant invalide pour un audit RECONCILING.');
+      }
+      return {
+        audit,
+        rollbackImpact: validatePendingRollbackImpact(audit),
+      };
+    });
+  }
+
+  async countCanonicalProcessedEvents(
+    eventIds: readonly string[],
+  ): Promise<number> {
+    if (eventIds.length === 0) return 0;
+    const result = await this.database.query<ReplayedEventCountRow>(
+      `SELECT COUNT(*)::text AS replayed_events
+       FROM swap_events
+       WHERE event_id = ANY($1::text[])
+         AND canonical = TRUE
+         AND processing_status = 'PROCESSED'`,
+      [[...eventIds]],
+    );
+    const value = result.rows[0]?.replayed_events ?? '0';
+    const count = Number(value);
+    if (!Number.isSafeInteger(count) || count < 0) {
+      throw new Error('Compteur de replays canoniques invalide en base.');
+    }
+    return count;
   }
 
   async rewindToAncestor(
@@ -307,8 +573,21 @@ export class CanonicalChainRepository {
         'RECONCILING',
         {},
       );
-      const previousImpact = savedRollbackImpact(audit.details);
-      if (previousImpact) return previousImpact;
+      const auditDetails = objectDetails(audit.details);
+      if (Object.hasOwn(auditDetails, 'rollbackImpact')) {
+        return validateRollbackImpact(audit.details, {
+          reorgId: id,
+          depth: reorg.depth,
+          orphanedEvents: auditCounter(
+            audit.orphaned_events,
+            'orphaned_events',
+          ),
+          replayedEvents: auditCounter(
+            audit.replayed_events,
+            'replayed_events',
+          ),
+        });
+      }
 
       const ancestorNumber = reorg.ancestor.number.toString();
       const discoveryResult = await client.query<DiscoveryImpactRow>(
@@ -346,6 +625,17 @@ export class CanonicalChainRepository {
          FOR UPDATE OF t`,
         [orphanedEventIds],
       );
+      for (const row of discoveryResult.rows) {
+        if (row.pair_address !== null) {
+          validatePairAddress(row.pair_address, 'discovered_tokens');
+        }
+      }
+      for (const row of swaps) {
+        validatePairAddress(row.pair_address, 'swap_events');
+      }
+      for (const row of tradeResult.rows) {
+        validatePairAddress(row.pair_address, 'trades');
+      }
 
       const pairAddresses = [
         ...new Set([
@@ -372,6 +662,9 @@ export class CanonicalChainRepository {
              transaction_index DESC, log_index DESC, event_id DESC`,
           [ancestorNumber, pairAddresses],
         );
+      for (const row of canonicalSessions.rows) {
+        validatePairAddress(row.pair_address, 'swap_events');
+      }
 
       const discoveries = new Set(
         discoveryResult.rows.flatMap(({ pair_address }) =>
@@ -384,16 +677,14 @@ export class CanonicalChainRepository {
         if (!earliestSessions.has(pairAddress)) {
           earliestSessions.set(
             pairAddress,
-            row.session_before === null
-              ? null
-              : parseJson<TokenSession>(row.session_before),
+            parsedSessionSnapshot(row.session_before, row.pair_address),
           );
         }
       }
       const latestCanonicalSessions = new Map(
         canonicalSessions.rows.map((row) => [
           row.pair_address.toLowerCase(),
-          parseJson<TokenSession>(row.session_after),
+          parsedSessionSnapshot(row.session_after, row.pair_address),
         ]),
       );
       const walletPairs = new Set(
@@ -588,7 +879,11 @@ export class CanonicalChainRepository {
              THEN chain_reorgs.details
            ELSE chain_reorgs.details || EXCLUDED.details
          END
-       RETURNING status, details`,
+       RETURNING
+         status,
+         orphaned_events::text,
+         replayed_events::text,
+         details`,
       [
         reorgId(reorg),
         reorg.ancestor?.number.toString() ?? null,

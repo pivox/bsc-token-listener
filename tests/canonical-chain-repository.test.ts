@@ -1,19 +1,60 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import type { Hash } from 'viem';
+import type { Address, Hash } from 'viem';
 import { CanonicalChainRepository } from '../src/chain/canonical-chain.repository.js';
 import type {
   CanonicalBlock,
   ChainReorgStatus,
   ReorgReconciliation,
+  ReorgRollbackImpact,
 } from '../src/chain/canonical-chain.types.js';
 import { CheckpointRepository } from '../src/storage/repositories.js';
+import { stringifyJson } from '../src/utils/json.js';
+import type { TokenSession } from '../src/types/domain.js';
 
 const HASH_10 = `0x${'1'.repeat(64)}` as Hash;
 const HASH_11 = `0x${'2'.repeat(64)}` as Hash;
 const HASH_12 = `0x${'3'.repeat(64)}` as Hash;
 const HASH_13 = `0x${'4'.repeat(64)}` as Hash;
+const PAIR_A = `0x${'a'.repeat(40)}` as Address;
+const PAIR_B = `0x${'b'.repeat(40)}` as Address;
+
+function validSession(pair: Address, updatedAtMs: number): TokenSession {
+  const token = `0x${'5'.repeat(40)}` as Address;
+  const wbnb = `0x${'6'.repeat(40)}` as Address;
+  return {
+    pair: {
+      factory: `0x${'1'.repeat(40)}`,
+      router: `0x${'2'.repeat(40)}`,
+      wbnb,
+      pair,
+      token,
+      token0: token,
+      token1: wbnb,
+      createdBlock: 10n,
+      blockHash: HASH_10,
+      createdTransactionHash: HASH_11,
+      createdLogIndex: 0,
+      discoveredAtMs: 1,
+    },
+    metadata: {
+      address: token,
+      name: 'Token',
+      symbol: 'TKN',
+      decimals: 18,
+      totalSupply: 1_000n,
+      codeSizeBytes: 1,
+    },
+    status: 'WAITING_FIRST_BUY',
+    subsequentBuyCount: 0,
+    targetBuysAfterEntry: 3,
+    countedBuyTransactionHashes: [],
+    sellAttempts: 0,
+    createdAtMs: 1,
+    updatedAtMs,
+  };
+}
 
 const SHALLOW_REORG: ReorgReconciliation = {
   ancestor: { number: 10n, hash: HASH_10, parentHash: HASH_10 },
@@ -47,6 +88,11 @@ class StatefulReorgDatabase {
     mutations: [],
   };
   failOn: string | null = null;
+  canonicalProcessedCount = 0;
+  sessionBeforeOverride: unknown | undefined;
+  discoveryPairOverride: string | undefined;
+  walletSwapPairOverride: string | undefined;
+  tradePairOverride: string | undefined;
   private pending: ReorgFixtureState | null = null;
 
   async connect(): Promise<this> {
@@ -79,6 +125,12 @@ class StatefulReorgDatabase {
       return { rows: [] };
     }
     const staged = this.pending ?? this.state;
+    if (
+      normalized.includes('SELECT COUNT(*)::text AS replayed_events')
+      && normalized.includes('FROM swap_events')
+    ) {
+      return { rows: [{ replayed_events: String(this.canonicalProcessedCount) }] as T[] };
+    }
     if (normalized.includes('INSERT INTO chain_reorgs')) {
       if (staged.auditCount === 0) {
         staged.auditCount = 1;
@@ -102,6 +154,11 @@ class StatefulReorgDatabase {
       return {
         rows: [{
           status: staged.auditStatus,
+          orphaned_events: String(
+            (staged.rollbackImpact as { orphanedEvents?: number } | null)
+              ?.orphanedEvents ?? 0,
+          ),
+          replayed_events: String(staged.replayedEvents),
           details: staged.rollbackImpact === null
             ? staged.details
             : { ...staged.details, rollbackImpact: staged.rollbackImpact },
@@ -111,8 +168,8 @@ class StatefulReorgDatabase {
     if (normalized.includes('FROM discovered_tokens') && normalized.includes('FOR UPDATE')) {
       return {
         rows: [
-          { pair_address: '0xpair-b' },
-          { pair_address: '0xpair-a' },
+          { pair_address: PAIR_B },
+          { pair_address: this.discoveryPairOverride ?? PAIR_A },
         ] as T[],
       };
     }
@@ -121,23 +178,25 @@ class StatefulReorgDatabase {
         rows: [
           {
             event_id: 'event-late',
-            pair_address: '0xpair-a',
+            pair_address: PAIR_A,
             block_number: '12',
             transaction_index: 1,
             log_index: 0,
-            session_before: '{"step":"late"}',
+            session_before: stringifyJson(validSession(PAIR_A, 2)),
           },
           {
             event_id: 'event-early',
-            pair_address: '0xpair-a',
+            pair_address: PAIR_A,
             block_number: '11',
             transaction_index: 0,
             log_index: 2,
-            session_before: '{"step":"baseline"}',
+            session_before: this.sessionBeforeOverride === undefined
+              ? stringifyJson(validSession(PAIR_A, 1))
+              : stringifyJson(this.sessionBeforeOverride),
           },
           {
             event_id: 'event-wallet',
-            pair_address: '0xpair-b',
+            pair_address: this.walletSwapPairOverride ?? PAIR_B,
             block_number: '11',
             transaction_index: 1,
             log_index: 1,
@@ -149,8 +208,12 @@ class StatefulReorgDatabase {
     if (normalized.includes('FROM trades') && normalized.includes('FOR UPDATE')) {
       return {
         rows: [
-          { trade_id: 'dry-trade', pair_address: '0xpair-a', has_transaction: false },
-          { trade_id: 'wallet-trade', pair_address: '0xpair-b', has_transaction: true },
+          {
+            trade_id: 'dry-trade',
+            pair_address: this.tradePairOverride ?? PAIR_A,
+            has_transaction: false,
+          },
+          { trade_id: 'wallet-trade', pair_address: PAIR_B, has_transaction: true },
         ] as T[],
       };
     }
@@ -160,8 +223,8 @@ class StatefulReorgDatabase {
     ) {
       return {
         rows: [{
-          pair_address: '0xpair-b',
-          session_after: '{"step":"canonical"}',
+          pair_address: PAIR_B,
+          session_after: stringifyJson(validSession(PAIR_B, 3)),
         }] as T[],
       };
     }
@@ -338,6 +401,47 @@ test('upsert le numéro et le hash du checkpoint', async () => {
   assert.match(database.calls[0]?.sql ?? '', /block_hash = EXCLUDED\.block_hash/u);
 });
 
+test('supprime exactement le checkpoint terminal demandé', async () => {
+  const database = new RecordingDatabase();
+  const repository = new CheckpointRepository(database);
+  const remove = (
+    repository as unknown as { delete(key: string): Promise<void> }
+  ).delete.bind(repository);
+
+  await remove('swap:0xabc');
+
+  assert.deepEqual(database.calls[0]?.values, ['swap:0xabc']);
+  assert.match(
+    database.calls[0]?.sql ?? '',
+    /DELETE FROM listener_checkpoints WHERE listener_key = \$1/u,
+  );
+});
+
+test('nettoie idempotemment uniquement les checkpoints Swap de sessions non monitorables', async () => {
+  const database = new RecordingDatabase();
+  database.rows = [
+    { listener_key: 'swap:0xclosed' },
+    { listener_key: 'swap:0xmanual' },
+  ];
+  const repository = new CheckpointRepository(database);
+  const cleanup = (
+    repository as unknown as {
+      deleteNonMonitorableSwapCheckpoints(): Promise<number>;
+    }
+  ).deleteNonMonitorableSwapCheckpoints.bind(repository);
+
+  assert.equal(await cleanup(), 2);
+  const call = database.calls[0];
+  assert.match(call?.sql ?? '', /DELETE FROM listener_checkpoints/u);
+  assert.match(call?.sql ?? '', /USING token_sessions/u);
+  assert.match(call?.sql ?? '', /listener_key = 'swap:' \|\| LOWER\(sessions\.pair_address\)/u);
+  assert.match(
+    call?.sql ?? '',
+    /sessions\.status NOT IN \('WAITING_FIRST_BUY', 'HOLDING'\)/u,
+  );
+  assert.match(call?.sql ?? '', /RETURNING checkpoints\.listener_key/u);
+});
+
 test('charge le plus ancien numéro de checkpoint sans conversion en number', async () => {
   const database = new RecordingDatabase();
   database.rows = [{ block_number: '9007199254740993' }];
@@ -483,6 +587,370 @@ test('mappe un audit encore sans ancêtre commun ni profondeur', async () => {
   assert.deepEqual(audit?.details, {});
 });
 
+test('charge et valide le dernier audit MANUAL_REVIEW terminal, y compris profond', async () => {
+  const database = new RecordingDatabase();
+  database.rows = [{
+    reorg_id: `reorg:${HASH_12}:${HASH_13}`,
+    detected_at_ms: '1753700000000',
+    common_ancestor_number: null,
+    common_ancestor_hash: null,
+    previous_tip_number: '12',
+    previous_tip_hash: HASH_12,
+    replacement_tip_number: '13',
+    replacement_tip_hash: HASH_13,
+    status: 'MANUAL_REVIEW',
+    depth: null,
+    orphaned_events: '0',
+    replayed_events: '0',
+    details: { reason: 'NO_COMMON_ANCESTOR_WITHIN_RETENTION' },
+  }];
+  const repository = new CanonicalChainRepository(database);
+  const loadManualReview = (
+    repository as unknown as {
+      getManualReviewReorg(): Promise<unknown>;
+    }
+  ).getManualReviewReorg.bind(repository);
+
+  const audit = await loadManualReview();
+
+  assert.deepEqual(audit, {
+    id: `reorg:${HASH_12}:${HASH_13}`,
+    detectedAtMs: 1_753_700_000_000,
+    commonAncestor: null,
+    previousTip: { number: 12n, hash: HASH_12 },
+    replacementTip: { number: 13n, hash: HASH_13 },
+    status: 'MANUAL_REVIEW',
+    impact: { depth: null, orphanedEvents: 0, replayedEvents: 0 },
+    details: { reason: 'NO_COMMON_ANCESTOR_WITHIN_RETENTION' },
+  });
+  assert.match(database.calls[0]?.sql ?? '', /status = 'MANUAL_REVIEW'/u);
+});
+
+test('refuse fail-closed un audit MANUAL_REVIEW terminal incohérent', async () => {
+  const database = new RecordingDatabase();
+  database.rows = [{
+    reorg_id: `reorg:${HASH_12}:${HASH_13}`,
+    detected_at_ms: '1753700000000',
+    common_ancestor_number: '10',
+    common_ancestor_hash: HASH_10,
+    previous_tip_number: '12',
+    previous_tip_hash: HASH_12,
+    replacement_tip_number: '13',
+    replacement_tip_hash: HASH_13,
+    status: 'MANUAL_REVIEW',
+    depth: '1',
+    orphaned_events: '0',
+    replayed_events: '0',
+    details: { reason: 'WALLET_CONSEQUENCE_REQUIRES_REVIEW' },
+  }];
+  const repository = new CanonicalChainRepository(database);
+  const loadManualReview = (
+    repository as unknown as {
+      getManualReviewReorg(): Promise<unknown>;
+    }
+  ).getManualReviewReorg.bind(repository);
+
+  await assert.rejects(loadManualReview(), /MANUAL_REVIEW.*invalide/u);
+});
+
+test('refuse un ancêtre MANUAL_REVIEW partiellement NULL au lieu de le traiter comme deep', async () => {
+  const database = new RecordingDatabase();
+  database.rows = [{
+    reorg_id: `reorg:${HASH_12}:${HASH_13}`,
+    detected_at_ms: '1753700000000',
+    common_ancestor_number: '10',
+    common_ancestor_hash: null,
+    previous_tip_number: '12',
+    previous_tip_hash: HASH_12,
+    replacement_tip_number: '13',
+    replacement_tip_hash: HASH_13,
+    status: 'MANUAL_REVIEW',
+    depth: null,
+    orphaned_events: '0',
+    replayed_events: '0',
+    details: { reason: 'NO_COMMON_ANCESTOR_WITHIN_RETENTION' },
+  }];
+  const repository = new CanonicalChainRepository(database);
+
+  await assert.rejects(
+    repository.getManualReviewReorg(),
+    /MANUAL_REVIEW.*invalide/u,
+  );
+});
+
+test('hydrate le premier audit shallow RECONCILING avec ses snapshots validés', async () => {
+  const database = new RecordingDatabase();
+  const rollbackImpact: ReorgRollbackImpact = {
+    reorgId: `reorg:${HASH_12}:${HASH_13}`,
+    depth: 2,
+    orphanedEvents: 1,
+    replayedEvents: 0,
+    orphanedEventIds: ['event-1'],
+    affectedPairs: [{
+      pairAddress: PAIR_A,
+      discoveryOrphaned: false,
+      earliestSessionBefore: validSession(PAIR_A, 1),
+      latestCanonicalSessionAfter: null,
+      hasWalletConsequence: false,
+    }],
+  };
+  database.rows = [{
+    reorg_id: rollbackImpact.reorgId,
+    detected_at_ms: '1753700000000',
+    common_ancestor_number: '10',
+    common_ancestor_hash: HASH_10,
+    previous_tip_number: '12',
+    previous_tip_hash: HASH_12,
+    replacement_tip_number: '13',
+    replacement_tip_hash: HASH_13,
+    status: 'RECONCILING',
+    depth: '2',
+    orphaned_events: '1',
+    replayed_events: '0',
+    details: stringifyJson({ rollbackImpact }),
+  }];
+  const repository = new CanonicalChainRepository(database);
+
+  const pending = await repository.getPendingShallowReorg();
+
+  assert.equal(pending?.audit.id, rollbackImpact.reorgId);
+  assert.deepEqual(pending?.rollbackImpact, rollbackImpact);
+  assert.match(database.calls[0]?.sql ?? '', /WHERE status = 'RECONCILING'/u);
+});
+
+test('charge tous les audits shallow RECONCILING dans leur ordre FIFO autoritatif', async () => {
+  const database = new RecordingDatabase();
+  const firstImpact: ReorgRollbackImpact = {
+    reorgId: `reorg:${HASH_11}:${HASH_12}`,
+    depth: 1,
+    orphanedEvents: 1,
+    replayedEvents: 0,
+    orphanedEventIds: ['event-first'],
+    affectedPairs: [],
+  };
+  const secondImpact: ReorgRollbackImpact = {
+    reorgId: `reorg:${HASH_12}:${HASH_13}`,
+    depth: 2,
+    orphanedEvents: 1,
+    replayedEvents: 0,
+    orphanedEventIds: ['event-second'],
+    affectedPairs: [],
+  };
+  database.rows = [
+    {
+      reorg_id: firstImpact.reorgId,
+      detected_at_ms: '1753700000000',
+      common_ancestor_number: '10',
+      common_ancestor_hash: HASH_10,
+      previous_tip_number: '11',
+      previous_tip_hash: HASH_11,
+      replacement_tip_number: '12',
+      replacement_tip_hash: HASH_12,
+      status: 'RECONCILING',
+      depth: '1',
+      orphaned_events: '1',
+      replayed_events: '0',
+      details: { rollbackImpact: firstImpact },
+    },
+    {
+      reorg_id: secondImpact.reorgId,
+      detected_at_ms: '1753700001000',
+      common_ancestor_number: '10',
+      common_ancestor_hash: HASH_10,
+      previous_tip_number: '12',
+      previous_tip_hash: HASH_12,
+      replacement_tip_number: '13',
+      replacement_tip_hash: HASH_13,
+      status: 'RECONCILING',
+      depth: '2',
+      orphaned_events: '1',
+      replayed_events: '0',
+      details: { rollbackImpact: secondImpact },
+    },
+  ];
+  const repository = new CanonicalChainRepository(database);
+
+  const pending = await repository.listPendingShallowReorgs();
+
+  assert.deepEqual(
+    pending.map(({ audit }) => audit.id),
+    [firstImpact.reorgId, secondImpact.reorgId],
+  );
+  assert.match(database.calls[0]?.sql ?? '', /ORDER BY detected_at ASC, reorg_id ASC/u);
+});
+
+test('refuse un rollback persistant dont les compteurs divergent de l’audit', async () => {
+  const database = new RecordingDatabase();
+  database.rows = [{
+    reorg_id: `reorg:${HASH_12}:${HASH_13}`,
+    detected_at_ms: '1753700000000',
+    common_ancestor_number: '10',
+    common_ancestor_hash: HASH_10,
+    previous_tip_number: '12',
+    previous_tip_hash: HASH_12,
+    replacement_tip_number: '13',
+    replacement_tip_hash: HASH_13,
+    status: 'RECONCILING',
+    depth: '2',
+    orphaned_events: '2',
+    replayed_events: '0',
+    details: {
+      rollbackImpact: {
+        reorgId: `reorg:${HASH_12}:${HASH_13}`,
+        depth: 2,
+        orphanedEvents: 1,
+        replayedEvents: 0,
+        orphanedEventIds: ['event-1'],
+        affectedPairs: [],
+      },
+    },
+  }];
+  const repository = new CanonicalChainRepository(database);
+
+  await assert.rejects(
+    repository.listPendingShallowReorgs(),
+    /rollback persistant invalide/ui,
+  );
+});
+
+test('refuse des identifiants d’événements orphelins dupliqués', async () => {
+  const database = new RecordingDatabase();
+  database.rows = [{
+    reorg_id: `reorg:${HASH_12}:${HASH_13}`,
+    detected_at_ms: '1753700000000',
+    common_ancestor_number: '10',
+    common_ancestor_hash: HASH_10,
+    previous_tip_number: '12',
+    previous_tip_hash: HASH_12,
+    replacement_tip_number: '13',
+    replacement_tip_hash: HASH_13,
+    status: 'RECONCILING',
+    depth: '2',
+    orphaned_events: '2',
+    replayed_events: '0',
+    details: {
+      rollbackImpact: {
+        reorgId: `reorg:${HASH_12}:${HASH_13}`,
+        depth: 2,
+        orphanedEvents: 2,
+        replayedEvents: 0,
+        orphanedEventIds: ['event-1', 'event-1'],
+        affectedPairs: [],
+      },
+    },
+  }];
+  const repository = new CanonicalChainRepository(database);
+
+  await assert.rejects(
+    repository.listPendingShallowReorgs(),
+    /rollback persistant invalide/ui,
+  );
+});
+
+for (const [name, snapshot] of [
+  ['snapshot incomplet', {}],
+  [
+    'snapshot d’une autre paire',
+    {
+      pair: {
+        factory: '0x1111111111111111111111111111111111111111',
+        router: '0x2222222222222222222222222222222222222222',
+        wbnb: '0x3333333333333333333333333333333333333333',
+        pair: '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        token: '0x4444444444444444444444444444444444444444',
+        token0: '0x4444444444444444444444444444444444444444',
+        token1: '0x3333333333333333333333333333333333333333',
+        createdBlock: 10n,
+        blockHash: HASH_10,
+        createdTransactionHash: HASH_11,
+        createdLogIndex: 0,
+        discoveredAtMs: 1,
+      },
+      metadata: {
+        address: '0x4444444444444444444444444444444444444444',
+        name: 'Token',
+        symbol: 'TKN',
+        decimals: 18,
+        totalSupply: 1_000n,
+        codeSizeBytes: 1,
+      },
+      status: 'WAITING_FIRST_BUY',
+      subsequentBuyCount: 0,
+      targetBuysAfterEntry: 3,
+      countedBuyTransactionHashes: [],
+      sellAttempts: 0,
+      createdAtMs: 1,
+      updatedAtMs: 1,
+    },
+  ],
+] as const) {
+  test(`refuse ${name} dans rollbackImpact`, async () => {
+    const database = new RecordingDatabase();
+    const pairAddress = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    database.rows = [{
+      reorg_id: `reorg:${HASH_12}:${HASH_13}`,
+      detected_at_ms: '1753700000000',
+      common_ancestor_number: '10',
+      common_ancestor_hash: HASH_10,
+      previous_tip_number: '12',
+      previous_tip_hash: HASH_12,
+      replacement_tip_number: '13',
+      replacement_tip_hash: HASH_13,
+      status: 'RECONCILING',
+      depth: '2',
+      orphaned_events: '1',
+      replayed_events: '0',
+      details: stringifyJson({
+        rollbackImpact: {
+          reorgId: `reorg:${HASH_12}:${HASH_13}`,
+          depth: 2,
+          orphanedEvents: 1,
+          replayedEvents: 0,
+          orphanedEventIds: ['event-1'],
+          affectedPairs: [{
+            pairAddress,
+            discoveryOrphaned: false,
+            earliestSessionBefore: snapshot,
+            latestCanonicalSessionAfter: null,
+            hasWalletConsequence: false,
+          }],
+        },
+      }),
+    }];
+    const repository = new CanonicalChainRepository(database);
+
+    await assert.rejects(
+      repository.listPendingShallowReorgs(),
+      /rollback persistant invalide/ui,
+    );
+  });
+}
+
+test('refuse explicitement un rollback persistant malformé au lieu de l’ignorer', async () => {
+  const database = new RecordingDatabase();
+  database.rows = [{
+    reorg_id: 'reorg-malformed',
+    detected_at_ms: '1753700000000',
+    common_ancestor_number: '10',
+    common_ancestor_hash: HASH_10,
+    previous_tip_number: '12',
+    previous_tip_hash: HASH_12,
+    replacement_tip_number: '13',
+    replacement_tip_hash: HASH_13,
+    status: 'RECONCILING',
+    depth: '2',
+    orphaned_events: '1',
+    replayed_events: '0',
+    details: { rollbackImpact: { reorgId: 'wrong', depth: '2' } },
+  }];
+  const repository = new CanonicalChainRepository(database);
+
+  await assert.rejects(
+    repository.getPendingShallowReorg(),
+    /rollback persistant invalide/ui,
+  );
+});
+
 test('rewind un reorg superficiel dans une transaction ordonnée et retourne un impact déterministe', async () => {
   const database = new StatefulReorgDatabase();
   const repository = new CanonicalChainRepository(database);
@@ -521,17 +989,17 @@ test('rewind un reorg superficiel dans une transaction ordonnée et retourne un 
   ]);
   assert.deepEqual(impact.affectedPairs, [
     {
-      pairAddress: '0xpair-a',
+      pairAddress: PAIR_A,
       discoveryOrphaned: true,
-      earliestSessionBefore: { step: 'baseline' },
+      earliestSessionBefore: validSession(PAIR_A, 1),
       latestCanonicalSessionAfter: null,
       hasWalletConsequence: false,
     },
     {
-      pairAddress: '0xpair-b',
+      pairAddress: PAIR_B,
       discoveryOrphaned: true,
       earliestSessionBefore: null,
-      latestCanonicalSessionAfter: { step: 'canonical' },
+      latestCanonicalSessionAfter: validSession(PAIR_B, 3),
       hasWalletConsequence: true,
     },
   ]);
@@ -554,6 +1022,21 @@ test('rewind un reorg superficiel dans une transaction ordonnée et retourne un 
     database.calls.find(({ sql }) => sql.includes('UPDATE trades'))?.sql ?? '',
     /t\.mode/u,
   );
+});
+
+test('rollback la transaction sans persister un snapshot de session incomplet', async () => {
+  const database = new StatefulReorgDatabase();
+  database.sessionBeforeOverride = {};
+  const repository = new CanonicalChainRepository(database);
+
+  await assert.rejects(
+    repository.rewindToAncestor(SHALLOW_REORG),
+    /snapshot de session invalide/ui,
+  );
+
+  assert.equal(database.state.auditCount, 0);
+  assert.equal(database.state.rollbackImpact, null);
+  assert.equal(database.state.committed, false);
 });
 
 for (const [name, invalidReorg] of [
@@ -700,6 +1183,61 @@ test('un retry du même fork réutilise audit et impact sans rejouer les mutatio
     1,
   );
 });
+
+test('un retry idempotent refuse un rollbackImpact persistant devenu invalide', async () => {
+  const database = new StatefulReorgDatabase();
+  const repository = new CanonicalChainRepository(database);
+  const first = await repository.rewindToAncestor(SHALLOW_REORG);
+  database.state.rollbackImpact = JSON.parse(stringifyJson({
+    ...first,
+    orphanedEventIds: ['duplicate', 'duplicate', 'event-late'],
+  }));
+
+  await assert.rejects(
+    repository.rewindToAncestor(SHALLOW_REORG),
+    /rollback persistant invalide/ui,
+  );
+
+  assert.equal(
+    database.calls.filter(({ sql }) => sql.includes('UPDATE swap_events')).length,
+    1,
+  );
+});
+
+for (const [source, configure] of [
+  [
+    'discovered_tokens',
+    (database: StatefulReorgDatabase) => {
+      database.discoveryPairOverride = 'not-an-address';
+    },
+  ],
+  [
+    'swap_events',
+    (database: StatefulReorgDatabase) => {
+      database.walletSwapPairOverride = 'not-an-address';
+    },
+  ],
+  [
+    'trades',
+    (database: StatefulReorgDatabase) => {
+      database.tradePairOverride = 'not-an-address';
+    },
+  ],
+] as const) {
+  test(`refuse une pair_address invalide lue depuis ${source} avant persistance`, async () => {
+    const database = new StatefulReorgDatabase();
+    configure(database);
+    const repository = new CanonicalChainRepository(database);
+
+    await assert.rejects(
+      repository.rewindToAncestor(SHALLOW_REORG),
+      /adresse de paire invalide/ui,
+    );
+
+    assert.equal(database.state.auditCount, 0);
+    assert.equal(database.state.rollbackImpact, null);
+  });
+}
 
 test('un reorg profond persiste seulement un audit manuel sans ancêtre', async () => {
   const database = new StatefulReorgDatabase();
@@ -851,4 +1389,19 @@ test('complete et manual mettent atomiquement à jour un audit RECONCILING', asy
   assert.deepEqual(manualDatabase.state.details, {
     reason: 'SESSION_RECONCILIATION_FAILED',
   });
+});
+
+test('compte seulement les événements orphelins redevenus canoniques et PROCESSED', async () => {
+  const database = new StatefulReorgDatabase();
+  database.canonicalProcessedCount = 2;
+  const repository = new CanonicalChainRepository(database);
+
+  const count = await repository.countCanonicalProcessedEvents(['event-a', 'event-b']);
+
+  assert.equal(count, 2);
+  const query = database.calls.at(-1);
+  assert.match(query?.sql ?? '', /canonical = TRUE/u);
+  assert.match(query?.sql ?? '', /processing_status = 'PROCESSED'/u);
+  assert.deepEqual(query?.values, [['event-a', 'event-b']]);
+  assert.equal(await repository.countCanonicalProcessedEvents([]), 0);
 });
