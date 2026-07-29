@@ -69,6 +69,7 @@ export interface CanonicalChainCoordinatorOptions {
   runtimeBarrier?: CanonicalListenerBarrier;
   confirmations?: number;
   chunkSize?: number;
+  cutoff?: CanonicalBlock;
   headerSpoolFactory?: CanonicalHeaderSpoolFactory;
   afterReorg?: (state: CanonicalChainState) => Promise<CanonicalReorgCompletion | void>;
   onRecovered?: () => void;
@@ -124,6 +125,13 @@ export class DeepReorgError extends CanonicalChainContinuityError {
       `Aucun ancêtre canonique trouvé dans les ${DEFAULT_CANONICAL_RETENTION} derniers blocs.`,
     );
     this.name = 'DeepReorgError';
+  }
+}
+
+export class FreshStartBoundaryError extends CanonicalChainContinuityError {
+  constructor() {
+    super('La reorg traverse le cutoff fresh-start.');
+    this.name = 'FreshStartBoundaryError';
   }
 }
 
@@ -334,6 +342,7 @@ export class CanonicalChainCoordinator {
   private readonly runtimeBarrier: CanonicalListenerBarrier | undefined;
   private readonly confirmations: number;
   private readonly chunkSize: bigint;
+  private readonly cutoff: CanonicalBlock | null;
   private readonly headerSpoolFactory: CanonicalHeaderSpoolFactory;
   private readonly afterReorg:
     ((state: CanonicalChainState) => Promise<CanonicalReorgCompletion | void>) | undefined;
@@ -363,6 +372,14 @@ export class CanonicalChainCoordinator {
     this.afterReorg = options.afterReorg;
     this.onRecovered = options.onRecovered;
     this.onCleanupError = options.onCleanupError;
+    if (options.cutoff !== undefined && options.cutoff.number < 0n) {
+      throw new Error('Le cutoff fresh-start doit être positif.');
+    }
+    this.cutoff = options.cutoff === undefined
+      ? null
+      : structuredClone(
+          validateHeader(options.cutoff, options.cutoff.number),
+        );
     this.confirmations = boundedInteger(
       options.confirmations ?? 5,
       'confirmations',
@@ -789,11 +806,39 @@ export class CanonicalChainCoordinator {
     const latestBlock = await this.blockReader.getBlockNumber();
     const head = confirmedHead(latestBlock, this.confirmations);
     if (head === null) return false;
+    if (this.cutoff !== null && head < this.cutoff.number) return false;
 
-    const tip = await this.canonicalStore.getCanonicalTip();
+    const storedTip = await this.canonicalStore.getCanonicalTip();
+    const tip =
+      this.cutoff !== null
+      && storedTip !== null
+      && storedTip.number < this.cutoff.number
+        ? null
+        : storedTip;
     if (tip && tip.number > head) return false;
 
-    const checkpoint = await this.checkpoints.get(request.listenerKey);
+    const storedCheckpoint = await this.checkpoints.get(request.listenerKey);
+    const needsCutoffAnchor =
+      this.cutoff !== null
+      && storedCheckpoint !== null
+      && (
+        storedCheckpoint.blockNumber < this.cutoff.number
+        || (
+          storedCheckpoint.blockNumber === this.cutoff.number
+          && (
+            storedCheckpoint.blockHash === null
+            || storedCheckpoint.blockHash.toLowerCase()
+              !== this.cutoff.hash.toLowerCase()
+          )
+        )
+      );
+    const checkpoint =
+      needsCutoffAnchor && this.cutoff !== null
+        ? {
+            blockNumber: this.cutoff.number,
+            blockHash: this.cutoff.hash,
+          }
+        : storedCheckpoint;
     if (
       checkpoint?.blockHash === null
       && checkpoint.blockNumber > head
@@ -801,12 +846,25 @@ export class CanonicalChainCoordinator {
       return false;
     }
 
-    const [oldestCheckpointBefore, descending] = await Promise.all([
+    const [oldestCheckpointRaw, descendingRaw] = await Promise.all([
       this.checkpoints.getOldestBlockNumber(),
       this.canonicalStore.listCanonicalDescending(
         DEFAULT_CANONICAL_RETENTION,
       ),
     ]);
+    const oldestCheckpointBefore =
+      this.cutoff !== null
+      && (
+        oldestCheckpointRaw === null
+        || oldestCheckpointRaw < this.cutoff.number
+      )
+        ? this.cutoff.number
+        : oldestCheckpointRaw;
+    const descending = this.cutoff === null
+      ? descendingRaw
+      : descendingRaw.filter(
+          ({ number }) => number >= this.cutoff!.number,
+        );
     if (tip) {
       const remoteTip = validateHeader(
         await this.blockReader.getBlock(tip.number),
@@ -828,16 +886,25 @@ export class CanonicalChainCoordinator {
       knownHeaders.set(tip.number, validateHeader(tip, tip.number));
     }
 
-    const fromBlock = checkpoint
+    const requestedFromBlock = checkpoint
       ? checkpoint.blockNumber + 1n
       : request.bootstrap === 'confirmed-head'
         ? head
         : request.startBlock;
+    const fromBlock = this.cutoff === null
+      ? requestedFromBlock
+      : requestedFromBlock > this.cutoff.number
+        ? requestedFromBlock
+        : this.cutoff.number + 1n;
     const windowStart = this.canonicalWindowStart(head);
-    const journalStart =
+    const requestedJournalStart =
       oldestCheckpointBefore !== null && oldestCheckpointBefore < windowStart
         ? oldestCheckpointBefore
         : windowStart;
+    const journalStart =
+      this.cutoff !== null && requestedJournalStart < this.cutoff.number
+        ? this.cutoff.number
+        : requestedJournalStart;
     const journalNeedsPersistence = !this.hasContinuousCachedJournal(
       knownHeaders,
       journalStart,
@@ -869,6 +936,13 @@ export class CanonicalChainCoordinator {
         ? await this.persistJournal(journalHeaders)
         : false;
       let checkpointPersisted = false;
+      if (needsCutoffAnchor && this.cutoff !== null) {
+        await this.setCheckpoint(request.listenerKey, {
+          blockNumber: this.cutoff.number,
+          blockHash: this.cutoff.hash,
+        });
+        checkpointPersisted = true;
+      }
       if (
         checkpoint?.blockHash === null
         && checkpoint.blockNumber <= head
@@ -879,7 +953,7 @@ export class CanonicalChainCoordinator {
             `Header legacy préparé absent pour le bloc ${checkpoint.blockNumber}.`,
           );
         }
-        await this.checkpoints.set(request.listenerKey, {
+        await this.setCheckpoint(request.listenerKey, {
           blockNumber: checkpoint.blockNumber,
           blockHash: legacyHeader.hash,
         });
@@ -898,13 +972,24 @@ export class CanonicalChainCoordinator {
         }
         const canonicalHeaders = preparedChunk;
         preparedChunk = [];
+        if (
+          this.cutoff !== null
+          && (
+            chunkStart <= this.cutoff.number
+            || canonicalHeaders.some(
+              ({ number }) => number <= this.cutoff!.number,
+            )
+          )
+        ) {
+          throw new FreshStartBoundaryError();
+        }
         const processChunk = () =>
           request.processChunk(chunkStart, header.number, canonicalHeaders);
         const processed = this.runtimeBarrier
           ? await this.runtimeBarrier.runListener(processChunk)
           : await processChunk();
         if (!processed) break;
-        await this.checkpoints.set(request.listenerKey, {
+        await this.setCheckpoint(request.listenerKey, {
           blockNumber: header.number,
           blockHash: header.hash,
         });
@@ -914,11 +999,15 @@ export class CanonicalChainCoordinator {
 
       if (saved || checkpointPersisted) {
         const oldestCheckpoint = await this.checkpoints.getOldestBlockNumber();
-        const cutoff =
+        const retentionCutoff =
           oldestCheckpoint === null || windowStart < oldestCheckpoint
             ? windowStart
             : oldestCheckpoint;
-        await this.canonicalStore.pruneCanonicalBefore(cutoff);
+        const pruneBefore =
+          this.cutoff !== null && retentionCutoff < this.cutoff.number
+            ? this.cutoff.number
+            : retentionCutoff;
+        await this.canonicalStore.pruneCanonicalBefore(pruneBefore);
       }
     } finally {
       await this.disposeSpools(spools);
@@ -932,7 +1021,12 @@ export class CanonicalChainCoordinator {
     descending: CanonicalBlock[],
     head: bigint,
   ): Promise<void> {
-    const window = this.validateDescendingWindow(oldTip, descending);
+    const validatedWindow = this.validateDescendingWindow(oldTip, descending);
+    const window = this.cutoff === null
+      ? validatedWindow
+      : validatedWindow.filter(
+          ({ number }) => number >= this.cutoff!.number,
+        );
     const newTip = validateHeader(
       await this.blockReader.getBlock(head),
       head,
@@ -988,9 +1082,14 @@ export class CanonicalChainCoordinator {
       },
     };
     try {
-      const impact = await this.reorgHandler.reconcileReorg(
+      const handlerImpact = await this.reorgHandler.reconcileReorg(
         cloneReconciliation(reorg),
       );
+      const crossedFreshStartBoundary =
+        ancestor === null && this.cutoff !== null;
+      const impact = crossedFreshStartBoundary
+        ? { ...handlerImpact, requiresManualReview: true }
+        : handlerImpact;
       const requiresManualReview = impact.requiresManualReview === true;
       const canRecoverAutomatically = ancestor && !requiresManualReview;
       this.status = {
@@ -1016,7 +1115,23 @@ export class CanonicalChainCoordinator {
       }
       throw error;
     }
-    if (!ancestor) throw new DeepReorgError();
+    if (!ancestor) {
+      if (this.cutoff !== null) throw new FreshStartBoundaryError();
+      throw new DeepReorgError();
+    }
+  }
+
+  private async setCheckpoint(
+    listenerKey: string,
+    checkpoint: AnchoredListenerCheckpoint,
+  ): Promise<void> {
+    if (
+      this.cutoff !== null
+      && checkpoint.blockNumber < this.cutoff.number
+    ) {
+      throw new FreshStartBoundaryError();
+    }
+    await this.checkpoints.set(listenerKey, checkpoint);
   }
 
   private promoteRecoveredReorg(
