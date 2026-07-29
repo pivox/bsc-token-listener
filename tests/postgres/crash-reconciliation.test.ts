@@ -99,6 +99,7 @@ test('migration de réconciliation idempotente', async () => {
         token_address TEXT NOT NULL,
         status TEXT NOT NULL,
         payload JSONB NOT NULL,
+        canonical BOOLEAN NOT NULL DEFAULT TRUE,
         created_at TIMESTAMPTZ NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL
       )
@@ -153,6 +154,9 @@ test('les claims concurrents et l’application sous bail restent atomiques', as
     ]) {
       await client.query(await readFile(migrationFile, 'utf8'));
     }
+    await client.query(
+      'ALTER TABLE token_sessions ADD COLUMN canonical BOOLEAN NOT NULL DEFAULT TRUE',
+    );
     const initial = session('MANUAL_REVIEW');
     initial.entry = {
       mode: 'live',

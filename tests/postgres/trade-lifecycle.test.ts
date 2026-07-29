@@ -37,6 +37,8 @@ test('migration idempotente, bigint exact et contraintes de déduplication', asy
         mode TEXT NOT NULL,
         status TEXT NOT NULL,
         transaction_hash TEXT,
+        source_event_id TEXT,
+        canonical BOOLEAN NOT NULL DEFAULT TRUE,
         payload JSONB NOT NULL,
         created_at TIMESTAMPTZ NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL
