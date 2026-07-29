@@ -15,7 +15,11 @@ export interface CanonicalBlockReader {
 export interface ConfirmedRangeRequest {
   listenerKey: string;
   startBlock: bigint;
-  processChunk(fromBlock: bigint, toBlock: bigint): Promise<boolean>;
+  processChunk(
+    fromBlock: bigint,
+    toBlock: bigint,
+    canonicalHeaders: readonly CanonicalBlock[],
+  ): Promise<boolean>;
 }
 
 export interface AnchoredListenerCheckpoint {

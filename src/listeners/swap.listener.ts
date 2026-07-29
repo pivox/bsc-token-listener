@@ -1,6 +1,9 @@
 import type { Address, Hash } from 'viem';
 import { pancakePairAbi } from '../abi/pancake-pair.abi.js';
-import type { ConfirmedRangeRequest } from '../chain/canonical-chain.types.js';
+import type {
+  CanonicalBlock,
+  ConfirmedRangeRequest,
+} from '../chain/canonical-chain.types.js';
 import { config } from '../config/env.js';
 import { publicClient, wsClient } from '../rpc/clients.js';
 import type { CheckpointRepository } from '../storage/repositories.js';
@@ -125,6 +128,8 @@ export class SwapListener {
   private reconcilePending = false;
   private stopped = false;
   private terminalNotified = false;
+  private externalIngestionEnabled = false;
+  private replayPrepared = false;
   private readonly inFlight = new Set<Promise<unknown>>();
 
   constructor(
@@ -160,12 +165,41 @@ export class SwapListener {
   async start(): Promise<void> {
     this.stopped = false;
     this.terminalNotified = false;
+    this.externalIngestionEnabled = true;
+    this.replayPrepared = false;
+    this.installWatcher();
+
+    await this.requestReconcile();
+    if (this.stopped || !isSessionMonitorable(this.session)) return;
+    this.installInterval();
+    this.logActive();
+  }
+
+  async startForReplay(): Promise<void> {
+    this.stopped = false;
+    this.terminalNotified = false;
+    this.externalIngestionEnabled = false;
+    this.replayPrepared = true;
+    this.installWatcher();
+    await this.requestReconcile();
+  }
+
+  activateAfterReplay(): void {
+    if (this.stopped || !this.replayPrepared) return;
+    this.replayPrepared = false;
+    this.externalIngestionEnabled = true;
+    if (!isSessionMonitorable(this.session)) return;
+    this.installInterval();
+    this.logActive();
+  }
+
+  private installWatcher(): void {
     this.stopWatch = this.dependencies.watcher.watchContractEvent({
       address: this.session.pair.pair,
       abi: pancakePairAbi,
       eventName: 'Swap',
       onLogs: () => {
-        if (this.stopped) return;
+        if (this.stopped || !this.externalIngestionEnabled) return;
         void this.requestReconcile().catch((error: unknown) =>
           logger.error(
             {
@@ -184,9 +218,10 @@ export class SwapListener {
         'WebSocket Swap en erreur.',
       ),
     });
+  }
 
-    await this.requestReconcile();
-    if (this.stopped || !isSessionMonitorable(this.session)) return;
+  private installInterval(): void {
+    if (this.interval) clearInterval(this.interval);
     this.interval = setInterval(() => {
       if (this.stopped) return;
       void this.track(this.tick()).catch((error: unknown) =>
@@ -199,7 +234,9 @@ export class SwapListener {
         ),
       );
     }, this.dependencies.reconcileIntervalMs ?? config.reconcileSeconds * 1_000);
+  }
 
+  private logActive(): void {
     logger.info(
       {
         pair: this.session.pair.pair,
@@ -212,6 +249,8 @@ export class SwapListener {
 
   stop(): void {
     this.stopped = true;
+    this.externalIngestionEnabled = false;
+    this.replayPrepared = false;
     this.stopWatch?.();
     if (this.interval) clearInterval(this.interval);
   }
@@ -254,8 +293,8 @@ export class SwapListener {
           await this.dependencies.coordinator.reconcile({
             listenerKey: `swap:${this.session.pair.pair.toLowerCase()}`,
             startBlock: this.session.pair.createdBlock,
-            processChunk: (fromBlock, toBlock) =>
-              this.processChunk(fromBlock, toBlock),
+            processChunk: (fromBlock, toBlock, canonicalHeaders) =>
+              this.processChunk(fromBlock, toBlock, canonicalHeaders),
           });
         } catch (error) {
           if (!failed) firstFailure = error;
@@ -274,6 +313,7 @@ export class SwapListener {
   private async processChunk(
     fromBlock: bigint,
     toBlock: bigint,
+    canonicalHeaders: readonly CanonicalBlock[],
   ): Promise<boolean> {
     const logs = await this.dependencies.logReader.getContractEvents({
       address: this.session.pair.pair,
@@ -282,12 +322,41 @@ export class SwapListener {
       fromBlock,
       toBlock,
     });
-    return this.processLogs(logs as SwapLog[]);
+    return this.processLogs(
+      logs as SwapLog[],
+      fromBlock,
+      toBlock,
+      canonicalHeaders,
+    );
   }
 
-  private async processLogs(logs: SwapLog[]): Promise<boolean> {
+  private async processLogs(
+    logs: SwapLog[],
+    fromBlock: bigint,
+    toBlock: bigint,
+    canonicalHeaders: readonly CanonicalBlock[],
+  ): Promise<boolean> {
+    const expectedHashes = new Map(
+      canonicalHeaders.map((header) => [
+        header.number,
+        header.hash.toLowerCase(),
+      ]),
+    );
     const identified = logs.map((log) => {
       assertSwapLogIdentity(log);
+      if (log.blockNumber < fromBlock || log.blockNumber > toBlock) {
+        throw new Error(
+          `Log Swap HTTP hors plage confirmée: ${log.blockNumber}.`,
+        );
+      }
+      if (
+        expectedHashes.get(log.blockNumber)
+        !== log.blockHash.toLowerCase()
+      ) {
+        throw new Error(
+          `Log Swap incohérent avec le header canonique préparé au bloc ${log.blockNumber}.`,
+        );
+      }
       return log;
     });
     const sorted = [...identified].sort((a, b) => {

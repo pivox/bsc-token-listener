@@ -1,7 +1,12 @@
 import type { ReorgRollbackImpact } from '../chain/canonical-chain.types.js';
+import type { Address } from 'viem';
 
 export interface ShallowReorgReplayDependencies {
-  activateRecoveredSessions(): Promise<void>;
+  withReplayAdmission<T>(operation: () => Promise<T>): Promise<T>;
+  prepareRecoveredSessions(): Promise<void>;
+  activateRecoveredSessions(): Promise<
+    void | { failedPairs: readonly Address[] }
+  >;
   reconcilePairs(): Promise<void>;
   waitForMonitorIdle(): Promise<void>;
   reconcileActiveSwaps(): Promise<void>;
@@ -37,16 +42,22 @@ export async function finalizeShallowReorgReplay(
   impact: ReorgRollbackImpact,
   dependencies: ShallowReorgReplayDependencies,
 ): Promise<number> {
-  await dependencies.activateRecoveredSessions();
-  await dependencies.reconcilePairs();
-  // onPair schedules monitor admission on the next microtask.
-  await Promise.resolve();
-  await dependencies.waitForMonitorIdle();
-  await dependencies.reconcileActiveSwaps();
-  await dependencies.waitForMonitorIdle();
-  const replayedEvents = await dependencies.countCanonicalProcessedEvents(
-    impact.orphanedEventIds,
-  );
-  await dependencies.completeReorg(impact.reorgId, replayedEvents);
-  return replayedEvents;
+  return dependencies.withReplayAdmission(async () => {
+    await dependencies.prepareRecoveredSessions();
+    await dependencies.reconcilePairs();
+    const admission = await dependencies.activateRecoveredSessions();
+    if (admission && admission.failedPairs.length > 0) {
+      throw new Error(
+        `Admission de ${admission.failedPairs.length} listener(s) Swap échouée pendant le replay.`,
+      );
+    }
+    await dependencies.waitForMonitorIdle();
+    await dependencies.reconcileActiveSwaps();
+    await dependencies.waitForMonitorIdle();
+    const replayedEvents = await dependencies.countCanonicalProcessedEvents(
+      impact.orphanedEventIds,
+    );
+    await dependencies.completeReorg(impact.reorgId, replayedEvents);
+    return replayedEvents;
+  });
 }

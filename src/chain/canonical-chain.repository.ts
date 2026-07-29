@@ -426,6 +426,75 @@ export class CanonicalChainRepository {
     return row ? chainReorgAudit(row) : null;
   }
 
+  async getManualReviewReorg(): Promise<ChainReorgAudit | null> {
+    const result = await this.database.query<ChainReorgRow>(
+      `SELECT
+         reorg_id,
+         (EXTRACT(EPOCH FROM detected_at) * 1000)::bigint::text AS detected_at_ms,
+         common_ancestor_number::text,
+         common_ancestor_hash,
+         previous_tip_number::text,
+         previous_tip_hash,
+         replacement_tip_number::text,
+         replacement_tip_hash,
+         status,
+         depth::text,
+         orphaned_events::text,
+         replayed_events::text,
+         details
+       FROM chain_reorgs
+       WHERE status = 'MANUAL_REVIEW'
+       ORDER BY detected_at DESC, reorg_id DESC
+       LIMIT 1`,
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    try {
+      if (
+        (row.common_ancestor_number === null)
+        !== (row.common_ancestor_hash === null)
+      ) {
+        throw new Error('invalid');
+      }
+      const audit = chainReorgAudit(row);
+      const expectedId =
+        `reorg:${audit.previousTip.hash.toLowerCase()}:${audit.replacementTip.hash.toLowerCase()}`;
+      const shallow = audit.commonAncestor !== null;
+      const validDepth = shallow
+        && audit.impact.depth !== null
+        && Number.isSafeInteger(audit.impact.depth)
+        && audit.impact.depth >= 1
+        && audit.impact.depth <= 128
+        && audit.previousTip.number > audit.commonAncestor!.number
+        && BigInt(audit.impact.depth)
+          === audit.previousTip.number - audit.commonAncestor!.number
+        && audit.replacementTip.number >= audit.previousTip.number
+        && typeof audit.details.reason === 'string'
+        && MANUAL_REVIEW_REASONS.has(
+          audit.details.reason as ReorgManualReviewReason,
+        );
+      const validDeep = !shallow
+        && audit.impact.depth === null
+        && audit.details.reason === 'NO_COMMON_ANCESTOR_WITHIN_RETENTION';
+      if (
+        audit.id !== expectedId
+        || audit.status !== 'MANUAL_REVIEW'
+        || !Number.isSafeInteger(audit.detectedAtMs)
+        || audit.detectedAtMs < 0
+        || audit.previousTip.number < 0n
+        || audit.replacementTip.number < 0n
+        || !validNonNegativeInteger(audit.impact.orphanedEvents)
+        || !validNonNegativeInteger(audit.impact.replayedEvents)
+        || (!validDepth && !validDeep)
+      ) {
+        throw new Error('invalid');
+      }
+      return audit;
+    } catch {
+      throw new Error('Audit MANUAL_REVIEW persistant invalide.');
+    }
+  }
+
   async getPendingShallowReorg(): Promise<PendingShallowReorg | null> {
     const pending = await this.listPendingShallowReorgs();
     return pending[0] ?? null;

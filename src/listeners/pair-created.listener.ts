@@ -1,6 +1,9 @@
 import type { Address, Hash } from 'viem';
 import { pancakeFactoryAbi } from '../abi/pancake-factory.abi.js';
-import type { ConfirmedRangeRequest } from '../chain/canonical-chain.types.js';
+import type {
+  CanonicalBlock,
+  ConfirmedRangeRequest,
+} from '../chain/canonical-chain.types.js';
 import { config } from '../config/env.js';
 import { publicClient, wsClient } from '../rpc/clients.js';
 import type { CheckpointRepository } from '../storage/repositories.js';
@@ -16,6 +19,7 @@ interface PairCreatedLog {
   blockNumber: bigint | null;
   blockHash: Hash | null;
   transactionHash: Hash | null;
+  transactionIndex: number | null;
   logIndex: number | null;
 }
 
@@ -25,6 +29,7 @@ function assertPairCreatedLogIdentity(
   blockNumber: bigint;
   blockHash: Hash;
   transactionHash: Hash;
+  transactionIndex: number;
   logIndex: number;
 } {
   if (typeof log.blockNumber !== 'bigint') {
@@ -40,6 +45,14 @@ function assertPairCreatedLogIdentity(
   if (!log.transactionHash) {
     throw new Error(
       'Log PairCreated HTTP confirmé invalide: transactionHash absent.',
+    );
+  }
+  if (
+    !Number.isSafeInteger(log.transactionIndex)
+    || (log.transactionIndex ?? -1) < 0
+  ) {
+    throw new Error(
+      'Log PairCreated HTTP confirmé invalide: transactionIndex absent.',
     );
   }
   if (!Number.isSafeInteger(log.logIndex) || (log.logIndex ?? -1) < 0) {
@@ -195,8 +208,8 @@ export class PairCreatedListener {
           await this.dependencies.coordinator.reconcile({
             listenerKey: 'pair-created',
             startBlock: 0n,
-            processChunk: (fromBlock, toBlock) =>
-              this.processChunk(fromBlock, toBlock),
+            processChunk: (fromBlock, toBlock, canonicalHeaders) =>
+              this.processChunk(fromBlock, toBlock, canonicalHeaders),
           });
         } catch (error) {
           if (!failed) firstFailure = error;
@@ -214,6 +227,7 @@ export class PairCreatedListener {
   private async processChunk(
     fromBlock: bigint,
     toBlock: bigint,
+    canonicalHeaders: readonly CanonicalBlock[],
   ): Promise<boolean> {
     const logs = await this.dependencies.logReader.getContractEvents({
       address: config.factory,
@@ -222,18 +236,50 @@ export class PairCreatedListener {
       fromBlock,
       toBlock,
     });
-    await this.processLogs(logs as PairCreatedLog[]);
+    await this.processLogs(
+      logs as PairCreatedLog[],
+      fromBlock,
+      toBlock,
+      canonicalHeaders,
+    );
     return true;
   }
 
-  private async processLogs(logs: PairCreatedLog[]): Promise<void> {
+  private async processLogs(
+    logs: PairCreatedLog[],
+    fromBlock: bigint,
+    toBlock: bigint,
+    canonicalHeaders: readonly CanonicalBlock[],
+  ): Promise<void> {
+    const expectedHashes = new Map(
+      canonicalHeaders.map((header) => [
+        header.number,
+        header.hash.toLowerCase(),
+      ]),
+    );
     const identified = logs.map((log) => {
       assertPairCreatedLogIdentity(log);
+      if (log.blockNumber < fromBlock || log.blockNumber > toBlock) {
+        throw new Error(
+          `Log PairCreated HTTP hors plage confirmée: ${log.blockNumber}.`,
+        );
+      }
+      if (
+        expectedHashes.get(log.blockNumber)
+        !== log.blockHash.toLowerCase()
+      ) {
+        throw new Error(
+          `Log PairCreated incohérent avec le header canonique préparé au bloc ${log.blockNumber}.`,
+        );
+      }
       return log;
     });
     const sorted = [...identified].sort((a, b) => {
       if (a.blockNumber !== b.blockNumber) {
         return a.blockNumber < b.blockNumber ? -1 : 1;
+      }
+      if (a.transactionIndex !== b.transactionIndex) {
+        return a.transactionIndex - b.transactionIndex;
       }
       return a.logIndex - b.logIndex;
     });

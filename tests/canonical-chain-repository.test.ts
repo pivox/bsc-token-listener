@@ -401,6 +401,47 @@ test('upsert le numéro et le hash du checkpoint', async () => {
   assert.match(database.calls[0]?.sql ?? '', /block_hash = EXCLUDED\.block_hash/u);
 });
 
+test('supprime exactement le checkpoint terminal demandé', async () => {
+  const database = new RecordingDatabase();
+  const repository = new CheckpointRepository(database);
+  const remove = (
+    repository as unknown as { delete(key: string): Promise<void> }
+  ).delete.bind(repository);
+
+  await remove('swap:0xabc');
+
+  assert.deepEqual(database.calls[0]?.values, ['swap:0xabc']);
+  assert.match(
+    database.calls[0]?.sql ?? '',
+    /DELETE FROM listener_checkpoints WHERE listener_key = \$1/u,
+  );
+});
+
+test('nettoie idempotemment uniquement les checkpoints Swap de sessions non monitorables', async () => {
+  const database = new RecordingDatabase();
+  database.rows = [
+    { listener_key: 'swap:0xclosed' },
+    { listener_key: 'swap:0xmanual' },
+  ];
+  const repository = new CheckpointRepository(database);
+  const cleanup = (
+    repository as unknown as {
+      deleteNonMonitorableSwapCheckpoints(): Promise<number>;
+    }
+  ).deleteNonMonitorableSwapCheckpoints.bind(repository);
+
+  assert.equal(await cleanup(), 2);
+  const call = database.calls[0];
+  assert.match(call?.sql ?? '', /DELETE FROM listener_checkpoints/u);
+  assert.match(call?.sql ?? '', /USING token_sessions/u);
+  assert.match(call?.sql ?? '', /listener_key = 'swap:' \|\| LOWER\(sessions\.pair_address\)/u);
+  assert.match(
+    call?.sql ?? '',
+    /sessions\.status NOT IN \('WAITING_FIRST_BUY', 'HOLDING'\)/u,
+  );
+  assert.match(call?.sql ?? '', /RETURNING checkpoints\.listener_key/u);
+});
+
 test('charge le plus ancien numéro de checkpoint sans conversion en number', async () => {
   const database = new RecordingDatabase();
   database.rows = [{ block_number: '9007199254740993' }];
@@ -544,6 +585,97 @@ test('mappe un audit encore sans ancêtre commun ni profondeur', async () => {
   assert.equal(audit?.impact.orphanedEvents, 0);
   assert.equal(audit?.impact.replayedEvents, 0);
   assert.deepEqual(audit?.details, {});
+});
+
+test('charge et valide le dernier audit MANUAL_REVIEW terminal, y compris profond', async () => {
+  const database = new RecordingDatabase();
+  database.rows = [{
+    reorg_id: `reorg:${HASH_12}:${HASH_13}`,
+    detected_at_ms: '1753700000000',
+    common_ancestor_number: null,
+    common_ancestor_hash: null,
+    previous_tip_number: '12',
+    previous_tip_hash: HASH_12,
+    replacement_tip_number: '13',
+    replacement_tip_hash: HASH_13,
+    status: 'MANUAL_REVIEW',
+    depth: null,
+    orphaned_events: '0',
+    replayed_events: '0',
+    details: { reason: 'NO_COMMON_ANCESTOR_WITHIN_RETENTION' },
+  }];
+  const repository = new CanonicalChainRepository(database);
+  const loadManualReview = (
+    repository as unknown as {
+      getManualReviewReorg(): Promise<unknown>;
+    }
+  ).getManualReviewReorg.bind(repository);
+
+  const audit = await loadManualReview();
+
+  assert.deepEqual(audit, {
+    id: `reorg:${HASH_12}:${HASH_13}`,
+    detectedAtMs: 1_753_700_000_000,
+    commonAncestor: null,
+    previousTip: { number: 12n, hash: HASH_12 },
+    replacementTip: { number: 13n, hash: HASH_13 },
+    status: 'MANUAL_REVIEW',
+    impact: { depth: null, orphanedEvents: 0, replayedEvents: 0 },
+    details: { reason: 'NO_COMMON_ANCESTOR_WITHIN_RETENTION' },
+  });
+  assert.match(database.calls[0]?.sql ?? '', /status = 'MANUAL_REVIEW'/u);
+});
+
+test('refuse fail-closed un audit MANUAL_REVIEW terminal incohérent', async () => {
+  const database = new RecordingDatabase();
+  database.rows = [{
+    reorg_id: `reorg:${HASH_12}:${HASH_13}`,
+    detected_at_ms: '1753700000000',
+    common_ancestor_number: '10',
+    common_ancestor_hash: HASH_10,
+    previous_tip_number: '12',
+    previous_tip_hash: HASH_12,
+    replacement_tip_number: '13',
+    replacement_tip_hash: HASH_13,
+    status: 'MANUAL_REVIEW',
+    depth: '1',
+    orphaned_events: '0',
+    replayed_events: '0',
+    details: { reason: 'WALLET_CONSEQUENCE_REQUIRES_REVIEW' },
+  }];
+  const repository = new CanonicalChainRepository(database);
+  const loadManualReview = (
+    repository as unknown as {
+      getManualReviewReorg(): Promise<unknown>;
+    }
+  ).getManualReviewReorg.bind(repository);
+
+  await assert.rejects(loadManualReview(), /MANUAL_REVIEW.*invalide/u);
+});
+
+test('refuse un ancêtre MANUAL_REVIEW partiellement NULL au lieu de le traiter comme deep', async () => {
+  const database = new RecordingDatabase();
+  database.rows = [{
+    reorg_id: `reorg:${HASH_12}:${HASH_13}`,
+    detected_at_ms: '1753700000000',
+    common_ancestor_number: '10',
+    common_ancestor_hash: null,
+    previous_tip_number: '12',
+    previous_tip_hash: HASH_12,
+    replacement_tip_number: '13',
+    replacement_tip_hash: HASH_13,
+    status: 'MANUAL_REVIEW',
+    depth: null,
+    orphaned_events: '0',
+    replayed_events: '0',
+    details: { reason: 'NO_COMMON_ANCESTOR_WITHIN_RETENTION' },
+  }];
+  const repository = new CanonicalChainRepository(database);
+
+  await assert.rejects(
+    repository.getManualReviewReorg(),
+    /MANUAL_REVIEW.*invalide/u,
+  );
 });
 
 test('hydrate le premier audit shallow RECONCILING avec ses snapshots validés', async () => {

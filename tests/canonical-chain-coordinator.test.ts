@@ -1502,6 +1502,43 @@ test('un audit wallet hydraté termine MANUAL_REVIEW sans exécuter le sync orig
   assert.equal(subject.currentStatus.lastReorg?.status, 'MANUAL_REVIEW');
 });
 
+test('hydrate directement un audit terminal profond en MANUAL_REVIEW et refuse toute ingestion', async () => {
+  const subject = coordinator(new MemoryBlockReader(115n));
+  const hydrateManualReview = (
+    subject as unknown as {
+      hydrateManualReviewReorg(value: unknown): void;
+    }
+  ).hydrateManualReviewReorg.bind(subject);
+  hydrateManualReview({
+    reorgId: `reorg:${block(12n).hash}:${forkedBlock(13n, 10n).hash}`,
+    detectedAtMs: 1_753_700_000_000,
+    ancestor: null,
+    oldTip: { number: 12n, hash: block(12n).hash },
+    newTip: { number: 13n, hash: forkedBlock(13n, 10n).hash },
+    impact: {
+      depth: null,
+      orphanedEvents: 0,
+      replayedEvents: 0,
+      requiresManualReview: true,
+    },
+  });
+  let processed = false;
+
+  await subject.reconcile({
+    listenerKey: 'blocked',
+    startBlock: 0n,
+    processChunk: async () => {
+      processed = true;
+      return true;
+    },
+  });
+
+  assert.equal(processed, false);
+  assert.equal(subject.currentStatus.state, 'MANUAL_REVIEW');
+  assert.equal(subject.currentStatus.lastReorg?.status, 'MANUAL_REVIEW');
+  assert.equal(subject.currentStatus.lastReorg?.ancestor, null);
+});
+
 test('refuse de promouvoir un résultat post-reorg associé à un autre fork', async () => {
   const reader = new MemoryBlockReader(115n);
   const originalGetBlock = reader.getBlock.bind(reader);

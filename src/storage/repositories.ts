@@ -44,6 +44,7 @@ export class SessionRepository {
          token_address = EXCLUDED.token_address,
          status = EXCLUDED.status,
          payload = EXCLUDED.payload,
+         canonical = TRUE,
          updated_at = EXCLUDED.updated_at
        WHERE token_sessions.recovery_owner IS NULL
        RETURNING pair_address`,
@@ -567,6 +568,24 @@ export class CheckpointRepository {
         checkpoint.blockHash.toLowerCase(),
       ],
     );
+  }
+
+  async delete(key: string): Promise<void> {
+    await this.database.query(
+      'DELETE FROM listener_checkpoints WHERE listener_key = $1',
+      [key],
+    );
+  }
+
+  async deleteNonMonitorableSwapCheckpoints(): Promise<number> {
+    const result = await this.database.query<{ listener_key: string }>(
+      `DELETE FROM listener_checkpoints AS checkpoints
+       USING token_sessions AS sessions
+       WHERE checkpoints.listener_key = 'swap:' || LOWER(sessions.pair_address)
+         AND sessions.status NOT IN ('WAITING_FIRST_BUY', 'HOLDING')
+       RETURNING checkpoints.listener_key`,
+    );
+    return result.rows.length;
   }
 }
 

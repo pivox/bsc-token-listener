@@ -27,6 +27,22 @@ test('hydrate un rollback shallow persistant avant la synchronisation canonique'
   assert.deepEqual(events, ['dashboard', 'hydrate', 'canonical', 'listeners']);
 });
 
+test('un état MANUAL_REVIEW hydraté conserve le dashboard mais bloque sync et listeners', async () => {
+  const events: string[] = [];
+
+  await continueStartupAfterRecovery({
+    startDashboard: async () => { events.push('dashboard'); },
+    hydrateCanonicalRecovery: async () => {
+      events.push('manual-review');
+      return 'MANUAL_REVIEW' as never;
+    },
+    synchronizeCanonical: async () => { events.push('canonical'); },
+    activateListeners: async () => { events.push('listeners'); },
+  });
+
+  assert.deepEqual(events, ['dashboard', 'manual-review']);
+});
+
 test('un snapshot de rollback incomplet arrête le startup avant sync et listeners', async () => {
   const events: string[] = [];
 
@@ -44,6 +60,28 @@ test('un snapshot de rollback incomplet arrête le startup avant sync et listene
   );
 
   assert.deepEqual(events, ['dashboard', 'hydrate']);
+});
+
+test('un échec du nettoyage des checkpoints terminaux bloque toute hydratation et ingestion', async () => {
+  const events: string[] = [];
+
+  await assert.rejects(
+    continueStartupAfterRecovery({
+      startDashboard: async () => { events.push('dashboard'); },
+      prepareListenerCheckpoints: async () => {
+        events.push('checkpoint-cleanup');
+        throw new Error('checkpoint cleanup failed');
+      },
+      hydrateCanonicalRecovery: async () => { events.push('hydrate'); },
+      synchronizeCanonical: async () => { events.push('canonical'); },
+      activateListeners: async () => { events.push('listeners'); },
+    } as Parameters<typeof continueStartupAfterRecovery>[0] & {
+      prepareListenerCheckpoints(): Promise<void>;
+    }),
+    /checkpoint cleanup failed/u,
+  );
+
+  assert.deepEqual(events, ['dashboard', 'checkpoint-cleanup']);
 });
 
 test('continue le démarrage protégé si le dashboard échoue', async () => {

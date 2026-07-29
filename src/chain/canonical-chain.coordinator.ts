@@ -71,6 +71,7 @@ export interface CanonicalChainCoordinatorOptions {
   chunkSize?: number;
   headerSpoolFactory?: CanonicalHeaderSpoolFactory;
   afterReorg?: (state: CanonicalChainState) => Promise<CanonicalReorgCompletion | void>;
+  onRecovered?: () => void;
   onCleanupError?: (errorType: string) => void;
 }
 
@@ -84,6 +85,15 @@ export interface CanonicalReorgHydration {
   readonly reorgId: string;
   readonly detectedAtMs: number;
   readonly ancestor: ChainBlockReference;
+  readonly oldTip: ChainBlockReference;
+  readonly newTip: ChainBlockReference;
+  readonly impact: ReorgImpact;
+}
+
+export interface CanonicalManualReviewHydration {
+  readonly reorgId: string;
+  readonly detectedAtMs: number;
+  readonly ancestor: ChainBlockReference | null;
   readonly oldTip: ChainBlockReference;
   readonly newTip: ChainBlockReference;
   readonly impact: ReorgImpact;
@@ -327,6 +337,7 @@ export class CanonicalChainCoordinator {
   private readonly headerSpoolFactory: CanonicalHeaderSpoolFactory;
   private readonly afterReorg:
     ((state: CanonicalChainState) => Promise<CanonicalReorgCompletion | void>) | undefined;
+  private readonly onRecovered: (() => void) | undefined;
   private readonly onCleanupError: ((errorType: string) => void) | undefined;
   private readonly postReorgScopes =
     new AsyncLocalStorage<PostReorgScope>();
@@ -350,6 +361,7 @@ export class CanonicalChainCoordinator {
     this.headerSpoolFactory =
       options.headerSpoolFactory ?? DEFAULT_HEADER_SPOOL_FACTORY;
     this.afterReorg = options.afterReorg;
+    this.onRecovered = options.onRecovered;
     this.onCleanupError = options.onCleanupError;
     this.confirmations = boundedInteger(
       options.confirmations ?? 5,
@@ -373,6 +385,67 @@ export class CanonicalChainCoordinator {
 
   hydratePendingReorg(reorg: CanonicalReorgHydration): void {
     this.hydratePendingReorgs([reorg]);
+  }
+
+  hydrateManualReviewReorg(reorg: CanonicalManualReviewHydration): void {
+    if (this.status.state !== 'HEALTHY' || this.status.lastReorg !== null) {
+      throw new Error('Une reorg runtime est déjà présente pendant l’hydratation.');
+    }
+    const validReference = (reference: ChainBlockReference): boolean =>
+      reference.number >= 0n && isHash(reference.hash);
+    const expectedId =
+      `reorg:${reorg.oldTip.hash.toLowerCase()}:${reorg.newTip.hash.toLowerCase()}`;
+    const shallow = reorg.ancestor !== null;
+    const validShallow = shallow
+      && validReference(reorg.ancestor as ChainBlockReference)
+      && reorg.impact.depth !== null
+      && Number.isSafeInteger(reorg.impact.depth)
+      && reorg.impact.depth >= 1
+      && reorg.impact.depth <= DEFAULT_CANONICAL_RETENTION
+      && reorg.oldTip.number > (reorg.ancestor as ChainBlockReference).number
+      && BigInt(reorg.impact.depth)
+        === reorg.oldTip.number - (reorg.ancestor as ChainBlockReference).number
+      && reorg.newTip.number >= reorg.oldTip.number;
+    const validDeep = !shallow && reorg.impact.depth === null;
+    if (
+      reorg.reorgId !== expectedId
+      || !Number.isSafeInteger(reorg.detectedAtMs)
+      || reorg.detectedAtMs < 0
+      || !validReference(reorg.oldTip)
+      || !validReference(reorg.newTip)
+      || !Number.isSafeInteger(reorg.impact.orphanedEvents)
+      || reorg.impact.orphanedEvents < 0
+      || !Number.isSafeInteger(reorg.impact.replayedEvents)
+      || reorg.impact.replayedEvents < 0
+      || reorg.impact.requiresManualReview !== true
+      || (!validShallow && !validDeep)
+    ) {
+      throw new Error('Hydratation MANUAL_REVIEW persistée invalide.');
+    }
+    const persistedBlock = (
+      reference: ChainBlockReference,
+    ): CanonicalBlock => ({
+      number: reference.number,
+      hash: reference.hash,
+      parentHash: reference.hash,
+    });
+    this.status = {
+      ...this.status,
+      state: 'MANUAL_REVIEW',
+      lastReorg: {
+        ancestor: reorg.ancestor === null
+          ? null
+          : persistedBlock(reorg.ancestor),
+        oldTip: persistedBlock(reorg.oldTip),
+        newTip: persistedBlock(reorg.newTip),
+        depth: reorg.impact.depth,
+        detectedAtMs: reorg.detectedAtMs,
+        status: 'MANUAL_REVIEW',
+        impact: cloneImpact(reorg.impact),
+      },
+    };
+    this.reorgReadyForFinalization = false;
+    this.hydratedReorgs = [];
   }
 
   hydratePendingReorgs(reorgs: readonly CanonicalReorgHydration[]): void {
@@ -566,6 +639,7 @@ export class CanonicalChainCoordinator {
     }
     const completion = await this.runPostReorg();
     this.promoteRecoveredReorg(completion);
+    this.onRecovered?.();
   }
 
   waitForIdle(): Promise<void> {
@@ -746,9 +820,19 @@ export class CanonicalChainCoordinator {
       }
 
       let chunkStart = fromBlock;
+      let preparedChunk: CanonicalBlock[] = [];
       for await (const header of chunkHeaders.headers()) {
+        preparedChunk.push(header);
+        if (
+          preparedChunk.length < Number(this.chunkSize)
+          && header.number !== head
+        ) {
+          continue;
+        }
+        const canonicalHeaders = preparedChunk;
+        preparedChunk = [];
         const processChunk = () =>
-          request.processChunk(chunkStart, header.number);
+          request.processChunk(chunkStart, header.number, canonicalHeaders);
         const processed = this.runtimeBarrier
           ? await this.runtimeBarrier.runListener(processChunk)
           : await processChunk();
@@ -1042,13 +1126,7 @@ export class CanonicalChainCoordinator {
       if (journalNeedsPersistence && number >= journalStart) {
         await journalHeaders.append(header);
       }
-      if (
-        number >= fromBlock
-        && (
-          (number - fromBlock + 1n) % this.chunkSize === 0n
-          || number === head
-        )
-      ) {
+      if (number >= fromBlock) {
         await chunkHeaders.append(header);
       }
       if (checkpoint?.blockHash === null && number === checkpoint.blockNumber) {

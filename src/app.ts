@@ -17,12 +17,16 @@ import {
   DashboardService,
 } from './dashboard/dashboard.js';
 import { TokenMetadataService } from './discovery/token-metadata.service.js';
+import { restoreReappearedPairSession } from './discovery/reappeared-pair.js';
 import { TradeExecutor } from './execution/trade-executor.js';
 import { HeartbeatService } from './heartbeat/heartbeat.js';
 import { PairCreatedListener } from './listeners/pair-created.listener.js';
 import { SwapListener } from './listeners/swap.listener.js';
 import { createMonitorReconcileRequest } from './monitoring/monitor-reconcile-request.js';
-import { MonitorScheduler } from './monitoring/monitor-scheduler.js';
+import {
+  MonitorScheduler,
+  type MonitorReconcileResult,
+} from './monitoring/monitor-scheduler.js';
 import { RecoveryCoordinator } from './recovery/recovery-coordinator.js';
 import { RecoveryIntentService } from './recovery/recovery-intent.service.js';
 import { ReconciliationRepository } from './recovery/reconciliation.repository.js';
@@ -31,6 +35,11 @@ import { ViemReconciliationGateway } from './recovery/viem-reconciliation.gatewa
 import { RuntimeRecoveryBarrier } from './recovery/runtime-recovery-barrier.js';
 import { account, publicClient, wsClient } from './rpc/clients.js';
 import { drainRuntimeForShutdown } from './runtime/runtime-shutdown.js';
+import {
+  ReorgReplayAdmissionGate,
+  startSwapMonitorForAdmission,
+} from './runtime/reorg-monitor-admission.js';
+import { retireTerminalMonitor } from './runtime/terminal-monitor-retirement.js';
 import {
   finalizeShallowReorgReplay,
   resumePersistedShallowReorgReplay,
@@ -120,6 +129,8 @@ async function main(): Promise<void> {
   });
   let synchronizeRecoveredSessions = async (): Promise<void> => {};
   let activateRecoveredSessions = async (): Promise<void> => {};
+  let admitReorgReplaySessions =
+    async (): Promise<MonitorReconcileResult> => ({ failedPairs: [] });
   const reconciliationStore = new ReconciliationRepository();
   const recoveryIntents = new RecoveryIntentService({
     reports,
@@ -170,9 +181,13 @@ async function main(): Promise<void> {
   const activeSessionsByToken = new Map<string, TokenSession>();
   const activeTokenByPair = new Map<string, string>();
   const monitorsPendingRecoveryDrain = new Map<string, SwapListener>();
+  const terminalPairsPendingRetirement = new Set<string>();
+  const terminalRetirementOperations = new Map<string, Promise<void>>();
   let pairListener: PairCreatedListener | null = null;
   const pendingShallowReorgs = new PendingShallowReorgQueue();
   let monitorSchedulingEnabled = false;
+  const reorgReplayAdmission = new ReorgReplayAdmissionGate();
+  const monitorsAwaitingReplayActivation = new Set<string>();
   let requestMonitorReconcile = (): void => {};
 
   const removeMonitor = (
@@ -201,8 +216,34 @@ async function main(): Promise<void> {
     logRelease = true,
   ): Promise<void> => {
     const key = pair.toLowerCase();
+    if (terminalPairsPendingRetirement.has(key)) {
+      await retireTerminalPair(pair);
+      return;
+    }
     await monitors.get(key)?.stopAndDrain();
     removeMonitor(pair, scheduleNext, logRelease);
+  };
+
+  const retireTerminalPair = (pair: Address): Promise<void> => {
+    const key = pair.toLowerCase();
+    const existing = terminalRetirementOperations.get(key);
+    if (existing) return existing;
+    terminalPairsPendingRetirement.add(key);
+    const operation = retireTerminalMonitor(pair, {
+      stopAndDrain: async () => {
+        await monitors.get(key)?.stopAndDrain();
+      },
+      deleteCheckpoint: (listenerKey) => checkpoints.delete(listenerKey),
+      releaseCapacity: () => {
+        terminalPairsPendingRetirement.delete(key);
+        monitorsAwaitingReplayActivation.delete(key);
+        removeMonitor(pair);
+      },
+    }).finally(() => {
+      terminalRetirementOperations.delete(key);
+    });
+    terminalRetirementOperations.set(key, operation);
+    return operation;
   };
 
   const dashboardActions = new DashboardActionService(
@@ -227,7 +268,14 @@ async function main(): Promise<void> {
     const listener = new SwapListener(
       session,
       engine,
-      (pair) => removeMonitor(pair),
+      (pair) => {
+        void retireTerminalPair(pair).catch((error: unknown) => {
+          logger.error(
+            { pair, reason: errorMessage(error) },
+            'Retrait terminal du listener Swap échoué.',
+          );
+        });
+      },
       {
         watcher: wsClient,
         logReader: publicClient,
@@ -238,9 +286,13 @@ async function main(): Promise<void> {
     activeSessionsByToken.set(tokenKey, session);
     activeTokenByPair.set(key, tokenKey);
     try {
-      await listener.start();
+      await startSwapMonitorForAdmission(listener, reorgReplayAdmission);
+      if (reorgReplayAdmission.isActive) {
+        monitorsAwaitingReplayActivation.add(key);
+      }
     } catch (error) {
       await listener.stopAndDrain();
+      monitorsAwaitingReplayActivation.delete(key);
       removeMonitor(session.pair.pair, false, false);
       throw error;
     }
@@ -260,7 +312,8 @@ async function main(): Promise<void> {
       await engine.ignoreManually(session);
     },
     canStart: () =>
-      monitorSchedulingEnabled && !recovery.currentStatus.running,
+      (monitorSchedulingEnabled || reorgReplayAdmission.isActive)
+      && !recovery.currentStatus.running,
     start: startMonitor,
     stop: (pair) => stopMonitor(pair, false, false),
   });
@@ -327,7 +380,7 @@ async function main(): Promise<void> {
     await synchronizeRecoveredSessions();
   };
 
-  activateRecoveredSessions = async (): Promise<void> => {
+  const drainRecoveredMonitors = async (): Promise<void> => {
     const pending = [...monitorsPendingRecoveryDrain.entries()];
     await Promise.all(
       pending.map(([, listener]) => listener.stopAndDrain()),
@@ -336,7 +389,20 @@ async function main(): Promise<void> {
       removeMonitor(pairKey as Address, false);
       monitorsPendingRecoveryDrain.delete(pairKey);
     }
-    await monitorScheduler.reconcile();
+  };
+
+  activateRecoveredSessions = async (): Promise<void> => {
+    await drainRecoveredMonitors();
+    const result = await monitorScheduler.reconcile();
+    if (result.failedPairs.length > 0) {
+      throw new Error(
+        `Démarrage de ${result.failedPairs.length} listener(s) Swap échoué.`,
+      );
+    }
+  };
+
+  admitReorgReplaySessions = async (): Promise<MonitorReconcileResult> => {
+    return monitorScheduler.reconcile();
   };
 
   const canonicalCoordinator = new CanonicalChainCoordinator({
@@ -400,7 +466,10 @@ async function main(): Promise<void> {
       return pendingShallowReorgs.finalizeHead(async (pending) => {
         const replayAndFinalize = (impact: ReorgRollbackImpact) =>
           finalizeShallowReorgReplay(impact, {
-            activateRecoveredSessions,
+            withReplayAdmission: (operation) =>
+              reorgReplayAdmission.run(operation),
+            prepareRecoveredSessions: drainRecoveredMonitors,
+            activateRecoveredSessions: admitReorgReplaySessions,
             reconcilePairs: async () => pairListener?.reconcileNow(),
             waitForMonitorIdle: () => monitorScheduler.waitForIdle(),
             reconcileActiveSwaps: async () => {
@@ -442,6 +511,12 @@ async function main(): Promise<void> {
         return completion;
       });
     },
+    onRecovered: () => {
+      for (const key of monitorsAwaitingReplayActivation) {
+        monitors.get(key)?.activateAfterReplay();
+      }
+      monitorsAwaitingReplayActivation.clear();
+    },
   });
   chainHealthProvider = new CanonicalChainHealthProvider(
     config.blockConfirmations,
@@ -454,6 +529,17 @@ async function main(): Promise<void> {
     if (monitors.has(key)) return;
     const existing = await sessions.findByPair(pair.pair);
     if (existing) {
+      const restored = restoreReappearedPairSession(existing, pair, Date.now());
+      if (restored) {
+        await discovered.upsert({
+          pair,
+          metadata: restored.metadata,
+          source: 'PAIR_CREATED',
+        });
+        await sessions.save(restored);
+        requestMonitorReconcile();
+        return;
+      }
       requestMonitorReconcile();
       return;
     }
@@ -527,7 +613,32 @@ async function main(): Promise<void> {
         'Dashboard non démarré; le bot continue sans interface.',
       );
     },
+    prepareListenerCheckpoints: async () => {
+      const removed =
+        await checkpoints.deleteNonMonitorableSwapCheckpoints();
+      if (removed > 0) {
+        logger.info(
+          { removed },
+          'Checkpoints Swap terminaux nettoyés au démarrage.',
+        );
+      }
+    },
     hydrateCanonicalRecovery: async () => {
+      const manualReview = await chainRepository.getManualReviewReorg();
+      if (manualReview) {
+        canonicalCoordinator.hydrateManualReviewReorg({
+          reorgId: manualReview.id,
+          detectedAtMs: manualReview.detectedAtMs,
+          ancestor: manualReview.commonAncestor,
+          oldTip: manualReview.previousTip,
+          newTip: manualReview.replacementTip,
+          impact: {
+            ...manualReview.impact,
+            requiresManualReview: true,
+          },
+        });
+        return 'MANUAL_REVIEW';
+      }
       const persisted = await chainRepository.listPendingShallowReorgs();
       if (persisted.length === 0) return;
       const hydrated = persisted.map(({ audit, rollbackImpact }) => {

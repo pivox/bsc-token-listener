@@ -1,6 +1,7 @@
 export interface StartupAfterRecoveryDependencies {
   startDashboard(): Promise<void>;
-  hydrateCanonicalRecovery?(): Promise<void>;
+  prepareListenerCheckpoints?(): Promise<void>;
+  hydrateCanonicalRecovery?(): Promise<void | 'MANUAL_REVIEW'>;
   synchronizeCanonical(): Promise<void>;
   activateListeners(): Promise<void>;
   onDashboardError?(error: Error): void;
@@ -29,7 +30,9 @@ export async function continueStartupAfterRecovery(
     );
   }
   try {
-    await dependencies.hydrateCanonicalRecovery?.();
+    await dependencies.prepareListenerCheckpoints?.();
+    const canonicalRecovery = await dependencies.hydrateCanonicalRecovery?.();
+    if (canonicalRecovery === 'MANUAL_REVIEW') return;
     await dependencies.synchronizeCanonical();
     await dependencies.activateListeners();
   } catch (error: unknown) {
