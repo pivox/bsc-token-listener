@@ -260,11 +260,11 @@ async function main(): Promise<void> {
     )
     : null;
 
-  const startMonitor = async (session: TokenSession): Promise<void> => {
-    if (!isSessionMonitorable(session)) return;
+  const startMonitor = async (session: TokenSession): Promise<boolean> => {
+    if (!isSessionMonitorable(session)) return false;
     const key = session.pair.pair.toLowerCase();
     const tokenKey = session.pair.token.toLowerCase();
-    if (monitors.has(key)) return;
+    if (monitors.has(key)) return true;
     const listener = new SwapListener(
       session,
       engine,
@@ -286,10 +286,19 @@ async function main(): Promise<void> {
     activeSessionsByToken.set(tokenKey, session);
     activeTokenByPair.set(key, tokenKey);
     try {
-      await startSwapMonitorForAdmission(listener, reorgReplayAdmission);
+      const started = await startSwapMonitorForAdmission(
+        listener,
+        reorgReplayAdmission,
+      );
+      if (!started) {
+        await listener.stopAndDrain();
+        removeMonitor(session.pair.pair, false, false);
+        return false;
+      }
       if (reorgReplayAdmission.isActive) {
         monitorsAwaitingReplayActivation.add(key);
       }
+      return true;
     } catch (error) {
       await listener.stopAndDrain();
       monitorsAwaitingReplayActivation.delete(key);
@@ -312,7 +321,7 @@ async function main(): Promise<void> {
       await engine.ignoreManually(session);
     },
     canStart: () =>
-      (monitorSchedulingEnabled || reorgReplayAdmission.isActive)
+      reorgReplayAdmission.canStartMonitor(monitorSchedulingEnabled)
       && !recovery.currentStatus.running,
     start: startMonitor,
     stop: (pair) => stopMonitor(pair, false, false),

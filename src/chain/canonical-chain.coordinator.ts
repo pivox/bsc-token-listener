@@ -583,30 +583,58 @@ export class CanonicalChainCoordinator {
       return execution;
     }
 
+    let requestStarted = false;
+    let requestCancelled = false;
+    let pendingReleased = false;
+    const releasePending = (): void => {
+      if (pendingReleased) return;
+      pendingReleased = true;
+      this.status = {
+        ...this.status,
+        pendingRequests: this.status.pendingRequests - 1,
+      };
+    };
+    const cancelQueuedRequest = (): boolean => {
+      if (requestStarted || requestCancelled) return false;
+      requestCancelled = true;
+      releasePending();
+      return true;
+    };
+    const queuedRequestCancelled = (): boolean => {
+      if (!requestCancelled && request.signal?.aborted === true) {
+        cancelQueuedRequest();
+      }
+      return requestCancelled;
+    };
+
     if (this.status.state === 'RECONCILING') {
       const operation = this.tail.then(async () => {
-        let requestStarted = false;
         try {
+          if (queuedRequestCancelled()) return;
           if (this.status.state === 'RECONCILING') {
             await this.finalizePendingReorg();
           }
+          if (queuedRequestCancelled()) return;
           requestStarted = true;
           await this.runRequest(request);
         } catch (error: unknown) {
-          if (!requestStarted) {
-            this.status = {
-              ...this.status,
-              pendingRequests: this.status.pendingRequests - 1,
-            };
-          }
+          if (!requestStarted) releasePending();
           throw error;
         }
       });
       this.tail = operation.catch(() => undefined);
-      return operation;
+      return this.observeQueuedCancellation(
+        operation,
+        request.signal,
+        cancelQueuedRequest,
+      );
     }
 
-    const operation = this.tail.then(() => this.runRequest(request));
+    const operation = this.tail.then(() => {
+      if (queuedRequestCancelled()) return false;
+      requestStarted = true;
+      return this.runRequest(request);
+    });
     const execution = operation.then(() => undefined);
     const queued = operation.then(async (reorgDetected) => {
       if (!reorgDetected) return;
@@ -630,7 +658,36 @@ export class CanonicalChainCoordinator {
       }
     });
     this.tail = queued.catch(() => undefined);
-    return execution;
+    return this.observeQueuedCancellation(
+      execution,
+      request.signal,
+      cancelQueuedRequest,
+    );
+  }
+
+  private observeQueuedCancellation(
+    operation: Promise<void>,
+    signal: AbortSignal | undefined,
+    cancel: () => boolean,
+  ): Promise<void> {
+    if (!signal) return operation;
+    return new Promise<void>((resolve, reject) => {
+      const onAbort = (): void => {
+        if (cancel()) resolve();
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) onAbort();
+      operation.then(
+        () => {
+          signal.removeEventListener('abort', onAbort);
+          resolve();
+        },
+        (error: unknown) => {
+          signal.removeEventListener('abort', onAbort);
+          reject(error);
+        },
+      );
+    });
   }
 
   private async finalizePendingReorg(): Promise<void> {
@@ -720,6 +777,14 @@ export class CanonicalChainCoordinator {
       this.status.state !== 'HEALTHY'
       && !(this.status.state === 'RECONCILING' && inPostReorgScope)
     ) return false;
+    if (
+      request.bootstrap !== undefined
+      && request.bootstrap !== 'confirmed-head'
+    ) {
+      throw new Error(
+        `Mode de bootstrap listener invalide: ${String(request.bootstrap)}.`,
+      );
+    }
 
     const latestBlock = await this.blockReader.getBlockNumber();
     const head = confirmedHead(latestBlock, this.confirmations);
@@ -765,7 +830,9 @@ export class CanonicalChainCoordinator {
 
     const fromBlock = checkpoint
       ? checkpoint.blockNumber + 1n
-      : request.startBlock;
+      : request.bootstrap === 'confirmed-head'
+        ? head
+        : request.startBlock;
     const windowStart = this.canonicalWindowStart(head);
     const journalStart =
       oldestCheckpointBefore !== null && oldestCheckpointBefore < windowStart

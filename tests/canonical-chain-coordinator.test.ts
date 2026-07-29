@@ -318,6 +318,36 @@ test('traite uniquement la plage confirmée puis ancre le checkpoint', async () 
   });
 });
 
+test('bootstrappe un listener Pair fresh au head confirmé sans scanner son historique', async () => {
+  const latest = 10_005n;
+  const confirmed = 10_000n;
+  const reader = new MemoryBlockReader(latest);
+  const canonicalStore = new MemoryCanonicalStore();
+  const checkpoints = new MemoryCheckpoints();
+  const ranges: Array<[bigint, bigint]> = [];
+  const subject = coordinator(reader, canonicalStore, checkpoints);
+
+  await subject.reconcile({
+    listenerKey: 'pair-created',
+    startBlock: 0n,
+    bootstrap: 'confirmed-head',
+    processChunk: async (fromBlock, toBlock) => {
+      ranges.push([fromBlock, toBlock]);
+      return true;
+    },
+  });
+
+  assert.deepEqual(ranges, [[confirmed, confirmed]]);
+  assert.ok(
+    reader.reads.length <= DEFAULT_CANONICAL_RETENTION + 1,
+    `lectures de headers non bornées: ${reader.reads.length}`,
+  );
+  assert.deepEqual(checkpoints.values.get('pair-created'), {
+    blockNumber: confirmed,
+    blockHash: hash(confirmed + 1n),
+  });
+});
+
 test('ne traite et ne checkpoint rien lorsque la tête n’est pas confirmée', async () => {
   const checkpoints = new MemoryCheckpoints();
   let calls = 0;
@@ -535,6 +565,55 @@ test('sérialise strictement les listeners et conserve la queue après un échec
     state: 'HEALTHY',
     lastReorg: null,
   });
+});
+
+test('annule immédiatement un reconcile de démarrage encore en queue puis rend sa continuation no-op', async () => {
+  const checkpoints = new MemoryCheckpoints();
+  const subject = coordinator(
+    new MemoryBlockReader(6n),
+    new MemoryCanonicalStore(),
+    checkpoints,
+  );
+  const firstStarted = deferred();
+  const releaseFirst = deferred();
+  let cancelledChunks = 0;
+
+  const first = subject.reconcile({
+    listenerKey: 'first',
+    startBlock: 1n,
+    processChunk: async () => {
+      firstStarted.resolve();
+      await releaseFirst.promise;
+      return true;
+    },
+  });
+  await firstStarted.promise;
+
+  const controller = new AbortController();
+  let cancelledResolved = false;
+  const cancelled = subject.reconcile({
+    listenerKey: 'cancelled-start',
+    startBlock: 1n,
+    signal: controller.signal,
+    processChunk: async () => {
+      cancelledChunks += 1;
+      return true;
+    },
+  }).then(() => {
+    cancelledResolved = true;
+  });
+
+  controller.abort();
+  await flushPromises();
+  const resolvedBeforeQueueTurn = cancelledResolved;
+  releaseFirst.resolve();
+  await Promise.all([first, cancelled]);
+  await subject.waitForIdle();
+
+  assert.equal(resolvedBeforeQueueTurn, true);
+  assert.equal(cancelledChunks, 0);
+  assert.equal(checkpoints.values.has('cancelled-start'), false);
+  assert.equal(subject.currentStatus.pendingRequests, 0);
 });
 
 test('un callback Pair planifie le monitor sans bloquer son checkpoint avant Swap', async () => {

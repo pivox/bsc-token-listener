@@ -181,6 +181,7 @@ test('PairCreated délègue la plage confirmée et ne traite que les logs HTTP o
 
   assert.equal(coordinator.requests[0]?.listenerKey, 'pair-created');
   assert.equal(coordinator.requests[0]?.startBlock, 0n);
+  assert.equal(coordinator.requests[0]?.bootstrap, 'confirmed-head');
   assert.deepEqual(
     reads.map(({ fromBlock, toBlock }) => ({ fromBlock, toBlock })),
     [{ fromBlock: 10n, toBlock: 11n }],

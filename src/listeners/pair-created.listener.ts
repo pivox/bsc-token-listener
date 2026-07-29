@@ -208,6 +208,7 @@ export class PairCreatedListener {
           await this.dependencies.coordinator.reconcile({
             listenerKey: 'pair-created',
             startBlock: 0n,
+            bootstrap: 'confirmed-head',
             processChunk: (fromBlock, toBlock, canonicalHeaders) =>
               this.processChunk(fromBlock, toBlock, canonicalHeaders),
           });

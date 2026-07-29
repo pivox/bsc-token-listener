@@ -45,6 +45,7 @@ export async function finalizeShallowReorgReplay(
   return dependencies.withReplayAdmission(async () => {
     await dependencies.prepareRecoveredSessions();
     await dependencies.reconcilePairs();
+    await dependencies.waitForMonitorIdle();
     const admission = await dependencies.activateRecoveredSessions();
     if (admission && admission.failedPairs.length > 0) {
       throw new Error(

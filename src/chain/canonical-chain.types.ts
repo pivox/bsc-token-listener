@@ -15,6 +15,8 @@ export interface CanonicalBlockReader {
 export interface ConfirmedRangeRequest {
   listenerKey: string;
   startBlock: bigint;
+  bootstrap?: 'confirmed-head';
+  signal?: AbortSignal;
   processChunk(
     fromBlock: bigint,
     toBlock: bigint,

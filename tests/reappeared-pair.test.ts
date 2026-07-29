@@ -89,6 +89,26 @@ test('remplace la provenance bloc/hash quand la même identité PairCreated réa
   assert.equal(restored?.pair.createdLogIndex, pair().createdLogIndex);
 });
 
+test('restaure la même paire recanonisée par un nouveau log PairCreated', () => {
+  const replacement = {
+    ...pair(),
+    createdBlock: 12n,
+    blockHash: HASH('8'),
+    createdTransactionHash: HASH('7'),
+    createdLogIndex: 9,
+    discoveredAtMs: 100,
+  };
+
+  const restored = restoreReappearedPairSession(
+    orphanedSession(),
+    replacement,
+    200,
+  );
+
+  assert.equal(restored?.status, 'WAITING_FIRST_BUY');
+  assert.deepEqual(restored?.pair, replacement);
+});
+
 test('ne restaure ni une identité stable différente ni une conséquence wallet manuelle', () => {
   assert.equal(
     restoreReappearedPairSession(
@@ -100,6 +120,22 @@ test('ne restaure ni une identité stable différente ni une conséquence wallet
   );
   assert.equal(
     restoreReappearedPairSession(orphanedSession('MANUAL_REVIEW'), pair(), 200),
+    null,
+  );
+  const rejectedWithWalletConsequence = orphanedSession();
+  rejectedWithWalletConsequence.unreconciledExecution = {
+    tradeId: 'trade-wallet',
+    step: 'BUY',
+    outcome: 'UNKNOWN',
+    transactionHash: HASH('6'),
+    recordedAtMs: 10,
+  };
+  assert.equal(
+    restoreReappearedPairSession(
+      rejectedWithWalletConsequence,
+      pair(),
+      200,
+    ),
     null,
   );
 });

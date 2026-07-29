@@ -7,7 +7,7 @@ function sameAddress(left: string, right: string): boolean {
   return left.toLowerCase() === right.toLowerCase();
 }
 
-function samePairIdentity(left: PairInfo, right: PairInfo): boolean {
+function sameImmutablePairIdentity(left: PairInfo, right: PairInfo): boolean {
   return (
     sameAddress(left.factory, right.factory)
     && sameAddress(left.router, right.router)
@@ -16,9 +16,14 @@ function samePairIdentity(left: PairInfo, right: PairInfo): boolean {
     && sameAddress(left.token, right.token)
     && sameAddress(left.token0, right.token0)
     && sameAddress(left.token1, right.token1)
-    && left.createdTransactionHash.toLowerCase()
-      === right.createdTransactionHash.toLowerCase()
-    && left.createdLogIndex === right.createdLogIndex
+  );
+}
+
+function hasWalletConsequence(session: TokenSession): boolean {
+  return (
+    session.unreconciledExecution !== undefined
+    || session.entry?.mode === 'live'
+    || session.exit?.mode === 'live'
   );
 }
 
@@ -30,7 +35,8 @@ export function restoreReappearedPairSession(
   if (
     existing.status !== 'REJECTED'
     || existing.rejectionReason !== ORPHANED_DISCOVERY_REASON
-    || !samePairIdentity(existing.pair, pair)
+    || hasWalletConsequence(existing)
+    || !sameImmutablePairIdentity(existing.pair, pair)
   ) {
     return null;
   }

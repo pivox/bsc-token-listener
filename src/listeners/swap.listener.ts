@@ -162,14 +162,18 @@ export class SwapListener {
     this.dependencies = defaultDependencies;
   }
 
-  async start(): Promise<void> {
+  async start(options: { signal?: AbortSignal } = {}): Promise<void> {
     this.stopped = false;
     this.terminalNotified = false;
     this.externalIngestionEnabled = true;
     this.replayPrepared = false;
     this.installWatcher();
 
-    await this.requestReconcile();
+    await this.requestReconcile(options.signal);
+    if (options.signal?.aborted) {
+      this.stop();
+      return;
+    }
     if (this.stopped || !isSessionMonitorable(this.session)) return;
     this.installInterval();
     this.logActive();
@@ -277,7 +281,7 @@ export class SwapListener {
     }
   }
 
-  private requestReconcile(): Promise<void> {
+  private requestReconcile(signal?: AbortSignal): Promise<void> {
     if (this.stopped) return Promise.resolve();
     if (this.reconciliation) {
       this.reconcilePending = true;
@@ -293,6 +297,7 @@ export class SwapListener {
           await this.dependencies.coordinator.reconcile({
             listenerKey: `swap:${this.session.pair.pair.toLowerCase()}`,
             startBlock: this.session.pair.createdBlock,
+            ...(signal ? { signal } : {}),
             processChunk: (fromBlock, toBlock, canonicalHeaders) =>
               this.processChunk(fromBlock, toBlock, canonicalHeaders),
           });
@@ -300,7 +305,7 @@ export class SwapListener {
           if (!failed) firstFailure = error;
           failed = true;
         }
-      } while (this.reconcilePending && !this.stopped);
+      } while (this.reconcilePending && !this.stopped && !signal?.aborted);
       if (failed) throw firstFailure;
     })();
     const tracked = this.track(execution);
