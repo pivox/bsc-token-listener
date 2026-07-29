@@ -130,6 +130,8 @@ export class FreshStartRepository {
            recovery_error = $2,
            updated_at = to_timestamp($3 / 1000.0)
          WHERE status = ANY($1::text[])
+           AND COALESCE(recovery_error, '')
+             NOT LIKE 'FRESH_START_CUTOFF:%'
          RETURNING pair_address`,
         [[...ACTIVE_STATUSES], reason, nowMs],
       );
