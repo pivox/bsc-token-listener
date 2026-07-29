@@ -84,6 +84,9 @@ test('réclame une session avec SKIP LOCKED et charge son snapshot', async () =>
   assert.ok(client.calls.some((call) =>
     /status = 'MANUAL_REVIEW'/u.test(call.sql)
     && /unreconciledExecution/u.test(call.sql)));
+  assert.ok(client.calls.some((call) =>
+    /COALESCE\(recovery_error,\s*''\)\s+NOT LIKE\s+'FRESH_START_CUTOFF:%'/u
+      .test(call.sql)));
 });
 
 test('applique la décision sous bail et écrit un audit idempotent', async () => {

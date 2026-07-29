@@ -399,8 +399,16 @@ export class DashboardRepository {
        LEFT JOIN swap_counts sc ON sc.pair_address = d.pair_address
        LEFT JOIN failed_trades ft ON ft.pair_address = d.pair_address
        ORDER BY
-         CASE WHEN s.status IN ('BUY_PENDING', 'HOLDING', 'SELL_PENDING', 'MANUAL_REVIEW') THEN 0 ELSE 1 END,
-         COALESCE(s.updated_at, d.updated_at) DESC
+         CASE
+           WHEN s.status = 'MANUAL_REVIEW' THEN 0
+           WHEN s.status = 'WAITING_FIRST_BUY' THEN 1
+           WHEN s.status IN (
+             'RISK_CHECKING', 'BUY_PENDING', 'HOLDING', 'SELL_PENDING'
+           ) THEN 2
+           ELSE 3
+         END,
+         COALESCE(s.updated_at, d.updated_at) DESC,
+         d.token_address ASC
        LIMIT $1`,
       [limit],
     );

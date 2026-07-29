@@ -18,13 +18,27 @@ Le premier Swap classé `BUY` observé sur une paire créée depuis le démarrag
 3. liquidité WBNB minimale ;
 4. sonde aller-retour réussie et perte sous le seuil.
 
-L’entrée est basée sur un log confirmé : elle n’est pas garantie dans le même bloc. Une session encore en attente est expirée au redémarrage, afin de ne pas transformer un achat ancien en faux « premier achat ».
+L’entrée est basée sur un log confirmé : elle n’est pas garantie dans le même
+bloc. Au redémarrage, toute session non terminale précédente passe en
+`MANUAL_REVIEW` et n’est jamais reprise automatiquement.
 
 ## Continuité canonique et reorgs
 
 Les WebSockets servent uniquement de signal de réveil : les logs et les headers sont toujours relus par RPC HTTP avant traitement. Avec `BLOCK_CONFIRMATIONS=5`, chaque décision suit donc la tête réseau d’au moins cinq blocs. Le journal canonique conserve une fenêtre de 128 blocs : un reorg récent est automatiquement rembobiné puis rejoué depuis son ancêtre commun ; un reorg plus profond suspend les passes et place les conséquences wallet en `MANUAL_REVIEW`.
 
 Le heartbeat et le dashboard exposent la profondeur de confirmation, le head confirmé, le tip/hash canonique, l’état `HEALTHY`, `RECONCILING` ou `MANUAL_REVIEW`, et le dernier reorg (détection, ancêtre, profondeur et compteurs). Une erreur RPC conserve les dernières valeurs validées mais les marque `STALE` et ne présente jamais cet état comme `HEALTHY`.
+
+Chaque lancement installe atomiquement le head confirmé courant comme cutoff
+immutable. La règle d’ingestion est :
+
+```text
+processable block number > latest committed fresh-start cutoff block number
+```
+
+Les checkpoints et le journal canonique sont réancrés sur ce header. Une erreur
+RPC n’installe aucun cutoff et n’avance aucun checkpoint. Une reorg qui
+traverserait la frontière exige `MANUAL_REVIEW` ; le coordinateur ne recherche
+jamais d’ancêtre sous le cutoff.
 
 ## Surveillance continue et règles de sortie
 
@@ -66,11 +80,12 @@ arme le mécanisme et remplace la vente take-profit fixe ; un recul de 5 % par
 rapport au pic net persistant déclenche ensuite la vente.
 
 Les réglages effectifs, leur révision, la liquidité de référence, le pic
-trailing et les décisions sont persistés. Après un crash, les transactions
-existantes sont d’abord retrouvées par hash et nonce. Une décision
-`EXECUTING` ne rediffuse jamais une transaction avant cette réconciliation.
-Les listeners et le monitor de sortie ne démarrent qu’après la première
-réconciliation canonique.
+trailing et les décisions sont persistés. Pendant une exécution, une transaction
+incertaine peut être retrouvée par hash et nonce sans rediffusion. Au lancement
+suivant, les sessions non terminales et décisions récupérables précédentes sont
+placées en `MANUAL_REVIEW` ; aucune reprise initiale n’est exécutée. La
+récupération périodique ne concerne que les incidents survenus depuis le cutoff
+de l’exécution courante.
 
 Une vente échouée avant diffusion, ou révoquée avec certitude, peut revenir en
 `HOLDING`. Si une vente a été diffusée mais que son résultat est ambigu, la

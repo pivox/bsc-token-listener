@@ -206,6 +206,7 @@ function coordinator(
   options: {
     confirmations?: number;
     chunkSize?: number;
+    cutoff?: CanonicalBlock;
     reorgHandler?: CanonicalReorgHandler;
     runtimeBarrier?: RuntimeRecoveryBarrier;
     headerSpoolFactory?: CanonicalChainCoordinatorOptions['headerSpoolFactory'];
@@ -218,6 +219,7 @@ function coordinator(
     checkpoints,
     reorgHandler: options.reorgHandler ?? new MemoryReorgHandler(),
     confirmations: options.confirmations ?? 5,
+    ...(options.cutoff === undefined ? {} : { cutoff: options.cutoff }),
     ...(options.chunkSize === undefined
       ? {}
       : { chunkSize: options.chunkSize }),
@@ -316,6 +318,159 @@ test('traite uniquement la plage confirmée puis ancre le checkpoint', async () 
     blockNumber: 15n,
     blockHash: hash(16n),
   });
+});
+
+test('ne traite jamais le cutoff ni un checkpoint plus ancien', async () => {
+  const cutoff = block(100n);
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', {
+    blockNumber: 10n,
+    blockHash: hash(11n),
+  });
+  const ranges: Array<[bigint, bigint]> = [];
+  const subject = coordinator(
+    new MemoryBlockReader(110n),
+    new MemoryCanonicalStore([cutoff]),
+    checkpoints,
+    { confirmations: 5, cutoff },
+  );
+
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 0n,
+    processChunk: async (from, to, headers) => {
+      ranges.push([from, to]);
+      assert.ok(headers.every(({ number }) => number > cutoff.number));
+      return true;
+    },
+  });
+
+  assert.deepEqual(ranges, [[101n, 105n]]);
+  assert.ok(
+    checkpoints.writes.every(
+      ({ checkpoint }) => checkpoint.blockNumber >= cutoff.number,
+    ),
+  );
+});
+
+test('ne rappelle pas processChunk tant que le head confirmé égale le cutoff', async () => {
+  const cutoff = block(100n);
+  let chunks = 0;
+  const subject = coordinator(
+    new MemoryBlockReader(105n),
+    new MemoryCanonicalStore([cutoff]),
+    new MemoryCheckpoints(),
+    { confirmations: 5, cutoff },
+  );
+
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 0n,
+    processChunk: async () => {
+      chunks += 1;
+      return true;
+    },
+  });
+
+  assert.equal(chunks, 0);
+});
+
+test('une erreur RPC ne persiste pas l’ancrage d’un checkpoint sous le cutoff', async () => {
+  const cutoff = block(100n);
+  const reader = new MemoryBlockReader(110n);
+  reader.failAt = cutoff.number;
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', {
+    blockNumber: 10n,
+    blockHash: hash(11n),
+  });
+  const subject = coordinator(
+    reader,
+    new MemoryCanonicalStore([cutoff]),
+    checkpoints,
+    { cutoff },
+  );
+
+  await assert.rejects(
+    subject.reconcile({
+      listenerKey: 'pairs',
+      startBlock: 0n,
+      processChunk: async () => true,
+    }),
+    /RPC indisponible/u,
+  );
+  assert.deepEqual(checkpoints.writes, []);
+});
+
+test('une erreur RPC de logs ne persiste pas l’ancrage sous le cutoff', async () => {
+  const cutoff = block(100n);
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', {
+    blockNumber: 10n,
+    blockHash: hash(11n),
+  });
+  const subject = coordinator(
+    new MemoryBlockReader(110n),
+    new MemoryCanonicalStore([cutoff]),
+    checkpoints,
+    { cutoff },
+  );
+
+  await assert.rejects(
+    subject.reconcile({
+      listenerKey: 'pairs',
+      startBlock: 0n,
+      processChunk: async () => {
+        throw new Error('log RPC unavailable');
+      },
+    }),
+    /log RPC unavailable/u,
+  );
+  assert.deepEqual(checkpoints.writes, []);
+});
+
+test('passe en revue manuelle si une reorg traverse le cutoff', async () => {
+  const cutoff = block(100n);
+  const reader = new MemoryBlockReader(110n);
+  reader.getBlock = async (number) => {
+    reader.reads.push(number);
+    return {
+      number,
+      hash: hash(20_000n + number),
+      parentHash:
+        number === 0n ? ZERO_HASH : hash(20_000n + number - 1n),
+    };
+  };
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 4 }, (_, index) => block(BigInt(100 + index))),
+  );
+  const reorgHandler = new MemoryReorgHandler();
+  reorgHandler.impact = {
+    depth: null,
+    orphanedEvents: 0,
+    replayedEvents: 0,
+    requiresManualReview: true,
+  };
+  const subject = coordinator(
+    reader,
+    canonicalStore,
+    new MemoryCheckpoints(),
+    { cutoff, reorgHandler },
+  );
+
+  await assert.rejects(
+    subject.reconcile({
+      listenerKey: 'pairs',
+      startBlock: 0n,
+      processChunk: async () => true,
+    }),
+    /cutoff fresh-start/iu,
+  );
+  assert.equal(subject.currentStatus.state, 'MANUAL_REVIEW');
+  assert.equal(
+    reader.reads.some((number) => number < cutoff.number),
+    false,
+  );
 });
 
 test('bootstrappe un listener Pair fresh au head confirmé sans scanner son historique', async () => {

@@ -96,6 +96,8 @@ export class ReconciliationRepository implements ReconciliationStore {
                  AND payload ? 'unreconciledExecution'
                )
              )
+             AND COALESCE(recovery_error, '')
+               NOT LIKE 'FRESH_START_CUTOFF:%'
              AND (recovery_lease_until IS NULL OR recovery_lease_until < NOW())
              AND NOT (pair_address = ANY($3::text[]))
            ORDER BY updated_at

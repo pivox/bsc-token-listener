@@ -1,6 +1,28 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { continueStartupAfterRecovery } from '../src/runtime/startup-order.js';
+
+test('applique le fresh-start avant dashboard et listeners sans recovery initiale', async () => {
+  const source = await readFile('src/app.ts', 'utf8');
+  const cutoff = source.indexOf('await freshStartService.apply()');
+  const dashboard = source.indexOf('await dashboard?.start()');
+  const listeners = source.indexOf('await pairListener.start()');
+
+  assert.ok(cutoff >= 0);
+  assert.ok(cutoff < dashboard);
+  assert.ok(dashboard < listeners);
+  assert.equal(source.includes('await recovery.reconcileInitial()'), false);
+  assert.equal(source.includes('hydrateCanonicalRecovery:'), false);
+});
+
+test('injecte le cutoff engagé dans le coordinateur canonique', async () => {
+  const source = await readFile('src/app.ts', 'utf8');
+  assert.match(
+    source,
+    /new CanonicalChainCoordinator\(\{[\s\S]*cutoff:\s*freshStartRun\.cutoff/u,
+  );
+});
 
 test('démarre le dashboard après la reprise et avant la synchronisation canonique puis les listeners', async () => {
   const events: string[] = [];

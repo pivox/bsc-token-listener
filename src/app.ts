@@ -37,6 +37,8 @@ import { ViemReconciliationGateway } from './recovery/viem-reconciliation.gatewa
 import { RuntimeRecoveryBarrier } from './recovery/runtime-recovery-barrier.js';
 import { account, publicClient, wsClient } from './rpc/clients.js';
 import { drainRuntimeForShutdown } from './runtime/runtime-shutdown.js';
+import { FreshStartRepository } from './runtime/fresh-start.repository.js';
+import { FreshStartService } from './runtime/fresh-start.service.js';
 import { startPositionExitRuntime } from './runtime/position-exit-runtime.js';
 import {
   ReorgReplayAdmissionGate,
@@ -73,6 +75,14 @@ import type { PairInfo, TokenSession } from './types/domain.js';
 import { errorMessage } from './utils/error.js';
 import { logger } from './utils/logger.js';
 
+let activeFreshStartRepository: FreshStartRepository | null = null;
+
+async function closeFreshStartRuntime(): Promise<void> {
+  const repository = activeFreshStartRepository;
+  activeFreshStartRepository = null;
+  await repository?.close();
+}
+
 async function main(): Promise<void> {
   const chainId = await publicClient.getChainId();
   if (chainId !== chain.id) {
@@ -99,6 +109,42 @@ async function main(): Promise<void> {
   }
 
   if (config.autoMigrate) await migrate();
+
+  const canonicalBlockReader = {
+    getBlockNumber: () => publicClient.getBlockNumber(),
+    getBlock: async (blockNumber: bigint) => {
+      const block = await publicClient.getBlock({ blockNumber });
+      if (
+        block.number === null
+        || block.hash === null
+        || block.number !== blockNumber
+      ) {
+        throw new Error(`Header RPC incomplet pour le bloc ${blockNumber}.`);
+      }
+      return {
+        number: block.number,
+        hash: block.hash,
+        parentHash: block.parentHash,
+      };
+    },
+  };
+  const freshStartRepository = new FreshStartRepository();
+  activeFreshStartRepository = freshStartRepository;
+  const freshStartService = new FreshStartService(
+    canonicalBlockReader,
+    freshStartRepository,
+    config.blockConfirmations,
+  );
+  const freshStartRun = await freshStartService.apply();
+  logger.warn(
+    {
+      cutoffBlock: freshStartRun.cutoff.number.toString(),
+      cutoffHash: freshStartRun.cutoff.hash,
+      quarantinedSessions: freshStartRun.quarantinedSessions,
+      quarantinedDecisions: freshStartRun.quarantinedDecisions,
+    },
+    'Fresh-start appliqué; historique antérieur placé en revue manuelle.',
+  );
 
   const sessions = new SessionRepository();
   const events = new SwapEventRepository();
@@ -482,25 +528,11 @@ async function main(): Promise<void> {
   };
 
   const canonicalCoordinator = new CanonicalChainCoordinator({
-    blockReader: {
-      getBlockNumber: () => publicClient.getBlockNumber(),
-      getBlock: async (blockNumber) => {
-        const block = await publicClient.getBlock({ blockNumber });
-        if (block.number === null || block.hash === null) {
-          throw new Error(
-            `Header RPC incomplet pour le bloc ${blockNumber}.`,
-          );
-        }
-        return {
-          number: block.number,
-          hash: block.hash,
-          parentHash: block.parentHash,
-        };
-      },
-    },
+    blockReader: canonicalBlockReader,
     canonicalStore: chainRepository,
     checkpoints,
     confirmations: config.blockConfirmations,
+    cutoff: freshStartRun.cutoff,
     runtimeBarrier: runtimeRecoveryBarrier,
     reorgHandler: {
       reconcileReorg: async (reorg) => {
@@ -598,6 +630,7 @@ async function main(): Promise<void> {
     config.blockConfirmations,
     canonicalCoordinator,
     chainRepository,
+    freshStartRun.appliedAtMs,
   );
 
   const onPair = async (pair: PairInfo): Promise<void> => {
@@ -668,12 +701,6 @@ async function main(): Promise<void> {
     requestMonitorReconcile();
   };
 
-  const initialRecovery = await recovery.reconcileInitial();
-  logger.info(
-    { processedSessions: initialRecovery.processedSessions },
-    'Réconciliation initiale terminée.',
-  );
-
   pairListener = new PairCreatedListener(onPair, {
     watcher: wsClient,
     logReader: publicClient,
@@ -698,48 +725,6 @@ async function main(): Promise<void> {
           'Checkpoints Swap terminaux nettoyés au démarrage.',
         );
       }
-    },
-    hydrateCanonicalRecovery: async () => {
-      const manualReview = await chainRepository.getManualReviewReorg();
-      if (manualReview) {
-        canonicalCoordinator.hydrateManualReviewReorg({
-          reorgId: manualReview.id,
-          detectedAtMs: manualReview.detectedAtMs,
-          ancestor: manualReview.commonAncestor,
-          oldTip: manualReview.previousTip,
-          newTip: manualReview.replacementTip,
-          impact: {
-            ...manualReview.impact,
-            requiresManualReview: true,
-          },
-        });
-        return 'MANUAL_REVIEW';
-      }
-      const persisted = await chainRepository.listPendingShallowReorgs();
-      if (persisted.length === 0) return;
-      const hydrated = persisted.map(({ audit, rollbackImpact }) => {
-        if (audit.commonAncestor === null) {
-          throw new Error('Audit RECONCILING shallow sans ancêtre commun.');
-        }
-        const identity = `${audit.previousTip.hash.toLowerCase()}:${audit.replacementTip.hash.toLowerCase()}`;
-        if (rollbackImpact.reorgId !== `reorg:${identity}`) {
-          throw new Error('Audit shallow persistant associé à un fork incohérent.');
-        }
-        pendingShallowReorgs.enqueue({
-          identity,
-          impact: rollbackImpact,
-          requiresProjectionReconciliation: true,
-        });
-        return {
-          reorgId: rollbackImpact.reorgId,
-          detectedAtMs: audit.detectedAtMs,
-          ancestor: audit.commonAncestor,
-          oldTip: audit.previousTip,
-          newTip: audit.replacementTip,
-          impact: rollbackImpact,
-        };
-      });
-      canonicalCoordinator.hydratePendingReorgs(hydrated);
     },
     synchronizeCanonical: async () => {
       await canonicalCoordinator.reconcile({
@@ -785,7 +770,10 @@ async function main(): Promise<void> {
       stopDashboard: async () => {
         await dashboard?.stop();
       },
-      closeDatabase,
+      closeDatabase: async () => {
+        await closeFreshStartRuntime();
+        await closeDatabase();
+      },
       onCleanupError: (error) => {
         logger.warn(
           { reason: errorMessage(error) },
@@ -891,6 +879,7 @@ async function main(): Promise<void> {
     } catch (error) {
       logger.warn({ reason: errorMessage(error) }, 'Arrêt du dashboard incomplet.');
     }
+    await closeFreshStartRuntime();
     await closeDatabase();
   };
 
@@ -898,7 +887,13 @@ async function main(): Promise<void> {
   process.once('SIGTERM', () => void shutdown('SIGTERM'));
 }
 
-main().catch((error: unknown) => {
+main().catch(async (error: unknown) => {
+  await closeFreshStartRuntime().catch((cleanupError: unknown) => {
+    logger.warn(
+      { reason: errorMessage(cleanupError) },
+      'Libération du verrou fresh-start incomplète.',
+    );
+  });
   logger.fatal({ error: errorMessage(error) }, 'Démarrage impossible.');
   process.exitCode = 1;
 });

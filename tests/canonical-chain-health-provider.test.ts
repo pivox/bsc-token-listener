@@ -67,6 +67,28 @@ test('au redémarrage, expose le dernier audit persistant MANUAL_REVIEW et dégr
   assert.equal(health.lastReorg?.orphanedEvents, 4);
 });
 
+test('ignore dans la santé courante un reorg antérieur au fresh-start', async () => {
+  const persisted = audit('MANUAL_REVIEW');
+  const subject = new CanonicalChainHealthProvider(
+    5,
+    coordinator({ value: 'HEALTHY' }),
+    {
+      getCanonicalTip: async () => ({
+        number: 120n,
+        hash: HASH,
+        parentHash: HASH,
+      }),
+      getLastReorg: async () => persisted,
+    } as unknown as CanonicalChainRepository,
+    persisted.detectedAtMs + 1,
+  );
+
+  const health = await subject.getHealth(125n);
+
+  assert.equal(health.state, 'HEALTHY');
+  assert.equal(health.lastReorg, null);
+});
+
 test('un RECOVERED runtime du même reorg reste RECONCILING tant que DB ne confirme pas', async () => {
   const persisted = { ...audit('RECONCILING'), detectedAtMs: 1_753_700_000_100 };
   const inMemory = { ...audit('RECOVERED'), detectedAtMs: 1_753_700_000_000 };

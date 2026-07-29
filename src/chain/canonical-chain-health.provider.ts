@@ -74,6 +74,7 @@ export class CanonicalChainHealthProvider implements ChainHealthProvider {
     readonly confirmations: number,
     private readonly coordinator: CanonicalChainCoordinator,
     private readonly repository: CanonicalChainRepository,
+    private readonly currentRunStartedAtMs = 0,
   ) {}
 
   async getHealth(latestBlock: bigint | null): Promise<ChainHealth> {
@@ -82,7 +83,12 @@ export class CanonicalChainHealthProvider implements ChainHealthProvider {
       this.repository.getLastReorg(),
     ]);
     const status = this.coordinator.currentStatus;
-    const reorg = mostRecentReorg(status.lastReorg, persisted);
+    const currentPersisted =
+      persisted !== null
+      && persisted.detectedAtMs >= this.currentRunStartedAtMs
+        ? persisted
+        : null;
+    const reorg = mostRecentReorg(status.lastReorg, currentPersisted);
     const state = reorg?.status === 'MANUAL_REVIEW'
       ? 'MANUAL_REVIEW'
       : reorg?.status === 'RECONCILING' && status.state === 'HEALTHY'
