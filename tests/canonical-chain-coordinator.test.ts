@@ -309,6 +309,7 @@ test('traite uniquement la plage confirmée puis ancre le checkpoint', async () 
       return true;
     },
   });
+  await subject.waitForIdle();
 
   assert.deepEqual(ranges, [[10n, 15n]]);
   assert.deepEqual(checkpoints.values.get('pairs'), {
@@ -1074,6 +1075,7 @@ test('réconcilie depuis l’ancêtre commun avant tout chunk ou checkpoint', as
       return true;
     },
   });
+  await subject.waitForIdle();
 
   assert.equal(reorgHandler.calls.length, 1);
   assert.deepEqual(reorgHandler.calls[0], {
@@ -1086,6 +1088,477 @@ test('réconcilie depuis l’ancêtre commun avant tout chunk ou checkpoint', as
   assert.deepEqual(checkpoints.writes, []);
   assert.equal(subject.currentStatus.state, 'HEALTHY');
   assert.equal(subject.currentStatus.lastReorg?.depth, 4);
+});
+
+test('un shallow reorg reste RECONCILING pendant le replay puis promeut le compteur final atomiquement', async () => {
+  const replayStarted = deferred();
+  const replayGate = deferred();
+  const reader = new MemoryBlockReader(115n);
+  const originalGetBlock = reader.getBlock.bind(reader);
+  reader.getBlock = async (number) =>
+    number > 106n ? forkedBlock(number, 106n) : originalGetBlock(number);
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 11 }, (_, index) => block(BigInt(100 + index))),
+  );
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', { blockNumber: 110n, blockHash: block(110n).hash });
+  const reorgHandler = new MemoryReorgHandler();
+  const subject = coordinator(reader, canonicalStore, checkpoints, {
+    reorgHandler,
+    afterReorg: async (state) => {
+      assert.equal(state, 'RECONCILING');
+      replayStarted.resolve();
+      await replayGate.promise;
+      const current = subject.currentStatus.lastReorg;
+      assert.ok(current);
+      return {
+        identity: `${current.oldTip.hash.toLowerCase()}:${current.newTip.hash.toLowerCase()}`,
+        reorgId: 'first',
+        replayedEvents: 7,
+      };
+    },
+  });
+
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 100n,
+    processChunk: async () => true,
+  });
+  await replayStarted.promise;
+
+  assert.equal(subject.currentStatus.state, 'RECONCILING');
+  assert.equal(subject.currentStatus.lastReorg?.status, 'RECONCILING');
+  assert.equal(subject.currentStatus.lastReorg?.impact.replayedEvents, 0);
+
+  replayGate.resolve();
+  await subject.waitForIdle();
+
+  assert.equal(subject.currentStatus.state, 'HEALTHY');
+  assert.equal(subject.currentStatus.lastReorg?.status, 'RECOVERED');
+  assert.equal(subject.currentStatus.lastReorg?.impact.replayedEvents, 7);
+});
+
+test('enchaîne deux shallow reorgs pendant le replay et ne promeut que le second résultat FIFO', async () => {
+  let salt = 10_000n;
+  const reader = new MemoryBlockReader(115n);
+  const originalGetBlock = reader.getBlock.bind(reader);
+  reader.getBlock = async (number) =>
+    number > 106n ? forkedBlock(number, 106n, salt) : originalGetBlock(number);
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 11 }, (_, index) => block(BigInt(100 + index))),
+  );
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', { blockNumber: 110n, blockHash: block(110n).hash });
+  const reorgHandler: CanonicalReorgHandler = {
+    reconcileReorg: async (reorg) => {
+      assert.ok(reorg.ancestor);
+      for (let number = reorg.ancestor.number + 1n; number <= reorg.oldTip.number; number += 1n) {
+        canonicalStore.blocks.set(number, forkedBlock(number, 106n, salt));
+      }
+      checkpoints.values.set('pairs', {
+        blockNumber: reorg.ancestor.number,
+        blockHash: reorg.ancestor.hash,
+      });
+      if (salt === 10_000n) salt = 20_000n;
+      return { depth: reorg.depth, orphanedEvents: 1, replayedEvents: 0 };
+    },
+  };
+  const completed: Array<{ reorgId: string; replayedEvents: number }> = [];
+  let afterCalls = 0;
+  let subject: CanonicalChainCoordinator;
+  subject = coordinator(reader, canonicalStore, checkpoints, {
+    reorgHandler,
+    afterReorg: async (state) => {
+      assert.equal(state, 'RECONCILING');
+      const current = subject.currentStatus.lastReorg;
+      assert.ok(current);
+      const identity = `${current.oldTip.hash.toLowerCase()}:${current.newTip.hash.toLowerCase()}`;
+      afterCalls += 1;
+      if (afterCalls === 1) {
+        await subject.reconcile({
+          listenerKey: 'nested-pairs',
+          startBlock: 107n,
+          processChunk: async () => true,
+        });
+        completed.push({ reorgId: 'first', replayedEvents: 3 });
+        return { identity, reorgId: 'first', replayedEvents: 3 };
+      }
+      completed.push({ reorgId: 'second', replayedEvents: 7 });
+      return { identity, reorgId: 'second', replayedEvents: 7 };
+    },
+  });
+
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 100n,
+    processChunk: async () => true,
+  });
+  await subject.waitForIdle();
+
+  assert.deepEqual(completed, [
+    { reorgId: 'first', replayedEvents: 3 },
+    { reorgId: 'second', replayedEvents: 7 },
+  ]);
+  assert.equal(subject.currentStatus.state, 'HEALTHY');
+  assert.equal(subject.currentStatus.lastReorg?.status, 'RECOVERED');
+  assert.equal(subject.currentStatus.lastReorg?.impact.replayedEvents, 7);
+  assert.equal(subject.currentStatus.lastReorg?.newTip.hash, forkedBlock(110n, 106n, 20_000n).hash);
+});
+
+test('un second replay en échec laisse son audit runtime RECONCILING après la finalisation du premier', async () => {
+  let salt = 10_000n;
+  const reader = new MemoryBlockReader(115n);
+  const originalGetBlock = reader.getBlock.bind(reader);
+  reader.getBlock = async (number) =>
+    number > 106n ? forkedBlock(number, 106n, salt) : originalGetBlock(number);
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 11 }, (_, index) => block(BigInt(100 + index))),
+  );
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', { blockNumber: 110n, blockHash: block(110n).hash });
+  const reorgHandler: CanonicalReorgHandler = {
+    reconcileReorg: async (reorg) => {
+      assert.ok(reorg.ancestor);
+      for (let number = reorg.ancestor.number + 1n; number <= reorg.oldTip.number; number += 1n) {
+        canonicalStore.blocks.set(number, forkedBlock(number, 106n, salt));
+      }
+      checkpoints.values.set('pairs', {
+        blockNumber: reorg.ancestor.number,
+        blockHash: reorg.ancestor.hash,
+      });
+      if (salt === 10_000n) salt = 20_000n;
+      return { depth: reorg.depth, orphanedEvents: 1, replayedEvents: 0 };
+    },
+  };
+  const completed: Array<{ reorgId: string; replayedEvents: number }> = [];
+  let afterCalls = 0;
+  let subject: CanonicalChainCoordinator;
+  subject = coordinator(reader, canonicalStore, checkpoints, {
+    reorgHandler,
+    afterReorg: async () => {
+      const current = subject.currentStatus.lastReorg;
+      assert.ok(current);
+      const identity = `${current.oldTip.hash.toLowerCase()}:${current.newTip.hash.toLowerCase()}`;
+      afterCalls += 1;
+      if (afterCalls === 1) {
+        completed.push({ reorgId: 'first', replayedEvents: 3 });
+        await subject.reconcile({
+          listenerKey: 'nested-pairs',
+          startBlock: 107n,
+          processChunk: async () => true,
+        });
+        return { identity, reorgId: 'first', replayedEvents: 3 };
+      }
+      throw new Error('second replay failed');
+    },
+  });
+
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 100n,
+    processChunk: async () => true,
+  });
+  await subject.waitForIdle();
+
+  assert.deepEqual(completed, [{ reorgId: 'first', replayedEvents: 3 }]);
+  assert.equal(subject.currentStatus.state, 'RECONCILING');
+  assert.equal(subject.currentStatus.lastReorg?.status, 'RECONCILING');
+  assert.equal(subject.currentStatus.lastReorg?.newTip.hash, forkedBlock(110n, 106n, 20_000n).hash);
+});
+
+test('un échec post-reorg remet aussi le dernier audit runtime en RECONCILING', async () => {
+  const reader = new MemoryBlockReader(115n);
+  const originalGetBlock = reader.getBlock.bind(reader);
+  reader.getBlock = async (number) =>
+    number > 106n ? forkedBlock(number, 106n) : originalGetBlock(number);
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 11 }, (_, index) => block(BigInt(100 + index))),
+  );
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', {
+    blockNumber: 110n,
+    blockHash: block(110n).hash,
+  });
+  const reorgHandler = new MemoryReorgHandler();
+  const subject = coordinator(reader, canonicalStore, checkpoints, {
+    reorgHandler,
+    afterReorg: async () => { throw new Error('replay impossible'); },
+  });
+
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 100n,
+    processChunk: async () => true,
+  });
+  await subject.waitForIdle();
+
+  assert.equal(subject.currentStatus.state, 'RECONCILING');
+  assert.equal(subject.currentStatus.lastReorg?.status, 'RECONCILING');
+});
+
+test('une reconcile externe relance sérialisée la finalisation échouée avant de traiter ses chunks', async () => {
+  const retryStarted = deferred();
+  const retryGate = deferred();
+  const reader = new MemoryBlockReader(115n);
+  const originalGetBlock = reader.getBlock.bind(reader);
+  reader.getBlock = async (number) =>
+    number > 106n ? forkedBlock(number, 106n) : originalGetBlock(number);
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 11 }, (_, index) => block(BigInt(100 + index))),
+  );
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', { blockNumber: 110n, blockHash: block(110n).hash });
+  let hookCalls = 0;
+  const chunks: string[] = [];
+  let subject: CanonicalChainCoordinator;
+  subject = coordinator(reader, canonicalStore, checkpoints, {
+    reorgHandler: {
+      reconcileReorg: async (reorg) => {
+        assert.ok(reorg.ancestor);
+        for (
+          let number = reorg.ancestor.number + 1n;
+          number <= reorg.newTip.number;
+          number += 1n
+        ) {
+          canonicalStore.blocks.set(number, forkedBlock(number, 106n));
+        }
+        checkpoints.values.set('pairs', {
+          blockNumber: reorg.ancestor.number,
+          blockHash: reorg.ancestor.hash,
+        });
+        return { depth: reorg.depth, orphanedEvents: 1, replayedEvents: 0 };
+      },
+    },
+    afterReorg: async () => {
+      hookCalls += 1;
+      if (hookCalls === 1) throw new Error('complete RPC failed');
+      retryStarted.resolve();
+      await retryGate.promise;
+      const current = subject.currentStatus.lastReorg;
+      assert.ok(current);
+      return {
+        identity: `${current.oldTip.hash.toLowerCase()}:${current.newTip.hash.toLowerCase()}`,
+        reorgId: 'recovered-after-retry',
+        replayedEvents: 1,
+      };
+    },
+  });
+
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 100n,
+    processChunk: async () => true,
+  });
+  await subject.waitForIdle();
+  assert.equal(subject.currentStatus.state, 'RECONCILING');
+
+  const first = subject.reconcile({
+    listenerKey: 'retry-one',
+    startBlock: 100n,
+    processChunk: async () => { chunks.push('one'); return true; },
+  });
+  const second = subject.reconcile({
+    listenerKey: 'retry-two',
+    startBlock: 100n,
+    processChunk: async () => { chunks.push('two'); return true; },
+  });
+  await retryStarted.promise;
+  assert.deepEqual(chunks, []);
+  assert.equal(hookCalls, 2);
+
+  retryGate.resolve();
+  await Promise.all([first, second]);
+
+  assert.equal(subject.currentStatus.state, 'HEALTHY');
+  assert.deepEqual(chunks, ['one', 'two']);
+  assert.equal(hookCalls, 2);
+});
+
+test('hydrate un audit shallow RECONCILING puis le finalise avant le premier sync canonique', async () => {
+  const reader = new MemoryBlockReader(115n);
+  const canonicalStore = new MemoryCanonicalStore();
+  const checkpoints = new MemoryCheckpoints();
+  const events: string[] = [];
+  let subject: CanonicalChainCoordinator;
+  subject = coordinator(reader, canonicalStore, checkpoints, {
+    afterReorg: async () => {
+      events.push('finalize');
+      const current = subject.currentStatus.lastReorg;
+      assert.ok(current);
+      return {
+        identity: `${current.oldTip.hash.toLowerCase()}:${current.newTip.hash.toLowerCase()}`,
+        reorgId: 'reorg:hydrated',
+        replayedEvents: 4,
+      };
+    },
+  });
+  subject.hydratePendingReorg({
+    reorgId: 'reorg:hydrated',
+    detectedAtMs: 1_753_700_000_000,
+    ancestor: { number: 10n, hash: block(10n).hash },
+    oldTip: { number: 12n, hash: block(12n).hash },
+    newTip: { number: 13n, hash: forkedBlock(13n, 10n).hash },
+    impact: { depth: 2, orphanedEvents: 1, replayedEvents: 0 },
+  });
+
+  await subject.reconcile({
+    listenerKey: 'canonical-startup-sync',
+    startBlock: 100n,
+    processChunk: async () => { events.push('chunk'); return true; },
+  });
+
+  assert.deepEqual(events, ['finalize', 'chunk']);
+  assert.equal(subject.currentStatus.state, 'HEALTHY');
+  assert.equal(subject.currentStatus.lastReorg?.status, 'RECOVERED');
+  assert.equal(subject.currentStatus.lastReorg?.impact.replayedEvents, 4);
+});
+
+test('hydrate et finalise une cascade persistée dans l’ordre FIFO avant le sync canonique', async () => {
+  const reader = new MemoryBlockReader(115n);
+  const canonicalStore = new MemoryCanonicalStore();
+  const checkpoints = new MemoryCheckpoints();
+  const events: string[] = [];
+  let subject: CanonicalChainCoordinator;
+  subject = coordinator(reader, canonicalStore, checkpoints, {
+    afterReorg: async () => {
+      const current = subject.currentStatus.lastReorg;
+      assert.ok(current);
+      const identity = `${current.oldTip.hash.toLowerCase()}:${current.newTip.hash.toLowerCase()}`;
+      events.push(`finalize:${identity}`);
+      return { identity, reorgId: `reorg:${identity}`, replayedEvents: events.length };
+    },
+  });
+  const first = {
+    reorgId: `reorg:${block(11n).hash}:${forkedBlock(12n, 10n).hash}`,
+    detectedAtMs: 1_753_700_000_000,
+    ancestor: { number: 10n, hash: block(10n).hash },
+    oldTip: { number: 11n, hash: block(11n).hash },
+    newTip: { number: 12n, hash: forkedBlock(12n, 10n).hash },
+    impact: { depth: 1, orphanedEvents: 1, replayedEvents: 0 },
+  };
+  const second = {
+    reorgId: `reorg:${block(12n).hash}:${forkedBlock(13n, 10n).hash}`,
+    detectedAtMs: 1_753_700_001_000,
+    ancestor: { number: 10n, hash: block(10n).hash },
+    oldTip: { number: 12n, hash: block(12n).hash },
+    newTip: { number: 13n, hash: forkedBlock(13n, 10n).hash },
+    impact: { depth: 2, orphanedEvents: 1, replayedEvents: 0 },
+  };
+  subject.hydratePendingReorgs([first, second]);
+
+  await subject.reconcile({
+    listenerKey: 'canonical-startup-sync',
+    startBlock: 100n,
+    processChunk: async () => { events.push('chunk'); return true; },
+  });
+
+  assert.deepEqual(events, [
+    `finalize:${first.oldTip.hash}:${first.newTip.hash}`,
+    `finalize:${second.oldTip.hash}:${second.newTip.hash}`,
+    'chunk',
+  ]);
+  assert.equal(subject.currentStatus.state, 'HEALTHY');
+  assert.equal(subject.currentStatus.lastReorg?.newTip.hash, second.newTip.hash);
+  assert.equal(subject.currentStatus.lastReorg?.impact.replayedEvents, 2);
+});
+
+test('un audit wallet hydraté termine MANUAL_REVIEW sans exécuter le sync original', async () => {
+  const reader = new MemoryBlockReader(115n);
+  const canonicalStore = new MemoryCanonicalStore();
+  const checkpoints = new MemoryCheckpoints();
+  let processCalls = 0;
+  let subject: CanonicalChainCoordinator;
+  subject = coordinator(reader, canonicalStore, checkpoints, {
+    afterReorg: async () => {
+      const current = subject.currentStatus.lastReorg;
+      assert.ok(current);
+      const identity = `${current.oldTip.hash.toLowerCase()}:${current.newTip.hash.toLowerCase()}`;
+      subject.requireManualReviewForPendingReorg(identity, 'reorg:wallet');
+      return undefined;
+    },
+  });
+  subject.hydratePendingReorg({
+    reorgId: 'reorg:wallet',
+    detectedAtMs: 1_753_700_000_000,
+    ancestor: { number: 10n, hash: block(10n).hash },
+    oldTip: { number: 12n, hash: block(12n).hash },
+    newTip: { number: 13n, hash: forkedBlock(13n, 10n).hash },
+    impact: {
+      depth: 2,
+      orphanedEvents: 1,
+      replayedEvents: 0,
+      requiresManualReview: true,
+    },
+  });
+
+  await subject.reconcile({
+    listenerKey: 'canonical-startup-sync',
+    startBlock: 100n,
+    processChunk: async () => { processCalls += 1; return true; },
+  });
+
+  assert.equal(processCalls, 0);
+  assert.equal(subject.currentStatus.state, 'MANUAL_REVIEW');
+  assert.equal(subject.currentStatus.lastReorg?.status, 'MANUAL_REVIEW');
+});
+
+test('refuse de promouvoir un résultat post-reorg associé à un autre fork', async () => {
+  const reader = new MemoryBlockReader(115n);
+  const originalGetBlock = reader.getBlock.bind(reader);
+  reader.getBlock = async (number) =>
+    number > 106n ? forkedBlock(number, 106n) : originalGetBlock(number);
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 11 }, (_, index) => block(BigInt(100 + index))),
+  );
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', { blockNumber: 110n, blockHash: block(110n).hash });
+  const subject = coordinator(reader, canonicalStore, checkpoints, {
+    reorgHandler: new MemoryReorgHandler(),
+    afterReorg: async () => ({
+      identity: 'another-fork',
+      reorgId: 'wrong',
+      replayedEvents: 4,
+    }),
+  });
+
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 100n,
+    processChunk: async () => true,
+  });
+  await subject.waitForIdle();
+
+  assert.equal(subject.currentStatus.state, 'RECONCILING');
+  assert.equal(subject.currentStatus.lastReorg?.status, 'RECONCILING');
+});
+
+test('une conséquence wallet shallow reste MANUAL_REVIEW sans transition RECOVERED', async () => {
+  const reader = new MemoryBlockReader(115n);
+  const originalGetBlock = reader.getBlock.bind(reader);
+  reader.getBlock = async (number) =>
+    number > 106n ? forkedBlock(number, 106n) : originalGetBlock(number);
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 11 }, (_, index) => block(BigInt(100 + index))),
+  );
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', { blockNumber: 110n, blockHash: block(110n).hash });
+  const reorgHandler = new MemoryReorgHandler();
+  reorgHandler.impact = {
+    depth: 4,
+    orphanedEvents: 1,
+    replayedEvents: 0,
+    requiresManualReview: true,
+  };
+  const subject = coordinator(reader, canonicalStore, checkpoints, { reorgHandler });
+
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 100n,
+    processChunk: async () => true,
+  });
+
+  assert.equal(subject.currentStatus.state, 'MANUAL_REVIEW');
+  assert.equal(subject.currentStatus.lastReorg?.status, 'MANUAL_REVIEW');
 });
 
 test('une erreur RPC pendant le préflight ou la recherche d’ancêtre ne mute rien', async () => {
@@ -1301,7 +1774,10 @@ test('bloque toute nouvelle passe si un rewind shallow échoue', async () => {
   const blockNumberReadsAfterFailure = reader.blockNumberReads;
   const writesAfterFailure = checkpoints.writes.length;
 
-  await subject.reconcile(request);
+  await assert.rejects(
+    subject.reconcile(request),
+    /Rollback shallow incomplet/u,
+  );
 
   assert.equal(reader.reads.length, readsAfterFailure);
   assert.equal(reader.blockNumberReads, blockNumberReadsAfterFailure);
@@ -1732,6 +2208,13 @@ test('autorise seulement les reconciles nested du post-reorg sans ouvrir la queu
       });
       nestedFinished.resolve();
       await hookGate.promise;
+      const current = subject.currentStatus.lastReorg;
+      assert.ok(current);
+      return {
+        identity: `${current.oldTip.hash.toLowerCase()}:${current.newTip.hash.toLowerCase()}`,
+        reorgId: 'nested',
+        replayedEvents: 0,
+      };
     },
   });
 

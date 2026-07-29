@@ -25,7 +25,7 @@ import {
   calculatePnl,
 } from './dashboard-metrics.js';
 import { canManuallySell } from './action-policy.js';
-import { HeartbeatService } from '../heartbeat/heartbeat.js';
+import { HeartbeatService, type ChainHealth } from '../heartbeat/heartbeat.js';
 import { renderDashboardPage } from './dashboard.page.js';
 
 const OPEN_STATUSES = new Set<SessionStatus>([
@@ -233,6 +233,7 @@ interface DashboardSnapshot {
       pendingSessions: number;
       manualReviewSessions: number;
     };
+    chain: ChainHealth;
   } | null;
   tokens: DashboardTokenView[];
 }

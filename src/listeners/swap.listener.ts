@@ -223,6 +223,10 @@ export class SwapListener {
     }
   }
 
+  reconcileNow(): Promise<void> {
+    return this.requestReconcile();
+  }
+
   private async tick(): Promise<void> {
     if (await this.engine.expireIfNeeded(this.session)) {
       this.stopAndNotifyTerminal();

@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { Hash } from 'viem';
+import type { CanonicalChainState } from '../src/chain/canonical-chain.types.js';
 import type { ListenerCheckpoint } from '../src/chain/canonical-chain.types.js';
-import { HeartbeatService } from '../src/heartbeat/heartbeat.js';
+import { HeartbeatService, type ChainHealth } from '../src/heartbeat/heartbeat.js';
 import type { CheckpointRepository, SessionRepository } from '../src/storage/repositories.js';
 
 const BLOCK_HASH = `0x${'1'.repeat(64)}` as Hash;
@@ -134,4 +135,184 @@ test('garde le dernier bloc valide quand le RPC HTTP chute', async () => {
   assert.equal(secondSnapshot.http.blockNumber, null);
   assert.equal(secondSnapshot.http.error, 'RPC HTTP indisponible');
   assert.equal(secondSnapshot.webSocket.status, 'up');
+});
+
+test('expose la santé canonique et conserve un dernier état valide explicitement stale après une erreur RPC', async () => {
+  let healthy = true;
+  const chain: ChainHealth = {
+    confirmations: 5,
+    confirmedHead: '120',
+    canonicalBlockNumber: '120',
+    canonicalBlockHash: `0x${'2'.repeat(64)}`,
+    state: 'HEALTHY' as CanonicalChainState,
+    stale: false,
+    lastReorg: {
+      detectedAt: '2026-07-29T10:00:00.000Z',
+      depth: 2,
+      commonAncestorNumber: '118',
+      commonAncestorHash: `0x${'3'.repeat(64)}`,
+      status: 'RECOVERED',
+      orphanedEvents: 4,
+      replayedEvents: 3,
+    },
+  };
+  const heartbeat = new HeartbeatService(
+    createCheckpointStore(120n) as unknown as CheckpointRepository,
+    createSessionStore(0) as unknown as SessionRepository,
+    {
+      getHttpLatestBlock: async () => {
+        if (healthy) return 125n;
+        throw new Error('RPC HTTP indisponible');
+      },
+      getWsLatestBlock: async () => 125n,
+    },
+    'dry-run',
+    undefined,
+    {
+      confirmations: 5,
+      async getHealth(): Promise<ChainHealth> {
+        if (!healthy) throw new Error('Lecture canonique indisponible');
+        return chain;
+      },
+    },
+  );
+
+  const first = await heartbeat.refresh(0);
+  assert.deepEqual(first.chain, chain);
+
+  healthy = false;
+  const second = await heartbeat.refresh(0);
+  assert.deepEqual(second.chain, {
+    ...chain,
+    state: 'RECONCILING',
+    stale: true,
+  });
+  assert.equal(second.http.status, 'down');
+});
+
+test('conserve le fixture MANUAL_REVIEW lors d’un rafraîchissement canonique stale', async () => {
+  let available = true;
+  const heartbeat = new HeartbeatService(
+    createCheckpointStore(null) as unknown as CheckpointRepository,
+    createSessionStore(0) as unknown as SessionRepository,
+    {
+      getHttpLatestBlock: async () => 125n,
+      getWsLatestBlock: async () => 125n,
+    },
+    'dry-run',
+    undefined,
+    {
+      confirmations: 5,
+      async getHealth(): Promise<ChainHealth> {
+        if (!available) throw new Error('Lecture canonique indisponible');
+        return {
+          confirmations: 5,
+          confirmedHead: '120',
+          canonicalBlockNumber: '120',
+          canonicalBlockHash: BLOCK_HASH,
+          state: 'MANUAL_REVIEW',
+          stale: false,
+          lastReorg: {
+            detectedAt: '2026-07-29T10:00:00.000Z',
+            depth: null,
+            commonAncestorNumber: null,
+            commonAncestorHash: null,
+            status: 'MANUAL_REVIEW',
+            orphanedEvents: 0,
+            replayedEvents: 0,
+          },
+        };
+      },
+    },
+  );
+
+  await heartbeat.refresh(0);
+  available = false;
+  const snapshot = await heartbeat.refresh(0);
+
+  assert.equal(snapshot.chain.state, 'MANUAL_REVIEW');
+  assert.equal(snapshot.chain.stale, true);
+  assert.equal(snapshot.chain.lastReorg?.status, 'MANUAL_REVIEW');
+});
+
+test('au démarrage à froid avec HTTP indisponible, expose les confirmations configurées sans inventer de tête canonique', async () => {
+  const heartbeat = new HeartbeatService(
+    createCheckpointStore(null) as unknown as CheckpointRepository,
+    createSessionStore(0) as unknown as SessionRepository,
+    {
+      getHttpLatestBlock: async () => { throw new Error('RPC HTTP indisponible'); },
+      getWsLatestBlock: async () => 125n,
+    },
+    'dry-run',
+    undefined,
+    {
+      async getHealth(): Promise<ChainHealth> {
+        throw new Error('La santé canonique ne peut pas être relue sans head HTTP');
+      },
+      confirmations: 5,
+    },
+  );
+
+  const snapshot = await heartbeat.refresh(0);
+
+  assert.deepEqual(snapshot.chain, {
+    confirmations: 5,
+    confirmedHead: null,
+    canonicalBlockNumber: null,
+    canonicalBlockHash: null,
+    state: 'RECONCILING',
+    stale: true,
+    lastReorg: null,
+  });
+});
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve(value: T): void;
+  reject(error: unknown): void;
+} {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  return {
+    promise: new Promise<T>((nextResolve, nextReject) => {
+      resolve = nextResolve;
+      reject = nextReject;
+    }),
+    resolve,
+    reject,
+  };
+}
+
+test('sérialise les refresh et laisse le second snapshot gagner après l’échec lent du premier', async () => {
+  const firstCheckpoint = deferred<ListenerCheckpoint | null>();
+  let checkpointCalls = 0;
+  const heartbeat = new HeartbeatService(
+    {
+      async get(): Promise<ListenerCheckpoint | null> {
+        checkpointCalls += 1;
+        if (checkpointCalls === 1) return firstCheckpoint.promise;
+        return null;
+      },
+    } as unknown as CheckpointRepository,
+    createSessionStore(0) as unknown as SessionRepository,
+    {
+      getHttpLatestBlock: async () => 200n,
+      getWsLatestBlock: async () => 200n,
+    },
+    'dry-run',
+  );
+
+  const first = heartbeat.refresh(1);
+  const firstFailure = assert.rejects(first, /premier refresh échoué/u);
+  const second = heartbeat.refresh(2);
+  await Promise.resolve();
+  assert.equal(checkpointCalls, 1);
+
+  firstCheckpoint.reject(new Error('premier refresh échoué'));
+  await firstFailure;
+  const secondSnapshot = await second;
+
+  assert.equal(secondSnapshot.latestBlock, '200');
+  assert.equal(secondSnapshot.activeSwapMonitors, 2);
+  assert.equal(heartbeat.currentSnapshot?.latestBlock, '200');
 });

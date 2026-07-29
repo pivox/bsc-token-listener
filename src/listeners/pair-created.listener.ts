@@ -175,6 +175,10 @@ export class PairCreatedListener {
     if (this.interval) clearInterval(this.interval);
   }
 
+  reconcileNow(): Promise<void> {
+    return this.requestReconcile();
+  }
+
   private requestReconcile(): Promise<void> {
     if (this.stopped) return Promise.resolve();
     if (this.reconciliation) {

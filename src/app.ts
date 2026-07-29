@@ -1,8 +1,13 @@
 import type { Address } from 'viem';
 import { pancakeRouterAbi } from './abi/pancake-router.abi.js';
-import { CanonicalChainCoordinator } from './chain/canonical-chain.coordinator.js';
+import {
+  CanonicalChainCoordinator,
+  type CanonicalReorgCompletion,
+} from './chain/canonical-chain.coordinator.js';
+import { CanonicalChainHealthProvider } from './chain/canonical-chain-health.provider.js';
 import { CanonicalChainRepository } from './chain/canonical-chain.repository.js';
 import { ReorgSessionReconciler } from './chain/reorg-session-reconciler.js';
+import type { ReorgRollbackImpact } from './chain/canonical-chain.types.js';
 import { chain } from './config/chain.js';
 import { config } from './config/env.js';
 import { ActionDashboardServer } from './dashboard/action-dashboard.js';
@@ -26,6 +31,12 @@ import { ViemReconciliationGateway } from './recovery/viem-reconciliation.gatewa
 import { RuntimeRecoveryBarrier } from './recovery/runtime-recovery-barrier.js';
 import { account, publicClient, wsClient } from './rpc/clients.js';
 import { drainRuntimeForShutdown } from './runtime/runtime-shutdown.js';
+import {
+  finalizeShallowReorgReplay,
+  resumePersistedShallowReorgReplay,
+} from './runtime/reorg-replay-lifecycle.js';
+import { PendingShallowReorgQueue } from './runtime/pending-shallow-reorgs.js';
+import { continueStartupAfterRecovery } from './runtime/startup-order.js';
 import { RiskSettingsStore } from './security/risk-settings.store.js';
 import { TokenRiskService } from './security/token-risk.service.js';
 import { EntryAmountService } from './execution/entry-amount.service.js';
@@ -135,6 +146,7 @@ async function main(): Promise<void> {
     },
     runtimeRecoveryBarrier,
   );
+  let chainHealthProvider: CanonicalChainHealthProvider | null = null;
   const heartbeat = new HeartbeatService(
     checkpoints,
     sessions,
@@ -144,11 +156,22 @@ async function main(): Promise<void> {
     },
     config.executionMode,
     recovery,
+    {
+      confirmations: config.blockConfirmations,
+      getHealth: (latestBlock) => {
+        if (!chainHealthProvider) {
+          throw new Error('Santé canonique indisponible pendant l’initialisation.');
+        }
+        return chainHealthProvider.getHealth(latestBlock);
+      },
+    },
   );
   const monitors = new Map<string, SwapListener>();
   const activeSessionsByToken = new Map<string, TokenSession>();
   const activeTokenByPair = new Map<string, string>();
   const monitorsPendingRecoveryDrain = new Map<string, SwapListener>();
+  let pairListener: PairCreatedListener | null = null;
+  const pendingShallowReorgs = new PendingShallowReorgQueue();
   let monitorSchedulingEnabled = false;
   let requestMonitorReconcile = (): void => {};
 
@@ -289,6 +312,21 @@ async function main(): Promise<void> {
     }
   };
 
+  const reconcileRollbackProjections = async (
+    rollback: ReorgRollbackImpact,
+  ): Promise<void> => {
+    const reconciliation = await reorgSessions.reconcile(rollback);
+    for (const pair of reconciliation.monitorsToStop) {
+      const pairKey = pair.toLowerCase();
+      const listener = monitors.get(pairKey);
+      listener?.stop();
+      if (listener) {
+        monitorsPendingRecoveryDrain.set(pairKey, listener);
+      }
+    }
+    await synchronizeRecoveredSessions();
+  };
+
   activateRecoveredSessions = async (): Promise<void> => {
     const pending = [...monitorsPendingRecoveryDrain.entries()];
     await Promise.all(
@@ -340,25 +378,76 @@ async function main(): Promise<void> {
 
         const impact = await runtimeRecoveryBarrier.runRecovery(async () => {
           const rollback = await chainRepository.rewindToAncestor(reorg);
-          const reconciliation = await reorgSessions.reconcile(rollback);
-          for (const pair of reconciliation.monitorsToStop) {
-            const pairKey = pair.toLowerCase();
-            const listener = monitors.get(pairKey);
-            listener?.stop();
-            if (listener) {
-              monitorsPendingRecoveryDrain.set(pairKey, listener);
-            }
+          await reconcileRollbackProjections(rollback);
+          if (rollback.affectedPairs.some((pair) => pair.hasWalletConsequence)) {
+            await chainRepository.requireManualReview(
+              rollback.reorgId,
+              'WALLET_CONSEQUENCE_REQUIRES_REVIEW',
+            );
+            return { ...rollback, requiresManualReview: true };
           }
-          await synchronizeRecoveredSessions();
+          pendingShallowReorgs.enqueue({
+            identity: `${reorg.oldTip.hash.toLowerCase()}:${reorg.newTip.hash.toLowerCase()}`,
+            impact: rollback,
+          });
           return rollback;
         });
         return impact;
       },
     },
     afterReorg: async (state) => {
-      if (state === 'HEALTHY') await activateRecoveredSessions();
+      if (state !== 'RECONCILING') return undefined;
+      return pendingShallowReorgs.finalizeHead(async (pending) => {
+        const replayAndFinalize = (impact: ReorgRollbackImpact) =>
+          finalizeShallowReorgReplay(impact, {
+            activateRecoveredSessions,
+            reconcilePairs: async () => pairListener?.reconcileNow(),
+            waitForMonitorIdle: () => monitorScheduler.waitForIdle(),
+            reconcileActiveSwaps: async () => {
+              await Promise.all(
+                [...monitors.values()].map((listener) => listener.reconcileNow()),
+              );
+            },
+            countCanonicalProcessedEvents: (eventIds) =>
+              chainRepository.countCanonicalProcessedEvents(eventIds),
+            completeReorg: (reorgId, replayedEvents) =>
+              chainRepository.completeReorg(reorgId, replayedEvents),
+          });
+        const replayedEvents = pending.requiresProjectionReconciliation === true
+          ? await resumePersistedShallowReorgReplay(pending.impact, {
+              reconcileProjections: (impact) =>
+                runtimeRecoveryBarrier.runRecovery(
+                  () => reconcileRollbackProjections(impact),
+                ),
+              requireManualReview: (reorgId) =>
+                chainRepository.requireManualReview(
+                  reorgId,
+                  'WALLET_CONSEQUENCE_REQUIRES_REVIEW',
+                ),
+              replayAndFinalize,
+            })
+          : await replayAndFinalize(pending.impact);
+        if (replayedEvents === null) {
+          canonicalCoordinator.requireManualReviewForPendingReorg(
+            pending.identity,
+            pending.impact.reorgId,
+          );
+          return undefined;
+        }
+        const completion: CanonicalReorgCompletion = {
+          identity: pending.identity,
+          reorgId: pending.impact.reorgId,
+          replayedEvents,
+        };
+        return completion;
+      });
     },
   });
+  chainHealthProvider = new CanonicalChainHealthProvider(
+    config.blockConfirmations,
+    canonicalCoordinator,
+    chainRepository,
+  );
 
   const onPair = async (pair: PairInfo): Promise<void> => {
     const key = pair.pair.toLowerCase();
@@ -423,25 +512,91 @@ async function main(): Promise<void> {
     'Réconciliation initiale terminée.',
   );
 
-  await canonicalCoordinator.reconcile({
-    listenerKey: 'canonical-startup-sync',
-    startBlock: (1n << 256n) - 1n,
-    processChunk: async () => {
-      throw new Error(
-        'La synchronisation canonique initiale ne doit traiter aucun log.',
-      );
-    },
-  });
-  monitorSchedulingEnabled = true;
-  await monitorScheduler.reconcile();
-
-  const pairListener = new PairCreatedListener(onPair, {
+  pairListener = new PairCreatedListener(onPair, {
     watcher: wsClient,
     logReader: publicClient,
     coordinator: canonicalCoordinator,
   });
-  await pairListener.start();
-  recovery.start();
+  await continueStartupAfterRecovery({
+    startDashboard: async () => {
+      await dashboard?.start();
+    },
+    onDashboardError: (error) => {
+      logger.error(
+        { reason: errorMessage(error), host: config.dashboardHost, port: config.dashboardPort },
+        'Dashboard non démarré; le bot continue sans interface.',
+      );
+    },
+    hydrateCanonicalRecovery: async () => {
+      const persisted = await chainRepository.listPendingShallowReorgs();
+      if (persisted.length === 0) return;
+      const hydrated = persisted.map(({ audit, rollbackImpact }) => {
+        if (audit.commonAncestor === null) {
+          throw new Error('Audit RECONCILING shallow sans ancêtre commun.');
+        }
+        const identity = `${audit.previousTip.hash.toLowerCase()}:${audit.replacementTip.hash.toLowerCase()}`;
+        if (rollbackImpact.reorgId !== `reorg:${identity}`) {
+          throw new Error('Audit shallow persistant associé à un fork incohérent.');
+        }
+        pendingShallowReorgs.enqueue({
+          identity,
+          impact: rollbackImpact,
+          requiresProjectionReconciliation: true,
+        });
+        return {
+          reorgId: rollbackImpact.reorgId,
+          detectedAtMs: audit.detectedAtMs,
+          ancestor: audit.commonAncestor,
+          oldTip: audit.previousTip,
+          newTip: audit.replacementTip,
+          impact: rollbackImpact,
+        };
+      });
+      canonicalCoordinator.hydratePendingReorgs(hydrated);
+    },
+    synchronizeCanonical: async () => {
+      await canonicalCoordinator.reconcile({
+        listenerKey: 'canonical-startup-sync',
+        startBlock: (1n << 256n) - 1n,
+        processChunk: async () => {
+          throw new Error(
+            'La synchronisation canonique initiale ne doit traiter aucun log.',
+          );
+        },
+      });
+      monitorSchedulingEnabled = true;
+      await monitorScheduler.reconcile();
+    },
+    activateListeners: async () => {
+      await pairListener.start();
+      recovery.start();
+    },
+    cleanup: {
+      disableSchedulingAndStopNewWork: () => {
+        monitorSchedulingEnabled = false;
+        pairListener.stop();
+        for (const listener of monitors.values()) listener.stop();
+      },
+      stopRecovery: () => recovery.stop(),
+      waitForMonitorIdle: () => monitorScheduler.waitForIdle(),
+      waitForCanonicalIdle: () => canonicalCoordinator.waitForIdle(),
+      drainListeners: async () => {
+        await Promise.all(
+          [...monitors.values()].map((listener) => listener.stopAndDrain()),
+        );
+      },
+      stopDashboard: async () => {
+        await dashboard?.stop();
+      },
+      closeDatabase,
+      onCleanupError: (error) => {
+        logger.warn(
+          { reason: errorMessage(error) },
+          'Nettoyage du démarrage incomplet.',
+        );
+      },
+    },
+  });
   const monitorQueueInterval = setInterval(() => {
     requestMonitorReconcile();
   }, config.reconcileSeconds * 1_000);
@@ -470,6 +625,13 @@ async function main(): Promise<void> {
         recoveryManualReviewSessions: snapshot.recovery.manualReviewSessions,
         recoveryLastCompletedAt: snapshot.recovery.lastCompletedAt,
         recoveryLastErrorType: snapshot.recovery.lastErrorType,
+        chainConfirmations: snapshot.chain.confirmations,
+        chainConfirmedHead: snapshot.chain.confirmedHead,
+        canonicalBlockNumber: snapshot.chain.canonicalBlockNumber,
+        canonicalBlockHash: snapshot.chain.canonicalBlockHash,
+        chainState: snapshot.chain.state,
+        chainStale: snapshot.chain.stale,
+        lastReorg: snapshot.chain.lastReorg,
       },
       'Heartbeat.',
     );
@@ -481,17 +643,6 @@ async function main(): Promise<void> {
     void refreshHeartbeat().catch((error: unknown) =>
       logger.error({ reason: errorMessage(error) }, 'Heartbeat échoué.'));
   }, 60_000);
-
-  if (dashboard) {
-    try {
-      await dashboard.start();
-    } catch (error) {
-      logger.error(
-        { reason: errorMessage(error), host: config.dashboardHost, port: config.dashboardPort },
-        'Dashboard non démarré; le bot continue sans interface.',
-      );
-    }
-  }
 
   const currentRiskSettings = await riskSettings.get();
   logger.info(

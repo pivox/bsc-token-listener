@@ -22,6 +22,14 @@ test('dashboard affiche les champs heartbeat dans la page', () => {
   assert.match(html, /snapshot\.heartbeat\.monitoring\.oldestWaitingAgeMs/);
   assert.match(html, /snapshot\.heartbeat\.http\.status/);
   assert.match(html, /snapshot\.heartbeat\.recovery\.pendingSessions/);
+  assert.match(html, /id="chain-confirmed-head"/);
+  assert.match(html, /id="chain-canonical-tip"/);
+  assert.match(html, /id="chain-state"/);
+  assert.match(html, /id="chain-last-reorg"/);
+  assert.match(html, /chain\.confirmedHead/);
+  assert.match(html, /chain\.canonicalBlockHash/);
+  assert.match(html, /chain\.lastReorg/);
+  assert.match(html, /chain\.state/);
 });
 
 test('dashboard distingue PnL brut, gas, PnL net et simulation', () => {

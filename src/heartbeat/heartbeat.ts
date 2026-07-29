@@ -3,6 +3,10 @@ import type { CheckpointRepository, SessionRepository } from '../storage/reposit
 import type { ExecutionMode } from '../types/domain.js';
 import type { RecoveryCoordinatorStatus } from '../recovery/recovery-coordinator.js';
 import type { MonitorSchedulerStatus } from '../monitoring/monitor-scheduler.js';
+import type {
+  CanonicalChainState,
+  ChainReorgStatus,
+} from '../chain/canonical-chain.types.js';
 
 export type RpcStatus = 'up' | 'down';
 
@@ -10,6 +14,26 @@ export interface RpcHealth {
   status: RpcStatus;
   blockNumber: string | null;
   error: string | null;
+}
+
+export interface ChainReorgHealth {
+  detectedAt: string;
+  depth: number | null;
+  commonAncestorNumber: string | null;
+  commonAncestorHash: string | null;
+  status: ChainReorgStatus;
+  orphanedEvents: number;
+  replayedEvents: number;
+}
+
+export interface ChainHealth {
+  confirmations: number;
+  confirmedHead: string | null;
+  canonicalBlockNumber: string | null;
+  canonicalBlockHash: string | null;
+  state: CanonicalChainState;
+  stale: boolean;
+  lastReorg: ChainReorgHealth | null;
 }
 
 export interface HeartbeatSnapshot {
@@ -30,6 +54,7 @@ export interface HeartbeatSnapshot {
     pendingSessions: number;
     manualReviewSessions: number;
   };
+  chain: ChainHealth;
 }
 
 export interface HeartbeatDependencies {
@@ -41,8 +66,14 @@ interface RecoveryStatusProvider {
   readonly currentStatus: RecoveryCoordinatorStatus;
 }
 
+export interface ChainHealthProvider {
+  readonly confirmations: number;
+  getHealth(latestBlock: bigint | null): Promise<ChainHealth>;
+}
+
 export class HeartbeatService {
   private snapshot: HeartbeatSnapshot | null = null;
+  private refreshTail: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly checkpoints: CheckpointRepository,
@@ -50,13 +81,27 @@ export class HeartbeatService {
     private readonly dependencies: HeartbeatDependencies,
     private readonly executionMode: ExecutionMode,
     private readonly recovery?: RecoveryStatusProvider,
+    private readonly chainHealth?: ChainHealthProvider,
   ) {}
 
   get currentSnapshot(): HeartbeatSnapshot | null {
     return this.snapshot;
   }
 
-  async refresh(
+  refresh(
+    activeSwapMonitors: number,
+    monitoring?: MonitorSchedulerStatus,
+  ): Promise<HeartbeatSnapshot> {
+    const refresh = this.refreshTail.then(() =>
+      this.refreshOnce(activeSwapMonitors, monitoring));
+    this.refreshTail = refresh.then(
+      () => undefined,
+      () => undefined,
+    );
+    return refresh;
+  }
+
+  private async refreshOnce(
     activeSwapMonitors: number,
     monitoring?: MonitorSchedulerStatus,
   ): Promise<HeartbeatSnapshot> {
@@ -73,6 +118,9 @@ export class HeartbeatService {
     ]);
 
     const latestBlock = http.blockNumber ?? this.snapshot?.latestBlock ?? null;
+    const chain = await this.fetchChainHealth(
+      http.blockNumber === null ? null : BigInt(http.blockNumber),
+    );
 
     this.snapshot = {
       generatedAt: new Date().toISOString(),
@@ -91,9 +139,37 @@ export class HeartbeatService {
       http,
       webSocket,
       recovery: this.recoverySnapshot(),
+      chain,
     };
 
     return this.snapshot;
+  }
+
+  private async fetchChainHealth(latestBlock: bigint | null): Promise<ChainHealth> {
+    try {
+      if (!this.chainHealth || latestBlock === null) {
+        throw new Error('Tête HTTP non validée pour la santé canonique.');
+      }
+      return await this.chainHealth.getHealth(latestBlock);
+    } catch {
+      const previous = this.snapshot?.chain;
+      if (previous) {
+        return {
+          ...previous,
+          stale: true,
+          state: previous.state === 'HEALTHY' ? 'RECONCILING' : previous.state,
+        };
+      }
+      return {
+        confirmations: this.chainHealth?.confirmations ?? 0,
+        confirmedHead: null,
+        canonicalBlockNumber: null,
+        canonicalBlockHash: null,
+        state: 'RECONCILING',
+        stale: true,
+        lastReorg: null,
+      };
+    }
   }
 
   private recoverySnapshot(): HeartbeatSnapshot['recovery'] {

@@ -107,6 +107,7 @@ export function renderDashboardPage(nonce: string, refreshSeconds: number): stri
       <article class="card"><div class="card-label">Dernier bloc BSC</div><div class="card-value" id="heartbeat-latest-block">—</div><div class="card-note" id="heartbeat-pair-created">Checkpoint pair-created: —</div></article>
       <article class="card"><div class="card-label">Monitoring</div><div class="card-value" id="heartbeat-swap-monitors">—</div><div class="card-note" id="heartbeat-monitor-queue">File: —</div><div class="card-note" id="heartbeat-monitor-wait">Attente max: —</div><div class="card-note" id="heartbeat-active-sessions">Sessions actives: —</div></article>
       <article class="card"><div class="card-label">Etat RPC</div><div class="card-value" id="heartbeat-http-status">—</div><div class="card-note" id="heartbeat-ws-status">WS : —</div></article>
+      <article class="card"><div class="card-label">Chaîne canonique</div><div class="card-value" id="chain-state">—</div><div class="card-note" id="chain-confirmed-head">Head confirmé: —</div><div class="card-note" id="chain-canonical-tip">Tip canonique: —</div><div class="card-note" id="chain-last-reorg">Dernier reorg: —</div></article>
       <article class="card"><div class="card-label">Réconciliation</div><div class="card-value" id="recovery-pending-sessions">—</div><div class="card-note" id="recovery-manual-review">Revue manuelle: —</div><div class="card-note" id="recovery-last-completed">Dernière passe: —</div></article>
       <article class="card"><div class="card-label">Solde wallet</div><div class="card-value" id="wallet-balance">—</div><div class="card-note" id="wallet-address">Wallet non configuré</div></article>
       <article class="card"><div class="card-label">Positions ouvertes</div><div class="card-value" id="open-positions">—</div><div class="card-note" id="detected-count">— tokens détectés</div></article>
@@ -237,6 +238,36 @@ export function renderDashboardPage(nonce: string, refreshSeconds: number): stri
       byId('heartbeat-ws-status').textContent = snapshot.heartbeat
         ? (snapshot.heartbeat.webSocket.status === 'up' ? 'WS: OK' : 'WS: KO')
         : 'WS: —';
+      const chain = snapshot.heartbeat ? snapshot.heartbeat.chain : null;
+      byId('chain-state').textContent = chain
+        ? chain.state + (chain.stale ? ' · STALE' : '')
+        : '—';
+      byId('chain-confirmed-head').textContent = chain
+        ? 'Head confirmé (' + String(chain.confirmations) + ' blocs): '
+          + (chain.confirmedHead || '—')
+        : 'Head confirmé: —';
+      byId('chain-canonical-tip').textContent = chain
+        ? 'Tip: ' + (chain.canonicalBlockNumber || '—')
+          + (chain.canonicalBlockHash ? ' · ' + shortAddress(chain.canonicalBlockHash) : '')
+        : 'Tip: —';
+      byId('chain-last-reorg').textContent = chain && chain.lastReorg
+        ? 'Reorg ' + chain.lastReorg.status + ' · ' + formatDate(chain.lastReorg.detectedAt)
+          + ' · ancêtre ' + (chain.lastReorg.commonAncestorNumber || '—')
+          + (chain.lastReorg.commonAncestorHash
+            ? ' ' + shortAddress(chain.lastReorg.commonAncestorHash)
+            : '')
+          + ' · profondeur '
+          + (chain.lastReorg.depth === null ? '—' : String(chain.lastReorg.depth))
+          + ' · orphelins/rejoués ' + String(chain.lastReorg.orphanedEvents)
+          + '/' + String(chain.lastReorg.replayedEvents)
+        : 'Dernier reorg: —';
+      byId('chain-last-reorg').title = chain && chain.lastReorg
+        ? 'Détecté ' + formatDate(chain.lastReorg.detectedAt)
+          + ' · ancêtre ' + (chain.lastReorg.commonAncestorNumber || '—')
+          + (chain.lastReorg.commonAncestorHash
+            ? ' ' + chain.lastReorg.commonAncestorHash
+            : '')
+        : '';
       byId('recovery-pending-sessions').textContent = snapshot.heartbeat
         ? String(snapshot.heartbeat.recovery.pendingSessions)
         : '—';

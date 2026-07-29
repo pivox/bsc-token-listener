@@ -173,6 +173,26 @@ test('PairCreated délègue la plage confirmée et ne traite que les logs HTTP o
   );
 });
 
+test('PairCreated peut rejouer au démarrage avant d’activer le watcher', async () => {
+  const watcher = new MemoryWatcher();
+  const coordinator = new MemoryCoordinator();
+  const subject = new PairCreatedListener(
+    async () => {},
+    {
+      watcher,
+      logReader: { getContractEvents: async () => [] },
+      coordinator,
+      reconcileIntervalMs: 60_000,
+    },
+  );
+
+  await subject.reconcileNow();
+
+  assert.equal(coordinator.requests.length, 1);
+  assert.equal(watcher.options, undefined);
+  subject.stop();
+});
+
 test('PairCreated ignore le payload WebSocket et coalesce les demandes pendant un reconcile', async () => {
   const watcher = new MemoryWatcher();
   const coordinator = new MemoryCoordinator();
