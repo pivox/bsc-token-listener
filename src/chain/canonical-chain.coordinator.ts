@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { createReadStream } from 'node:fs';
@@ -55,14 +56,20 @@ export interface CanonicalHeaderSpoolFactory {
   create(): Promise<CanonicalHeaderSpool>;
 }
 
+export interface CanonicalListenerBarrier {
+  runListener<T>(operation: () => Promise<T>): Promise<T>;
+}
+
 export interface CanonicalChainCoordinatorOptions {
   blockReader: CanonicalBlockReader;
   canonicalStore: CanonicalChainStore;
   checkpoints: ListenerCheckpointStore;
   reorgHandler: CanonicalReorgHandler;
+  runtimeBarrier?: CanonicalListenerBarrier;
   confirmations?: number;
   chunkSize?: number;
   headerSpoolFactory?: CanonicalHeaderSpoolFactory;
+  afterReorg?: (state: CanonicalChainState) => Promise<void>;
   onCleanupError?: (errorType: string) => void;
 }
 
@@ -178,6 +185,14 @@ interface PreparedCanonicalScan {
   legacyHeader: CanonicalBlock | null;
 }
 
+interface PostReorgScope {
+  active: boolean;
+  reorgDetected: boolean;
+  inFlight: Set<Promise<void>>;
+  hasError: boolean;
+  firstError: unknown;
+}
+
 class TemporaryCanonicalHeaderSpool implements CanonicalHeaderSpool {
   private handle: FileHandle | null;
 
@@ -290,10 +305,16 @@ export class CanonicalChainCoordinator {
   private readonly canonicalStore: CanonicalChainStore;
   private readonly checkpoints: ListenerCheckpointStore;
   private readonly reorgHandler: CanonicalReorgHandler;
+  private readonly runtimeBarrier: CanonicalListenerBarrier | undefined;
   private readonly confirmations: number;
   private readonly chunkSize: bigint;
   private readonly headerSpoolFactory: CanonicalHeaderSpoolFactory;
+  private readonly afterReorg:
+    ((state: CanonicalChainState) => Promise<void>) | undefined;
   private readonly onCleanupError: ((errorType: string) => void) | undefined;
+  private readonly postReorgScopes =
+    new AsyncLocalStorage<PostReorgScope>();
+  private activeRequests = 0;
   private tail: Promise<void> = Promise.resolve();
   private status: CanonicalChainCoordinatorStatus = {
     running: false,
@@ -307,8 +328,10 @@ export class CanonicalChainCoordinator {
     this.canonicalStore = options.canonicalStore;
     this.checkpoints = options.checkpoints;
     this.reorgHandler = options.reorgHandler;
+    this.runtimeBarrier = options.runtimeBarrier;
     this.headerSpoolFactory =
       options.headerSpoolFactory ?? DEFAULT_HEADER_SPOOL_FACTORY;
+    this.afterReorg = options.afterReorg;
     this.onCleanupError = options.onCleanupError;
     this.confirmations = boundedInteger(
       options.confirmations ?? 5,
@@ -335,19 +358,46 @@ export class CanonicalChainCoordinator {
       ...this.status,
       pendingRequests: this.status.pendingRequests + 1,
     };
-    const execution = this.tail.then(async () => {
-      this.status = { ...this.status, running: true };
+    const scope = this.postReorgScopes.getStore();
+    if (scope?.active === true) {
+      const execution = this.runRequest(request).then((reorgDetected) => {
+        if (reorgDetected) scope.reorgDetected = true;
+      });
+      let observed: Promise<void>;
+      observed = execution.then(
+        () => {
+          scope.inFlight.delete(observed);
+        },
+        (error: unknown) => {
+          if (!scope.hasError) {
+            scope.hasError = true;
+            scope.firstError = error;
+          }
+          scope.inFlight.delete(observed);
+        },
+      );
+      scope.inFlight.add(observed);
+      return execution;
+    }
+
+    const operation = this.tail.then(() => this.runRequest(request));
+    const execution = operation.then(() => undefined);
+    const queued = operation.then(async (reorgDetected) => {
+      if (!reorgDetected || !this.afterReorg) return;
       try {
-        await this.execute(request);
-      } finally {
-        this.status = {
-          ...this.status,
-          running: false,
-          pendingRequests: this.status.pendingRequests - 1,
-        };
+        await this.runPostReorg();
+      } catch (error: unknown) {
+        if (this.status.state === 'HEALTHY') {
+          this.status = { ...this.status, state: 'RECONCILING' };
+        }
+        logger.error(
+          { errorType: safeErrorType(error) },
+          'Finalisation post-reorg échouée.',
+        );
+        throw error;
       }
     });
-    this.tail = execution.catch(() => undefined);
+    this.tail = queued.catch(() => undefined);
     return execution;
   }
 
@@ -355,22 +405,72 @@ export class CanonicalChainCoordinator {
     return this.tail;
   }
 
-  private async execute(request: ConfirmedRangeRequest): Promise<void> {
-    if (this.status.state !== 'HEALTHY') return;
+  private async runRequest(
+    request: ConfirmedRangeRequest,
+  ): Promise<boolean> {
+    this.activeRequests += 1;
+    this.status = { ...this.status, running: true };
+    try {
+      return await this.execute(request);
+    } finally {
+      this.activeRequests -= 1;
+      this.status = {
+        ...this.status,
+        running: this.activeRequests > 0,
+        pendingRequests: this.status.pendingRequests - 1,
+      };
+    }
+  }
+
+  private async runPostReorg(): Promise<void> {
+    const afterReorg = this.afterReorg;
+    if (!afterReorg) return;
+    const scope: PostReorgScope = {
+      active: true,
+      reorgDetected: false,
+      inFlight: new Set(),
+      hasError: false,
+      firstError: undefined,
+    };
+    try {
+      await this.postReorgScopes.run(scope, async () => {
+        do {
+          scope.reorgDetected = false;
+          try {
+            await afterReorg(this.status.state);
+          } catch (error: unknown) {
+            if (!scope.hasError) {
+              scope.hasError = true;
+              scope.firstError = error;
+            }
+          }
+          while (scope.inFlight.size > 0) {
+            await Promise.all([...scope.inFlight]);
+          }
+          if (scope.hasError) throw scope.firstError;
+        } while (scope.reorgDetected);
+      });
+    } finally {
+      scope.active = false;
+    }
+  }
+
+  private async execute(request: ConfirmedRangeRequest): Promise<boolean> {
+    if (this.status.state !== 'HEALTHY') return false;
 
     const latestBlock = await this.blockReader.getBlockNumber();
     const head = confirmedHead(latestBlock, this.confirmations);
-    if (head === null) return;
+    if (head === null) return false;
 
     const tip = await this.canonicalStore.getCanonicalTip();
-    if (tip && tip.number > head) return;
+    if (tip && tip.number > head) return false;
 
     const checkpoint = await this.checkpoints.get(request.listenerKey);
     if (
       checkpoint?.blockHash === null
       && checkpoint.blockNumber > head
     ) {
-      return;
+      return false;
     }
 
     const [oldestCheckpointBefore, descending] = await Promise.all([
@@ -386,7 +486,7 @@ export class CanonicalChainCoordinator {
       );
       if (remoteTip.hash.toLowerCase() !== tip.hash.toLowerCase()) {
         await this.reconcileDivergence(tip, remoteTip, descending, head);
-        return;
+        return true;
       }
     }
     const knownHeaders = new Map<bigint, CanonicalBlock>();
@@ -458,10 +558,11 @@ export class CanonicalChainCoordinator {
 
       let chunkStart = fromBlock;
       for await (const header of chunkHeaders.headers()) {
-        const processed = await request.processChunk(
-          chunkStart,
-          header.number,
-        );
+        const processChunk = () =>
+          request.processChunk(chunkStart, header.number);
+        const processed = this.runtimeBarrier
+          ? await this.runtimeBarrier.runListener(processChunk)
+          : await processChunk();
         if (!processed) break;
         await this.checkpoints.set(request.listenerKey, {
           blockNumber: header.number,
@@ -482,6 +583,7 @@ export class CanonicalChainCoordinator {
     } finally {
       await this.disposeSpools(spools);
     }
+    return false;
   }
 
   private async reconcileDivergence(

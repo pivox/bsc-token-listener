@@ -1,5 +1,8 @@
 import type { Address } from 'viem';
 import { pancakeRouterAbi } from './abi/pancake-router.abi.js';
+import { CanonicalChainCoordinator } from './chain/canonical-chain.coordinator.js';
+import { CanonicalChainRepository } from './chain/canonical-chain.repository.js';
+import { ReorgSessionReconciler } from './chain/reorg-session-reconciler.js';
 import { chain } from './config/chain.js';
 import { config } from './config/env.js';
 import { ActionDashboardServer } from './dashboard/action-dashboard.js';
@@ -13,6 +16,7 @@ import { TradeExecutor } from './execution/trade-executor.js';
 import { HeartbeatService } from './heartbeat/heartbeat.js';
 import { PairCreatedListener } from './listeners/pair-created.listener.js';
 import { SwapListener } from './listeners/swap.listener.js';
+import { createMonitorReconcileRequest } from './monitoring/monitor-reconcile-request.js';
 import { MonitorScheduler } from './monitoring/monitor-scheduler.js';
 import { RecoveryCoordinator } from './recovery/recovery-coordinator.js';
 import { RecoveryIntentService } from './recovery/recovery-intent.service.js';
@@ -21,6 +25,7 @@ import { SessionReconciler } from './recovery/session-reconciler.js';
 import { ViemReconciliationGateway } from './recovery/viem-reconciliation.gateway.js';
 import { RuntimeRecoveryBarrier } from './recovery/runtime-recovery-barrier.js';
 import { account, publicClient, wsClient } from './rpc/clients.js';
+import { drainRuntimeForShutdown } from './runtime/runtime-shutdown.js';
 import { RiskSettingsStore } from './security/risk-settings.store.js';
 import { TokenRiskService } from './security/token-risk.service.js';
 import { EntryAmountService } from './execution/entry-amount.service.js';
@@ -73,6 +78,7 @@ async function main(): Promise<void> {
   const reports = new RiskReportRepository();
   const discovered = new DiscoveredTokenRepository();
   const checkpoints = new CheckpointRepository();
+  const chainRepository = new CanonicalChainRepository();
   const ignoredAssets = new IgnoredAssetRepository();
   const riskSettings = new RiskSettingsStore();
   const metadataService = new TokenMetadataService(publicClient);
@@ -94,6 +100,13 @@ async function main(): Promise<void> {
     runtimeRecoveryBarrier,
     events,
   );
+  const reorgSessions = new ReorgSessionReconciler({
+    findSession: (pair) => sessions.findByPair(pair),
+    listCanonicalProcessedEvents: (pair) =>
+      events.listCanonicalProcessedEvents(pair),
+    saveReconciledSession: (session, canonical) =>
+      sessions.saveReconciledSession(session, canonical),
+  });
   let synchronizeRecoveredSessions = async (): Promise<void> => {};
   let activateRecoveredSessions = async (): Promise<void> => {};
   const reconciliationStore = new ReconciliationRepository();
@@ -136,7 +149,7 @@ async function main(): Promise<void> {
   const activeSessionsByToken = new Map<string, TokenSession>();
   const activeTokenByPair = new Map<string, string>();
   const monitorsPendingRecoveryDrain = new Map<string, SwapListener>();
-  let monitorSchedulingEnabled = true;
+  let monitorSchedulingEnabled = false;
   let requestMonitorReconcile = (): void => {};
 
   const removeMonitor = (
@@ -190,9 +203,13 @@ async function main(): Promise<void> {
     if (monitors.has(key)) return;
     const listener = new SwapListener(
       session,
-      checkpoints,
       engine,
       (pair) => removeMonitor(pair),
+      {
+        watcher: wsClient,
+        logReader: publicClient,
+        coordinator: canonicalCoordinator,
+      },
     );
     monitors.set(key, listener);
     activeSessionsByToken.set(tokenKey, session);
@@ -224,17 +241,24 @@ async function main(): Promise<void> {
     start: startMonitor,
     stop: (pair) => stopMonitor(pair, false, false),
   });
-  requestMonitorReconcile = (): void => {
-    if (
-      recovery.currentStatus.running
-      || monitorsPendingRecoveryDrain.size > 0
-    ) return;
-    void monitorScheduler.reconcile().catch((error: unknown) =>
-      logger.error(
-        { reason: errorMessage(error) },
-        'Réconciliation de la file de monitoring échouée.',
-      ));
-  };
+  requestMonitorReconcile = createMonitorReconcileRequest({
+    canSchedule: () =>
+      monitorSchedulingEnabled
+      && !recovery.currentStatus.running
+      && monitorsPendingRecoveryDrain.size === 0,
+    reconcile: async () => {
+      const result = await monitorScheduler.reconcile();
+      if (result.failedPairs.length > 0) {
+        throw new Error(
+          `Démarrage de ${result.failedPairs.length} listener(s) Swap échoué.`,
+        );
+      }
+    },
+    onError: (error) => logger.error(
+      { reason: errorMessage(error) },
+      'Réconciliation de la file de monitoring échouée.',
+    ),
+  });
 
   synchronizeRecoveredSessions = async (): Promise<void> => {
     const refreshed = await sessions.loadActive();
@@ -277,17 +301,71 @@ async function main(): Promise<void> {
     await monitorScheduler.reconcile();
   };
 
+  const canonicalCoordinator = new CanonicalChainCoordinator({
+    blockReader: {
+      getBlockNumber: () => publicClient.getBlockNumber(),
+      getBlock: async (blockNumber) => {
+        const block = await publicClient.getBlock({ blockNumber });
+        if (block.number === null || block.hash === null) {
+          throw new Error(
+            `Header RPC incomplet pour le bloc ${blockNumber}.`,
+          );
+        }
+        return {
+          number: block.number,
+          hash: block.hash,
+          parentHash: block.parentHash,
+        };
+      },
+    },
+    canonicalStore: chainRepository,
+    checkpoints,
+    confirmations: config.blockConfirmations,
+    runtimeBarrier: runtimeRecoveryBarrier,
+    reorgHandler: {
+      reconcileReorg: async (reorg) => {
+        if (!reorg.ancestor) {
+          await runtimeRecoveryBarrier.runRecovery(async () => {
+            await chainRepository.recordDeepReorg(
+              reorg,
+              'NO_COMMON_ANCESTOR_WITHIN_RETENTION',
+            );
+          });
+          return {
+            depth: null,
+            orphanedEvents: 0,
+            replayedEvents: 0,
+          };
+        }
+
+        const impact = await runtimeRecoveryBarrier.runRecovery(async () => {
+          const rollback = await chainRepository.rewindToAncestor(reorg);
+          const reconciliation = await reorgSessions.reconcile(rollback);
+          for (const pair of reconciliation.monitorsToStop) {
+            const pairKey = pair.toLowerCase();
+            const listener = monitors.get(pairKey);
+            listener?.stop();
+            if (listener) {
+              monitorsPendingRecoveryDrain.set(pairKey, listener);
+            }
+          }
+          await synchronizeRecoveredSessions();
+          return rollback;
+        });
+        return impact;
+      },
+    },
+    afterReorg: async (state) => {
+      if (state === 'HEALTHY') await activateRecoveredSessions();
+    },
+  });
+
   const onPair = async (pair: PairInfo): Promise<void> => {
     const key = pair.pair.toLowerCase();
     if (monitors.has(key)) return;
     const existing = await sessions.findByPair(pair.pair);
     if (existing) {
-      const result = await monitorScheduler.reconcile();
-      if (result.failedPairs.length > 0) {
-        throw new Error(
-          `Démarrage de ${result.failedPairs.length} listener(s) Swap échoué.`,
-        );
-      }
+      requestMonitorReconcile();
       return;
     }
     if (await ignoredAssets.isIgnored(pair.token)) {
@@ -336,23 +414,32 @@ async function main(): Promise<void> {
       },
       'Nouvelle paire Token/WBNB enregistrée.',
     );
-    const result = await monitorScheduler.reconcile();
-    if (result.failedPairs.length > 0) {
-      throw new Error(
-        `Démarrage de ${result.failedPairs.length} listener(s) Swap échoué.`,
-      );
-    }
+    requestMonitorReconcile();
   };
 
   const initialRecovery = await recovery.reconcileInitial();
   logger.info(
     { processedSessions: initialRecovery.processedSessions },
-    'Réconciliation initiale terminée; activation des listeners autorisée.',
+    'Réconciliation initiale terminée.',
   );
 
+  await canonicalCoordinator.reconcile({
+    listenerKey: 'canonical-startup-sync',
+    startBlock: (1n << 256n) - 1n,
+    processChunk: async () => {
+      throw new Error(
+        'La synchronisation canonique initiale ne doit traiter aucun log.',
+      );
+    },
+  });
+  monitorSchedulingEnabled = true;
   await monitorScheduler.reconcile();
 
-  const pairListener = new PairCreatedListener(checkpoints, onPair);
+  const pairListener = new PairCreatedListener(onPair, {
+    watcher: wsClient,
+    logReader: publicClient,
+    coordinator: canonicalCoordinator,
+  });
   await pairListener.start();
   recovery.start();
   const monitorQueueInterval = setInterval(() => {
@@ -433,13 +520,19 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
-    monitorSchedulingEnabled = false;
     logger.info({ signal }, 'Arrêt du bot.');
-    clearInterval(monitorQueueInterval);
-    await recovery.stop();
-    await monitorScheduler.waitForIdle();
-    clearInterval(heartbeatInterval);
-    pairListener.stop();
+    await drainRuntimeForShutdown({
+      disableSchedulingAndStopNewWork: () => {
+        monitorSchedulingEnabled = false;
+        clearInterval(monitorQueueInterval);
+        clearInterval(heartbeatInterval);
+        pairListener.stop();
+        for (const listener of monitors.values()) listener.stop();
+      },
+      stopRecovery: () => recovery.stop(),
+      waitForMonitorIdle: () => monitorScheduler.waitForIdle(),
+      waitForCanonicalIdle: () => canonicalCoordinator.waitForIdle(),
+    });
     await Promise.all(
       [...monitors.values()].map((listener) => listener.stopAndDrain()),
     );

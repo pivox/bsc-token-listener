@@ -17,6 +17,23 @@ import type {
   ListenerCheckpoint,
   ReorgImpact,
 } from '../src/chain/canonical-chain.types.js';
+import { scheduleMonitorReconcile } from '../src/monitoring/monitor-reconcile-request.js';
+import { RuntimeRecoveryBarrier } from '../src/recovery/runtime-recovery-barrier.js';
+
+function deferred<T = void>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+} {
+  let resolve = (_value: T | PromiseLike<T>): void => {};
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+async function flushPromises(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
 
 function hash(number: bigint): Hash {
   return `0x${number.toString(16).padStart(64, '0')}` as Hash;
@@ -159,6 +176,15 @@ class MemoryHeaderSpool {
   }
 }
 
+class CleanMemoryHeaderSpool extends MemoryHeaderSpool {
+  override async dispose(): Promise<void> {}
+}
+
+const memoryHeaderSpoolFactory = {
+  create: async (): Promise<CleanMemoryHeaderSpool> =>
+    new CleanMemoryHeaderSpool(),
+};
+
 class ThrowingCleanupSpoolFactory {
   readonly spools: MemoryHeaderSpool[] = [];
 
@@ -181,6 +207,9 @@ function coordinator(
     confirmations?: number;
     chunkSize?: number;
     reorgHandler?: CanonicalReorgHandler;
+    runtimeBarrier?: RuntimeRecoveryBarrier;
+    headerSpoolFactory?: CanonicalChainCoordinatorOptions['headerSpoolFactory'];
+    afterReorg?: CanonicalChainCoordinatorOptions['afterReorg'];
   } = {},
 ): CanonicalChainCoordinator {
   return new CanonicalChainCoordinator({
@@ -192,6 +221,15 @@ function coordinator(
     ...(options.chunkSize === undefined
       ? {}
       : { chunkSize: options.chunkSize }),
+    ...(options.runtimeBarrier === undefined
+      ? {}
+      : { runtimeBarrier: options.runtimeBarrier }),
+    ...(options.headerSpoolFactory === undefined
+      ? {}
+      : { headerSpoolFactory: options.headerSpoolFactory }),
+    ...(options.afterReorg === undefined
+      ? {}
+      : { afterReorg: options.afterReorg }),
   });
 }
 
@@ -496,6 +534,67 @@ test('sérialise strictement les listeners et conserve la queue après un échec
     state: 'HEALTHY',
     lastReorg: null,
   });
+});
+
+test('un callback Pair planifie le monitor sans bloquer son checkpoint avant Swap', async () => {
+  const checkpoints = new MemoryCheckpoints();
+  const subject = coordinator(
+    new MemoryBlockReader(20n),
+    new MemoryCanonicalStore(),
+    checkpoints,
+    { headerSpoolFactory: memoryHeaderSpoolFactory },
+  );
+  const order: string[] = [];
+  const errors: unknown[] = [];
+
+  const pair = subject.reconcile({
+    listenerKey: 'pair-created',
+    startBlock: 10n,
+    processChunk: async () => {
+      order.push('pair-start');
+      scheduleMonitorReconcile(
+        () => subject.reconcile({
+          listenerKey: 'swap:pair',
+          startBlock: 10n,
+          processChunk: async () => {
+            assert.deepEqual(checkpoints.values.get('pair-created'), {
+              blockNumber: 15n,
+              blockHash: hash(16n),
+            });
+            order.push('swap');
+            return true;
+          },
+        }),
+        (error) => {
+          errors.push(error);
+        },
+      );
+      order.push('pair-end');
+      return true;
+    },
+  });
+
+  await pair;
+  assert.deepEqual(order, ['pair-start', 'pair-end']);
+  await subject.waitForIdle();
+  assert.deepEqual(order, ['pair-start', 'pair-end', 'swap']);
+  assert.deepEqual(errors, []);
+});
+
+test('le déclencheur monitor non bloquant rend son échec observable', async () => {
+  const failure = new Error('scheduler indisponible');
+  const observed = deferred<unknown>();
+
+  scheduleMonitorReconcile(
+    () => {
+      throw failure;
+    },
+    (error) => {
+      observed.resolve(error);
+    },
+  );
+
+  assert.equal(await observed.promise, failure);
 });
 
 test('découpe par chunks et checkpoint chaque fin exacte', async () => {
@@ -1349,7 +1448,438 @@ test('un nouveau coordinator détecte un journal persistant divergent', async ()
 
   assert.equal(reorgHandler.calls.length, 1);
   assert.equal(reorgHandler.calls[0]?.ancestor?.number, 106n);
+  assert.equal(reorgHandler.calls[0]?.ancestor?.hash, block(106n).hash);
   assert.equal(reorgHandler.calls[0]?.depth, 4);
+});
+
+test('attend la fin d’un listener actif avant de démarrer le rollback', async () => {
+  const barrier = new RuntimeRecoveryBarrier();
+  const listenerGate = deferred();
+  const listenerStarted = deferred();
+  const rollbackStarted = deferred();
+  const rollbackGate = deferred();
+  const reader = new MemoryBlockReader(115n);
+  const originalGetBlock = reader.getBlock.bind(reader);
+  reader.getBlock = async (number) =>
+    number > 106n
+      ? forkedBlock(number, 106n)
+      : originalGetBlock(number);
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 11 }, (_, index) => block(BigInt(100 + index))),
+  );
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', {
+    blockNumber: 110n,
+    blockHash: block(110n).hash,
+  });
+  let rollbackCalls = 0;
+  const reorgHandler: CanonicalReorgHandler = {
+    reconcileReorg: (reorg) =>
+      barrier.runRecovery(async () => {
+        rollbackCalls += 1;
+        rollbackStarted.resolve();
+        await rollbackGate.promise;
+        return {
+          depth: reorg.depth,
+          orphanedEvents: 0,
+          replayedEvents: 0,
+        };
+      }),
+  };
+  const subject = coordinator(reader, canonicalStore, checkpoints, {
+    reorgHandler,
+    runtimeBarrier: barrier,
+  });
+  const listenerRun = barrier.runListener(async () => {
+    listenerStarted.resolve();
+    await listenerGate.promise;
+  });
+  await listenerStarted.promise;
+
+  const reconciliation = subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 100n,
+    processChunk: async () => true,
+  });
+  await flushPromises();
+
+  assert.equal(rollbackCalls, 0);
+  listenerGate.resolve();
+  await rollbackStarted.promise;
+  assert.equal(rollbackCalls, 1);
+  rollbackGate.resolve();
+  await Promise.all([listenerRun, reconciliation]);
+});
+
+test('un rollback ouvert bloque la passe listener suivante', async () => {
+  const barrier = new RuntimeRecoveryBarrier();
+  const rollbackStarted = deferred();
+  const rollbackGate = deferred();
+  const reader = new MemoryBlockReader(115n);
+  const originalGetBlock = reader.getBlock.bind(reader);
+  reader.getBlock = async (number) =>
+    number > 106n
+      ? forkedBlock(number, 106n)
+      : originalGetBlock(number);
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 11 }, (_, index) => block(BigInt(100 + index))),
+  );
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', {
+    blockNumber: 110n,
+    blockHash: block(110n).hash,
+  });
+  const reorgHandler: CanonicalReorgHandler = {
+    reconcileReorg: (reorg) =>
+      barrier.runRecovery(async () => {
+        rollbackStarted.resolve();
+        await rollbackGate.promise;
+        if (!reorg.ancestor) assert.fail('ancêtre shallow attendu');
+        for (const number of canonicalStore.blocks.keys()) {
+          if (number > reorg.ancestor.number) {
+            canonicalStore.blocks.delete(number);
+          }
+        }
+        checkpoints.values.set('pairs', {
+          blockNumber: reorg.ancestor.number,
+          blockHash: reorg.ancestor.hash,
+        });
+        return {
+          depth: reorg.depth,
+          orphanedEvents: 0,
+          replayedEvents: 0,
+        };
+      }),
+  };
+  const subject = coordinator(reader, canonicalStore, checkpoints, {
+    reorgHandler,
+    runtimeBarrier: barrier,
+  });
+  const first = subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 100n,
+    processChunk: async () => true,
+  });
+  await rollbackStarted.promise;
+  let processCalls = 0;
+
+  const second = subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 100n,
+    processChunk: async () => {
+      processCalls += 1;
+      return true;
+    },
+  });
+  await flushPromises();
+
+  assert.equal(processCalls, 0);
+  rollbackGate.resolve();
+  await Promise.all([first, second]);
+  assert.equal(processCalls, 1);
+});
+
+test('fait passer processChunk par la barrière listener', async () => {
+  const barrier = new RuntimeRecoveryBarrier();
+  const recoveryStarted = deferred();
+  const recoveryGate = deferred();
+  const recovery = barrier.runRecovery(async () => {
+    recoveryStarted.resolve();
+    await recoveryGate.promise;
+  });
+  await recoveryStarted.promise;
+  let processCalls = 0;
+  const canonicalStore = new MemoryCanonicalStore();
+  const journalSaveStarted = deferred();
+  const journalSaveGate = deferred();
+  const saveCanonicalBlocks =
+    canonicalStore.saveCanonicalBlocks.bind(canonicalStore);
+  canonicalStore.saveCanonicalBlocks = async (headers) => {
+    journalSaveStarted.resolve();
+    await journalSaveGate.promise;
+    await saveCanonicalBlocks(headers);
+  };
+  const subject = coordinator(
+    new MemoryBlockReader(20n),
+    canonicalStore,
+    new MemoryCheckpoints(),
+    {
+      runtimeBarrier: barrier,
+      headerSpoolFactory: memoryHeaderSpoolFactory,
+    },
+  );
+
+  const reconciliation = subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 10n,
+    processChunk: async () => {
+      processCalls += 1;
+      return true;
+    },
+  });
+  await journalSaveStarted.promise;
+  journalSaveGate.resolve();
+  await flushPromises();
+
+  assert.equal(processCalls, 0);
+  recoveryGate.resolve();
+  await Promise.all([recovery, reconciliation]);
+  assert.equal(processCalls, 1);
+});
+
+test('waitForIdle attend la fin d’un processChunk ouvert', async () => {
+  const barrier = new RuntimeRecoveryBarrier();
+  const chunkStarted = deferred();
+  const chunkGate = deferred();
+  const subject = coordinator(
+    new MemoryBlockReader(20n),
+    new MemoryCanonicalStore(),
+    new MemoryCheckpoints(),
+    { runtimeBarrier: barrier },
+  );
+  const reconciliation = subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 10n,
+    processChunk: async () => {
+      chunkStarted.resolve();
+      await chunkGate.promise;
+      return true;
+    },
+  });
+  await chunkStarted.promise;
+  let idle = false;
+  const shutdown = subject.waitForIdle().then(() => {
+    idle = true;
+  });
+  await flushPromises();
+
+  assert.equal(idle, false);
+  chunkGate.resolve();
+  await Promise.all([reconciliation, shutdown]);
+  assert.equal(idle, true);
+});
+
+test('autorise seulement les reconciles nested du post-reorg sans ouvrir la queue externe', async () => {
+  const nestedGate = deferred();
+  const hookGate = deferred();
+  const afterReorgStarted = deferred();
+  const nestedStarted = deferred();
+  const nestedFinished = deferred();
+  const escapedGate = deferred();
+  let escapedRun: Promise<void> | null = null;
+  let nestedCalls = 0;
+  let externalCalls = 0;
+  let escapedCalls = 0;
+  const reader = new MemoryBlockReader(115n);
+  const originalGetBlock = reader.getBlock.bind(reader);
+  reader.getBlock = async (number) =>
+    number > 106n
+      ? forkedBlock(number, 106n)
+      : originalGetBlock(number);
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 11 }, (_, index) => block(BigInt(100 + index))),
+  );
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', {
+    blockNumber: 110n,
+    blockHash: block(110n).hash,
+  });
+  const reorgHandler: CanonicalReorgHandler = {
+    reconcileReorg: async (reorg) => {
+      if (!reorg.ancestor) assert.fail('ancêtre shallow attendu');
+      for (const number of canonicalStore.blocks.keys()) {
+        if (number > reorg.ancestor.number) {
+          canonicalStore.blocks.delete(number);
+        }
+      }
+      checkpoints.values.set('pairs', {
+        blockNumber: reorg.ancestor.number,
+        blockHash: reorg.ancestor.hash,
+      });
+      return {
+        depth: reorg.depth,
+        orphanedEvents: 0,
+        replayedEvents: 0,
+      };
+    },
+  };
+  let subject: CanonicalChainCoordinator;
+  subject = coordinator(reader, canonicalStore, checkpoints, {
+    reorgHandler,
+    headerSpoolFactory: memoryHeaderSpoolFactory,
+    afterReorg: async () => {
+      afterReorgStarted.resolve();
+      escapedRun = (async () => {
+        await escapedGate.promise;
+        await subject.reconcile({
+          listenerKey: 'escaped',
+          startBlock: 107n,
+          processChunk: async () => {
+            escapedCalls += 1;
+            return true;
+          },
+        });
+      })();
+      await subject.reconcile({
+        listenerKey: 'nested-swap-listener',
+        startBlock: 107n,
+        processChunk: async () => {
+          nestedCalls += 1;
+          nestedStarted.resolve();
+          await nestedGate.promise;
+          return true;
+        },
+      });
+      nestedFinished.resolve();
+      await hookGate.promise;
+    },
+  });
+
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 100n,
+    processChunk: async () => true,
+  });
+  await afterReorgStarted.promise;
+  const external = subject.reconcile({
+    listenerKey: 'external',
+    startBlock: 107n,
+    processChunk: async () => {
+      externalCalls += 1;
+      return true;
+    },
+  });
+  let idle = false;
+  const idleRun = subject.waitForIdle().then(() => {
+    idle = true;
+  });
+  const nestedEntered = await Promise.race([
+    nestedStarted.promise.then(() => true),
+    (async () => {
+      await flushPromises();
+      await flushPromises();
+      return false;
+    })(),
+  ]);
+
+  assert.equal(nestedEntered, true);
+  assert.equal(externalCalls, 0);
+  assert.equal(idle, false);
+  assert.equal(subject.currentStatus.running, true);
+  assert.equal(subject.currentStatus.pendingRequests, 2);
+  nestedGate.resolve();
+  await nestedFinished.promise;
+  await flushPromises();
+  assert.equal(externalCalls, 0);
+  assert.equal(idle, false);
+  assert.equal(subject.currentStatus.running, false);
+  assert.equal(subject.currentStatus.pendingRequests, 1);
+  hookGate.resolve();
+  await Promise.all([external, idleRun]);
+  assert.equal(externalCalls, 1);
+  assert.equal(idle, true);
+
+  const blockerGate = deferred();
+  const blockerStarted = deferred();
+  const blocker = subject.reconcile({
+    listenerKey: 'blocker',
+    startBlock: 107n,
+    processChunk: async () => {
+      blockerStarted.resolve();
+      await blockerGate.promise;
+      return true;
+    },
+  });
+  await blockerStarted.promise;
+  escapedGate.resolve();
+  await flushPromises();
+  await flushPromises();
+  assert.equal(escapedCalls, 0);
+  assert.equal(subject.currentStatus.running, true);
+  assert.equal(subject.currentStatus.pendingRequests, 2);
+  blockerGate.resolve();
+  await Promise.all([blocker, escapedRun]);
+  assert.equal(escapedCalls, 1);
+  await subject.waitForIdle();
+  assert.equal(subject.currentStatus.running, false);
+  assert.equal(subject.currentStatus.pendingRequests, 0);
+});
+
+test('afterReorg draine un reconcile inline non awaité avant waitForIdle', async () => {
+  const chunkGate = deferred();
+  const chunkStarted = deferred();
+  const failureReached = deferred();
+  const reader = new MemoryBlockReader(115n);
+  const originalGetBlock = reader.getBlock.bind(reader);
+  reader.getBlock = async (number) =>
+    number > 106n
+      ? forkedBlock(number, 106n)
+      : originalGetBlock(number);
+  const canonicalStore = new MemoryCanonicalStore(
+    Array.from({ length: 11 }, (_, index) => block(BigInt(100 + index))),
+  );
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', {
+    blockNumber: 110n,
+    blockHash: block(110n).hash,
+  });
+  let subject: CanonicalChainCoordinator;
+  subject = coordinator(reader, canonicalStore, checkpoints, {
+    headerSpoolFactory: memoryHeaderSpoolFactory,
+    reorgHandler: {
+      reconcileReorg: async (reorg) => {
+        if (!reorg.ancestor) assert.fail('ancêtre shallow attendu');
+        for (const number of canonicalStore.blocks.keys()) {
+          if (number > reorg.ancestor.number) {
+            canonicalStore.blocks.delete(number);
+          }
+        }
+        checkpoints.values.set('pairs', {
+          blockNumber: reorg.ancestor.number,
+          blockHash: reorg.ancestor.hash,
+        });
+        return {
+          depth: reorg.depth,
+          orphanedEvents: 0,
+          replayedEvents: 0,
+        };
+      },
+    },
+    afterReorg: async () => {
+      void subject.reconcile({
+        listenerKey: 'unawaited-swap',
+        startBlock: 107n,
+        processChunk: async () => {
+          chunkStarted.resolve();
+          await chunkGate.promise;
+          failureReached.resolve();
+          throw new Error('nested unawaited failed');
+        },
+      });
+    },
+  });
+
+  await subject.reconcile({
+    listenerKey: 'pairs',
+    startBlock: 100n,
+    processChunk: async () => true,
+  });
+  await chunkStarted.promise;
+  let idle = false;
+  const idleRun = subject.waitForIdle().then(() => {
+    idle = true;
+  });
+  await flushPromises();
+  const idleBeforeRelease = idle;
+  chunkGate.resolve();
+  await failureReached.promise;
+  await idleRun;
+  await flushPromises();
+
+  assert.equal(idleBeforeRelease, false);
+  assert.equal(subject.currentStatus.state, 'RECONCILING');
+  assert.equal(subject.currentStatus.pendingRequests, 0);
+  assert.equal(subject.currentStatus.running, false);
 });
 
 test('ne déduit aucun reorg lorsque le tip stocké dépasse le head confirmé', async () => {

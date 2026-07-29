@@ -1,14 +1,26 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+interface ListenerScope {
+  active: boolean;
+}
+
 export class RuntimeRecoveryBarrier {
   private activeListeners = 0;
   private recoveryActive = false;
   private readonly listenerWaiters: Array<() => void> = [];
   private readonly recoveryWaiters: Array<() => void> = [];
+  private readonly listenerScopes = new AsyncLocalStorage<ListenerScope>();
 
   async runListener<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.listenerScopes.getStore()?.active === true) {
+      return operation();
+    }
     await this.acquireListener();
+    const scope: ListenerScope = { active: true };
     try {
-      return await operation();
+      return await this.listenerScopes.run(scope, operation);
     } finally {
+      scope.active = false;
       this.releaseListener();
     }
   }
