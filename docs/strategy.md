@@ -26,7 +26,7 @@ Les WebSockets servent uniquement de signal de réveil : les logs et les headers
 
 Le heartbeat et le dashboard exposent la profondeur de confirmation, le head confirmé, le tip/hash canonique, l’état `HEALTHY`, `RECONCILING` ou `MANUAL_REVIEW`, et le dernier reorg (détection, ancêtre, profondeur et compteurs). Une erreur RPC conserve les dernières valeurs validées mais les marque `STALE` et ne présente jamais cet état comme `HEALTHY`.
 
-## Compteur de sortie
+## Surveillance continue et règles de sortie
 
 Après confirmation de notre entrée — ou, en `dry-run`, après un curseur virtuel placé à la fin du bloc courant — :
 
@@ -35,4 +35,44 @@ Après confirmation de notre entrée — ou, en `dry-run`, après un curseur vir
 - compter une seule fois chaque hash de transaction d’achat ;
 - vendre lorsque le compteur atteint `TARGET_BUYS_AFTER_ENTRY`.
 
-Une vente échouée avant diffusion, ou révoquée avec certitude, remet la session en `HOLDING`; un Swap suivant provoque une nouvelle tentative. Si une vente a été diffusée mais que son résultat est ambigu, la session passe en `ERROR` pour empêcher une double vente et imposer une vérification du reçu/wallet.
+Le compteur n’est qu’une règle parmi les sorties continues. Par défaut, le
+monitor s’exécute toutes les 15 secondes et applique, dans cet ordre :
+
+1. probe inconnu ou bloqué : `MANUAL_REVIEW`, sans transaction ;
+2. baisse de liquidité WBNB de 20 % : vente d’urgence seulement après un probe
+   immédiat réussi ;
+3. stop-loss économique de 10 % ;
+4. durée maximale de 30 minutes ;
+5. trailing stop éventuel ;
+6. take-profit fixe de 20 % ;
+7. compteur `TARGET_BUYS_AFTER_ENTRY`.
+
+Tous les montants restent en entiers wei. La valeur économique est calculée
+ainsi :
+
+```text
+entryCostWei = principal d’entrée + gas d’entrée confirmé
+afterTaxWei = quoteWei × (10000 - sellTaxBps) / 10000
+afterBufferWei = afterTaxWei × (10000 - quoteBufferBps) / 10000
+netExitWei = max(0, afterBufferWei - gas de sortie estimé)
+```
+
+Une sortie normale est placée en `MANUAL_REVIEW` lorsque le gas estimé dépasse
+10 % de `netExitWei`. Une urgence de liquidité ignore ce ratio, mais ne peut
+jamais dépasser le plafond absolu de 0,01 BNB de gas.
+
+Le trailing est désactivé par défaut. Lorsqu’il est activé, un gain de 20 %
+arme le mécanisme et remplace la vente take-profit fixe ; un recul de 5 % par
+rapport au pic net persistant déclenche ensuite la vente.
+
+Les réglages effectifs, leur révision, la liquidité de référence, le pic
+trailing et les décisions sont persistés. Après un crash, les transactions
+existantes sont d’abord retrouvées par hash et nonce. Une décision
+`EXECUTING` ne rediffuse jamais une transaction avant cette réconciliation.
+Les listeners et le monitor de sortie ne démarrent qu’après la première
+réconciliation canonique.
+
+Une vente échouée avant diffusion, ou révoquée avec certitude, peut revenir en
+`HOLDING`. Si une vente a été diffusée mais que son résultat est ambigu, la
+référence de reprise reste persistée et la session exige une intervention
+manuelle afin d’empêcher une double vente.

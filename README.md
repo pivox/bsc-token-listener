@@ -221,9 +221,9 @@ l’état `HEALTHY` / `RECONCILING` / `MANUAL_REVIEW`, ainsi que le dernier reor
 cas d’échec RPC, les dernières valeurs validées restent visibles mais sont
 marquées `STALE`; elles ne sont jamais affichées comme saines.
 
-## Dashboard minimal
+## Dashboard local
 
-Le bot expose une interface de supervision **strictement en lecture seule**. Elle affiche :
+Le bot expose une interface locale de supervision. Elle affiche :
 
 - les tokens écoutés, achetés, vendus et en erreur ;
 - le solde du wallet public quand une clé est configurée ;
@@ -232,6 +232,8 @@ Le bot expose une interface de supervision **strictement en lecture seule**. Ell
 - le score `TokenRiskReport`, les taxes estimées, les swaps observés et une chronologie ;
 - l’état et le backlog de la réconciliation après crash ;
 - les liens vers BscScan pour le token, la paire et les transactions.
+- la prochaine évaluation de sortie, le PnL économique net, la liquidité de
+  référence, le probe de vente et l’état trailing.
 
 Configuration par défaut :
 
@@ -259,6 +261,28 @@ Pour une position live clôturée, le dashboard distingue :
 
 Les cotations dry-run restent explicitement marquées comme simulations et ne sont
 jamais présentées comme des montants réels.
+
+### Politique de sortie configurable
+
+Toutes les valeurs `EXIT_*` et `TARGET_BUYS_AFTER_ENTRY` de `.env.example`
+sont modifiables depuis le formulaire « Politique de sortie ». Une modification
+est refusée sans écoute loopback, sans `DASHBOARD_ACTIONS_ENABLED=true`, ou sans
+la confirmation live dédiée. Le formulaire impose une prévisualisation, une
+confirmation explicite et la révision courante ; une révision périmée retourne
+un conflit sans modifier PostgreSQL. Le bouton de reset restaure les valeurs
+du `.env`. Chaque modification est auditée.
+
+Le profil par défaut évalue toutes les 15 secondes, limite une position à
+30 minutes, applique un stop-loss de 10 %, un take-profit de 20 % et détecte
+une baisse de liquidité de 20 %. Le probe de vente est renouvelé toutes les
+60 secondes et immédiatement avant chaque vente.
+
+Le formulaire et les ventes manuelles restent verrouillés par défaut :
+
+```env
+DASHBOARD_ACTIONS_ENABLED=false
+CONFIRM_DASHBOARD_TRADING_ACTIONS=
+```
 
 ## Tests PostgreSQL
 
@@ -296,5 +320,6 @@ Tester longuement en dry-run avant toute activation.
 - pas de liste complète des détenteurs ;
 - pas d’intégration aux lockers LP ;
 - détection de sélecteurs basée sur le bytecode, donc faux positifs et faux négatifs possibles ;
-- pas de surveillance continue des changements de paramètres après l’achat ;
+- les métriques dépendent de la disponibilité du RPC et du contrat
+  `SafetyProbe` configuré ;
 - pas de mempool ni d’exécution dans le même bloc.
