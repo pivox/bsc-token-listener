@@ -755,14 +755,14 @@ async function main(): Promise<void> {
       await monitorScheduler.reconcile();
     },
     activateListeners: async () => {
-      await pairListener.start();
-      recovery.start();
       await startPositionExitRuntime({
         reconcilePendingDecisions: () =>
           positionExitMonitor.reconcilePendingDecisions(),
         reconcileNow: () => positionExitMonitor.reconcileNow(),
         start: () => positionExitMonitor.start(),
       });
+      await pairListener.start();
+      recovery.start();
     },
     cleanup: {
       disableSchedulingAndStopNewWork: () => {
