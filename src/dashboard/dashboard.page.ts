@@ -363,6 +363,10 @@ export function renderDashboardPage(nonce: string, refreshSeconds: number): stri
       const realizedNet = formatBnb(token.pnl.realizedNetBnb);
       const gas = formatBnb(token.pnl.gasBnb);
       const pnl = token.exit ? (token.pnl.realizedNetBnb === null ? realizedGross : realizedNet) : (formatBnb(token.pnl.unrealizedBnb) + (token.pnl.unrealizedPercent ? ' (' + token.pnl.unrealizedPercent + ' %)' : ''));
+      const positionExit = token.positionExit;
+      const exitPnl = positionExit && positionExit.economicPnlPercent !== null
+        ? positionExit.economicPnlPercent + ' %'
+        : '—';
       byId('dialog-content').innerHTML =
         '<dl class="detail-grid">' +
           detailItem('Statut', token.statusLabel) +
@@ -377,6 +381,16 @@ export function renderDashboardPage(nonce: string, refreshSeconds: number): stri
           detailItem('PnL net', token.exit ? realizedNet : '—') +
           detailItem('Liquidité WBNB au contrôle', token.risk.liquidityBnb ? formatBnb(token.risk.liquidityBnb) : '—') +
           detailItem('Taxes estimées', 'Achat ' + (token.risk.buyTaxPercent || '—') + ' % / Vente ' + (token.risk.sellTaxPercent || '—') + ' %') +
+          detailItem('Prochaine évaluation', positionExit ? formatDate(positionExit.nextEvaluationAt) : '—') +
+          detailItem('Durée restante', positionExit && positionExit.remainingHoldingSeconds !== null ? positionExit.remainingHoldingSeconds + ' s' : '—') +
+          detailItem('Valeur nette économique', positionExit ? formatBnb(positionExit.netValueBnb) : '—') +
+          detailItem('PnL économique', exitPnl) +
+          detailItem('Stop-loss', positionExit ? positionExit.stopLossPercent + ' %' : '—') +
+          detailItem('Take-profit', positionExit ? positionExit.takeProfitPercent + ' %' : '—') +
+          detailItem('Trailing', positionExit ? (positionExit.trailingEnabled ? (positionExit.trailingArmed ? 'Armé' : 'En attente') : 'Désactivé') : '—') +
+          detailItem('Probe de vente', positionExit ? token.positionExit.lastProbeStatus : '—') +
+          detailItem('Dernière raison', positionExit ? positionExit.lastReason : '—') +
+          detailItem('État stale', positionExit ? positionExit.staleReason : '—') +
         '</dl>' +
         (token.error ? '<div class="alert">' + escapeHtml(token.error) + '</div>' : '') +
         '<h3 class="section-title">Chronologie</h3><ol class="timeline">' + timeline.map(function (event) { return '<li><time>' + escapeHtml(formatDate(event.at)) + '</time><span>' + escapeHtml(event.text) + '</span></li>'; }).join('') + '</ol>' +

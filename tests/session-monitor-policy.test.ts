@@ -522,7 +522,10 @@ test('une vente manuelle n’hérite jamais d’une provenance résiduelle', asy
   };
   let sellSourceEventId: string | undefined;
   const engine = new SessionEngine(
-    { save: async () => {} } as never,
+    {
+      findByPair: async () => structuredClone(current),
+      save: async () => {},
+    } as never,
     {} as never,
     {} as never,
     {

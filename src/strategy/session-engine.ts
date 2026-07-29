@@ -20,6 +20,11 @@ import { logger } from '../utils/logger.js';
 import type { TokenRiskReport } from '../security/token-risk.types.js';
 import { RuntimeRecoveryBarrier } from '../recovery/runtime-recovery-barrier.js';
 import { isSessionMonitorable } from './session-monitor-policy.js';
+import { evaluatePositionExit } from './position-exit-evaluator.js';
+import type { PositionMetricsService } from './position-metrics.service.js';
+import type { PositionExitRepository } from './position-exit.repository.js';
+import type { PositionExitSettingsProvider } from './position-exit-settings.provider.js';
+import type { PositionExitDecision } from './position-exit.types.js';
 
 const TERMINAL = new Set(['CLOSED', 'REJECTED', 'EXPIRED']);
 
@@ -35,6 +40,15 @@ const NOOP_SWAP_EVENT_LIFECYCLE: SwapEventLifecycle = {
   markFailed: async () => {},
 };
 
+export interface PositionExitEngineDependencies {
+  settings: Pick<PositionExitSettingsProvider, 'get'>;
+  metrics: Pick<PositionMetricsService, 'collect'>;
+  decisions: Pick<
+    PositionExitRepository,
+    'createDecision' | 'findDecision' | 'transitionDecision'
+  >;
+}
+
 export class SessionEngine {
   private readonly locks = new Map<string, Promise<void>>();
 
@@ -46,6 +60,7 @@ export class SessionEngine {
     private readonly amountService: EntryAmountService,
     private readonly runtimeBarrier = new RuntimeRecoveryBarrier(),
     private readonly eventLifecycle: SwapEventLifecycle = NOOP_SWAP_EVENT_LIFECYCLE,
+    private readonly positionExits?: PositionExitEngineDependencies,
   ) {}
 
   async onSwap(session: TokenSession, event: SwapEvent): Promise<boolean> {
@@ -87,6 +102,9 @@ export class SessionEngine {
 
   async sellManually(session: TokenSession): Promise<TokenSession> {
     return this.withLock(session, async () => {
+      const current = await this.sessions.findByPair(session.pair.pair);
+      if (!current) throw new Error('Session introuvable.');
+      this.replaceSession(session, current);
       if (!session.entry || session.exit) {
         throw new Error('Aucune position ouverte à vendre.');
       }
@@ -104,6 +122,21 @@ export class SessionEngine {
         true,
       );
       return session;
+    });
+  }
+
+  async requestPolicyExit(
+    session: TokenSession,
+    decision: PositionExitDecision,
+  ): Promise<TokenSession> {
+    if (!this.positionExits) {
+      throw new Error('Politique de sortie non configurée.');
+    }
+    return this.withLock(session, async () => {
+      const current = await this.sessions.findByPair(session.pair.pair);
+      if (!current) throw new Error('Session introuvable.');
+      this.replaceSession(session, current);
+      return this.requestPolicyExitLocked(session, decision);
     });
   }
 
@@ -180,6 +213,23 @@ export class SessionEngine {
     if (this.isTerminal(session)) return;
     session.lastProcessedCursor = event.cursor;
     session.updatedAtMs = Date.now();
+
+    if (session.status === 'HOLDING' && this.positionExits) {
+      const effective = await this.positionExits.settings.get();
+      if (
+        session.targetBuysAfterEntry !==
+          effective.settings.targetBuysAfterEntry ||
+        session.exitPolicy?.settingsRevision !== effective.revision
+      ) {
+        session.targetBuysAfterEntry =
+          effective.settings.targetBuysAfterEntry;
+        session.exitPolicy = {
+          ...session.exitPolicy,
+          settingsRevision: effective.revision,
+        };
+        await this.sessions.save(session);
+      }
+    }
 
     if (session.status === 'WAITING_FIRST_BUY' && event.kind === 'BUY') {
       const { added, count } = recordEntryObservationBuy(session, event);
@@ -360,6 +410,56 @@ export class SessionEngine {
     );
 
     if (session.subsequentBuyCount < session.targetBuysAfterEntry) return;
+    if (this.positionExits) {
+      const effective = await this.positionExits.settings.get();
+      const nowMs = Date.now();
+      const observedMetrics = await this.positionExits.metrics.collect(
+        session,
+        effective.settings,
+        session.exitPolicy ?? {},
+        nowMs,
+        { forceProbe: true },
+      );
+      const evaluation = evaluatePositionExit({
+        settings: effective.settings,
+        state: session.exitPolicy ?? {},
+        metrics: observedMetrics,
+        nowMs,
+        openedAtMs: session.entry.confirmedAtMs,
+        observedBuysAfterEntry: session.subsequentBuyCount,
+      });
+      session.exitPolicy = {
+        ...evaluation.state,
+        settingsRevision: effective.revision,
+      };
+      session.updatedAtMs = nowMs;
+      await this.sessions.save(session);
+      if (evaluation.primaryRule === undefined || evaluation.action === 'HOLD') {
+        return;
+      }
+      const entryReference =
+        session.entry.tradeId ??
+        session.entry.transactionHash ??
+        String(session.entry.confirmedAtMs);
+      const decision = await this.positionExits.decisions.createDecision({
+        idempotencyKey: [
+          session.pair.pair.toLowerCase(),
+          entryReference,
+          effective.revision,
+          evaluation.primaryRule,
+        ].join(':'),
+        pair: session.pair.pair,
+        token: session.pair.token,
+        settingsRevision: effective.revision,
+        primaryRule: evaluation.primaryRule,
+        triggeredRules: evaluation.triggeredRules,
+        action: evaluation.action,
+        metrics: observedMetrics,
+        reason: evaluation.reason,
+      });
+      await this.requestPolicyExitLocked(session, decision, event.id);
+      return;
+    }
     await this.performSell(
       session,
       'Sortie effectuée après le nombre cible d’achats.',
@@ -368,11 +468,103 @@ export class SessionEngine {
     );
   }
 
+  private async requestPolicyExitLocked(
+    session: TokenSession,
+    decision: PositionExitDecision,
+    sourceEventId?: string,
+  ): Promise<TokenSession> {
+    if (!this.positionExits) {
+      throw new Error('Politique de sortie non configurée.');
+    }
+    if (session.status !== 'HOLDING' || !session.entry || session.exit) {
+      await this.positionExits.decisions.transitionDecision(
+        decision.id,
+        'PENDING',
+        'SUPERSEDED',
+      );
+      return session;
+    }
+    const persistedDecision =
+      await this.positionExits.decisions.findDecision(decision.id);
+    if (!persistedDecision || persistedDecision.status !== 'PENDING') {
+      return session;
+    }
+    const effective = await this.positionExits.settings.get();
+    if (effective.revision !== persistedDecision.settingsRevision) {
+      await this.positionExits.decisions.transitionDecision(
+        decision.id,
+        'PENDING',
+        'SUPERSEDED',
+      );
+      return session;
+    }
+    const nowMs = Date.now();
+    const latestMetrics = await this.positionExits.metrics.collect(
+      session,
+      effective.settings,
+      session.exitPolicy ?? {},
+      nowMs,
+      { forceProbe: true },
+    );
+    const latest = evaluatePositionExit({
+      settings: effective.settings,
+      state: session.exitPolicy ?? {},
+      metrics: latestMetrics,
+      nowMs,
+      openedAtMs: session.entry.confirmedAtMs,
+      observedBuysAfterEntry: session.subsequentBuyCount,
+    });
+    session.exitPolicy = { ...latest.state, settingsRevision: effective.revision };
+
+    if (latest.action === 'MANUAL_REVIEW') {
+      await this.positionExits.decisions.transitionDecision(
+        decision.id,
+        'PENDING',
+        'MANUAL_REVIEW',
+      );
+      session.status = 'MANUAL_REVIEW';
+      session.rejectionReason = latest.reason;
+      session.updatedAtMs = nowMs;
+      await this.sessions.save(session);
+      return session;
+    }
+    if (
+      latest.action === 'HOLD' ||
+      latest.action !== persistedDecision.action
+    ) {
+      await this.positionExits.decisions.transitionDecision(
+        decision.id,
+        'PENDING',
+        'SUPERSEDED',
+      );
+      await this.sessions.save(session);
+      return session;
+    }
+    const claimed = await this.positionExits.decisions.transitionDecision(
+      decision.id,
+      'PENDING',
+      'EXECUTING',
+    );
+    if (!claimed) return session;
+    session.pendingExitDecisionId = decision.id;
+    await this.performSell(
+      session,
+      latest.action === 'EMERGENCY_SELL'
+        ? 'Sortie d’urgence après baisse de liquidité.'
+        : `Sortie automatique: ${latest.primaryRule ?? 'politique'}.`,
+      false,
+      sourceEventId,
+      persistedDecision,
+    );
+    return session;
+  }
+
   private async performSell(
     session: TokenSession,
     successMessage: string,
     rethrowFailure: boolean,
     sourceEventId?: string,
+    decision?: PositionExitDecision,
   ): Promise<void> {
     if (sourceEventId === undefined) {
       delete session.pendingExecutionSourceEventId;
@@ -392,9 +584,20 @@ export class SessionEngine {
       delete session.unreconciledExecution;
       delete session.pendingExecutionSourceEventId;
       session.status = 'CLOSED';
+      delete session.pendingExitDecisionId;
       delete session.rejectionReason;
       session.updatedAtMs = Date.now();
       await this.sessions.save(session);
+      if (decision && this.positionExits) {
+        await this.positionExits.decisions.transitionDecision(
+          decision.id,
+          'EXECUTING',
+          'EXECUTED',
+          session.exit.tradeId
+            ? { relatedTradeId: session.exit.tradeId }
+            : {},
+        );
+      }
       logger.info(
         {
           pair: session.pair.pair,
@@ -407,10 +610,21 @@ export class SessionEngine {
     } catch (error) {
       const unresolvedExecution = executionToReconcile(error);
       if (unresolvedExecution) session.unreconciledExecution = unresolvedExecution;
+      if (!unresolvedExecution) {
+        delete session.pendingExitDecisionId;
+      }
       session.status = 'MANUAL_REVIEW';
       session.rejectionReason = `Vente échouée: ${errorMessage(error)}`;
       session.updatedAtMs = Date.now();
       await this.sessions.save(session);
+      if (decision && this.positionExits && !unresolvedExecution) {
+        await this.positionExits.decisions.transitionDecision(
+          decision.id,
+          'EXECUTING',
+          'FAILED',
+          { errorType: error instanceof Error ? error.name : 'UnknownError' },
+        );
+      }
       logger.error(
         { pair: session.pair.pair, error: errorMessage(error) },
         'Vente échouée; intervention manuelle requise.',

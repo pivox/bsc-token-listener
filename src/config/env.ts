@@ -7,6 +7,7 @@ import {
   type Hex,
 } from 'viem';
 import { readBlockConfirmations } from '../chain/confirmed-blocks.js';
+import { parsePositionExitSettings } from '../strategy/position-exit-settings.js';
 import type { ExecutionMode } from '../types/domain.js';
 
 function read(name: string, fallback?: string): string {
@@ -122,6 +123,29 @@ if (buyAmountStepWei > minBuyBnbWei) {
   throw new Error('BUY_AMOUNT_STEP_BNB doit être inférieur ou égal à MIN_BUY_BNB.');
 }
 
+const targetBuysAfterEntry = readInteger('TARGET_BUYS_AFTER_ENTRY', 3, 1, 1_000);
+const positionExitSettings = parsePositionExitSettings({
+  monitorIntervalSeconds: readInteger('EXIT_MONITOR_INTERVAL_SECONDS', 15, 5, 300),
+  maxHoldingMinutes: readInteger('EXIT_MAX_HOLDING_MINUTES', 30, 1, 10_080),
+  stopLossBps: readInteger('EXIT_STOP_LOSS_BPS', 1_000, 1, 10_000),
+  takeProfitBps: readInteger('EXIT_TAKE_PROFIT_BPS', 2_000, 1, 100_000),
+  liquidityDropBps: readInteger('EXIT_LIQUIDITY_DROP_BPS', 2_000, 1, 10_000),
+  probeIntervalSeconds: readInteger('EXIT_SAFETY_PROBE_INTERVAL_SECONDS', 60, 15, 3_600),
+  quoteBufferBps: readInteger('EXIT_QUOTE_BUFFER_BPS', 1_500, 0, 5_000),
+  maxGasValueBps: readInteger('EXIT_MAX_GAS_VALUE_BPS', 1_000, 1, 10_000),
+  emergencyMaxGasWei: parseEther(read('EXIT_EMERGENCY_MAX_GAS_BNB', '0.01')),
+  approvalGasUnits: BigInt(
+    readInteger('EXIT_APPROVAL_GAS_UNITS', 80_000, 21_000, 1_000_000),
+  ),
+  sellGasUnits: BigInt(
+    readInteger('EXIT_SELL_GAS_UNITS', 350_000, 21_000, 2_000_000),
+  ),
+  trailingEnabled: readBoolean('EXIT_TRAILING_STOP_ENABLED', false),
+  trailingActivationBps: readInteger('EXIT_TRAILING_ACTIVATION_BPS', 2_000, 1, 100_000),
+  trailingDrawdownBps: readInteger('EXIT_TRAILING_DRAWDOWN_BPS', 500, 1, 10_000),
+  targetBuysAfterEntry,
+});
+
 export const config = {
   network,
   blockConfirmations: readBlockConfirmations(process.env),
@@ -158,7 +182,8 @@ export const config = {
   gasReserveWei: parseEther(read('GAS_RESERVE_BNB', '0.005')),
   slippageBps: readInteger('SLIPPAGE_BPS', 1500, 0, 5000, 'BUY_SLIPPAGE_BPS'),
   txDeadlineSeconds: readInteger('TX_DEADLINE_SECONDS', 90, 15, 600),
-  targetBuysAfterEntry: readInteger('TARGET_BUYS_AFTER_ENTRY', 3, 1, 1000),
+  targetBuysAfterEntry,
+  positionExitSettings,
   entryObservationBuys: readInteger('ENTRY_OBSERVATION_BUYS', 3, 1, 20),
   maxConcurrentPositions: readInteger('MAX_CONCURRENT_POSITIONS', 1, 1, 100),
   maxActivePairMonitors: readInteger('MAX_ACTIVE_PAIR_MONITORS', 50, 1, 1000),

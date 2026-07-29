@@ -1,5 +1,6 @@
 import type { Address } from 'viem';
 import { pancakeRouterAbi } from './abi/pancake-router.abi.js';
+import { pancakePairAbi } from './abi/pancake-pair.abi.js';
 import {
   CanonicalChainCoordinator,
   type CanonicalReorgCompletion,
@@ -12,6 +13,7 @@ import { chain } from './config/chain.js';
 import { config } from './config/env.js';
 import { ActionDashboardServer } from './dashboard/action-dashboard.js';
 import { DashboardActionService } from './dashboard/dashboard-action.service.js';
+import { ExitPolicyDashboardService } from './dashboard/exit-policy.service.js';
 import {
   DashboardRepository,
   DashboardService,
@@ -35,6 +37,7 @@ import { ViemReconciliationGateway } from './recovery/viem-reconciliation.gatewa
 import { RuntimeRecoveryBarrier } from './recovery/runtime-recovery-barrier.js';
 import { account, publicClient, wsClient } from './rpc/clients.js';
 import { drainRuntimeForShutdown } from './runtime/runtime-shutdown.js';
+import { startPositionExitRuntime } from './runtime/position-exit-runtime.js';
 import {
   ReorgReplayAdmissionGate,
   startSwapMonitorForAdmission,
@@ -48,6 +51,7 @@ import { PendingShallowReorgQueue } from './runtime/pending-shallow-reorgs.js';
 import { continueStartupAfterRecovery } from './runtime/startup-order.js';
 import { RiskSettingsStore } from './security/risk-settings.store.js';
 import { TokenRiskService } from './security/token-risk.service.js';
+import { SafetyProbeService } from './security/safety-probe.service.js';
 import { EntryAmountService } from './execution/entry-amount.service.js';
 import { closeDatabase, migrate } from './storage/database.js';
 import { IgnoredAssetRepository } from './storage/ignored-asset.repository.js';
@@ -60,6 +64,10 @@ import {
   TradeRepository,
 } from './storage/repositories.js';
 import { SessionEngine } from './strategy/session-engine.js';
+import { PositionExitRepository } from './strategy/position-exit.repository.js';
+import { PositionExitSettingsProvider } from './strategy/position-exit-settings.provider.js';
+import { PositionMetricsService } from './strategy/position-metrics.service.js';
+import { PositionExitMonitor } from './strategy/position-exit-monitor.js';
 import { isSessionMonitorable } from './strategy/session-monitor-policy.js';
 import type { PairInfo, TokenSession } from './types/domain.js';
 import { errorMessage } from './utils/error.js';
@@ -100,9 +108,15 @@ async function main(): Promise<void> {
   const checkpoints = new CheckpointRepository();
   const chainRepository = new CanonicalChainRepository();
   const ignoredAssets = new IgnoredAssetRepository();
+  const positionExitRepository = new PositionExitRepository();
+  const positionExitSettings = new PositionExitSettingsProvider(
+    positionExitRepository,
+    config.positionExitSettings,
+  );
   const riskSettings = new RiskSettingsStore();
   const metadataService = new TokenMetadataService(publicClient);
-  const risk = new TokenRiskService(publicClient, riskSettings);
+  const safetyProbe = new SafetyProbeService(publicClient);
+  const risk = new TokenRiskService(publicClient, riskSettings, safetyProbe);
   const executor = new TradeExecutor(trades);
   const amountService = new EntryAmountService({
     getWalletBalanceWei: async () => {
@@ -111,6 +125,36 @@ async function main(): Promise<void> {
     },
   });
   const runtimeRecoveryBarrier = new RuntimeRecoveryBarrier();
+  const positionMetrics = new PositionMetricsService({
+    quotePosition: async (session) => {
+      if (!session.entry) throw new Error('Position sans entrée.');
+      const amounts = await publicClient.readContract({
+        address: session.pair.router,
+        abi: pancakeRouterAbi,
+        functionName: 'getAmountsOut',
+        args: [
+          session.entry.amountOutToken,
+          [session.pair.token, session.pair.wbnb],
+        ],
+      });
+      const quote = amounts.at(-1);
+      if (quote === undefined) throw new Error('Quote de sortie vide.');
+      return quote;
+    },
+    readLiquidityWbnb: async (session) => {
+      const [reserve0, reserve1] = await publicClient.readContract({
+        address: session.pair.pair,
+        abi: pancakePairAbi,
+        functionName: 'getReserves',
+      });
+      return session.pair.token0.toLowerCase() ===
+        session.pair.wbnb.toLowerCase()
+        ? reserve0
+        : reserve1;
+    },
+    readFeePerGas: () => publicClient.getGasPrice(),
+    probeSellability: (session) => safetyProbe.probe(session.pair),
+  });
   const engine = new SessionEngine(
     sessions,
     reports,
@@ -119,7 +163,20 @@ async function main(): Promise<void> {
     amountService,
     runtimeRecoveryBarrier,
     events,
+    {
+      settings: positionExitSettings,
+      metrics: positionMetrics,
+      decisions: positionExitRepository,
+    },
   );
+  const positionExitMonitor = new PositionExitMonitor({
+    sessions,
+    settings: positionExitSettings,
+    metrics: positionMetrics,
+    decisions: positionExitRepository,
+    engine,
+    barrier: runtimeRecoveryBarrier,
+  });
   const reorgSessions = new ReorgSessionReconciler({
     findSession: (pair) => sessions.findByPair(pair),
     listCanonicalProcessedEvents: (pair) =>
@@ -252,11 +309,21 @@ async function main(): Promise<void> {
     (token) => activeSessionsByToken.get(token.toLowerCase()) ?? null,
     (pair) => stopMonitor(pair),
   );
+  const exitPolicyDashboard = new ExitPolicyDashboardService(
+    positionExitSettings,
+    sessions,
+    config.positionExitSettings,
+  );
   const dashboard = config.dashboardEnabled
     ? new ActionDashboardServer(
-      new DashboardService(new DashboardRepository(), heartbeat),
+      new DashboardService(
+        new DashboardRepository(),
+        heartbeat,
+        positionExitSettings,
+      ),
       riskSettings,
       dashboardActions,
+      exitPolicyDashboard,
     )
     : null;
 
@@ -688,17 +755,27 @@ async function main(): Promise<void> {
       await monitorScheduler.reconcile();
     },
     activateListeners: async () => {
+      await startPositionExitRuntime({
+        reconcilePendingDecisions: () =>
+          positionExitMonitor.reconcilePendingDecisions(),
+        reconcileNow: () => positionExitMonitor.reconcileNow(),
+        start: () => positionExitMonitor.start(),
+      });
       await pairListener.start();
       recovery.start();
     },
     cleanup: {
       disableSchedulingAndStopNewWork: () => {
         monitorSchedulingEnabled = false;
+        positionExitMonitor.stop();
         pairListener.stop();
         for (const listener of monitors.values()) listener.stop();
       },
       stopRecovery: () => recovery.stop(),
-      waitForMonitorIdle: () => monitorScheduler.waitForIdle(),
+      waitForMonitorIdle: async () => {
+        await positionExitMonitor.waitForIdle();
+        await monitorScheduler.waitForIdle();
+      },
       waitForCanonicalIdle: () => canonicalCoordinator.waitForIdle(),
       drainListeners: async () => {
         await Promise.all(
@@ -800,7 +877,9 @@ async function main(): Promise<void> {
         pairListener.stop();
         for (const listener of monitors.values()) listener.stop();
       },
+      stopPositionExits: () => positionExitMonitor.stop(),
       stopRecovery: () => recovery.stop(),
+      waitForPositionExitIdle: () => positionExitMonitor.waitForIdle(),
       waitForMonitorIdle: () => monitorScheduler.waitForIdle(),
       waitForCanonicalIdle: () => canonicalCoordinator.waitForIdle(),
     });

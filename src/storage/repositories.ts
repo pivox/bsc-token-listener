@@ -70,6 +70,14 @@ export class SessionRepository {
     return result.rows.map((row) => parseJson<TokenSession>(row.payload));
   }
 
+  async loadHolding(): Promise<TokenSession[]> {
+    const result = await this.database.query<{ payload: unknown }>(
+      `SELECT payload FROM token_sessions
+       WHERE status = 'HOLDING'`,
+    );
+    return result.rows.map((row) => parseJson<TokenSession>(row.payload));
+  }
+
   async findByPair(pair: Address): Promise<TokenSession | null> {
     const result = await this.database.query<{ payload: unknown }>(
       'SELECT payload FROM token_sessions WHERE pair_address = $1',

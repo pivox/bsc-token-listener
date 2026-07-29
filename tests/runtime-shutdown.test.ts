@@ -44,6 +44,12 @@ test('désactive les nouvelles passes monitor et draine celles lancées autour d
     stopRecovery: async () => {
       events.push('recovery');
     },
+    stopPositionExits: () => {
+      events.push('exit-stop');
+    },
+    waitForPositionExitIdle: async () => {
+      events.push('exit-idle');
+    },
     waitForMonitorIdle: async () => {
       monitorIdleCalls += 1;
       events.push(`monitor-${monitorIdleCalls}`);
@@ -62,7 +68,13 @@ test('désactive les nouvelles passes monitor et draine celles lancées autour d
   });
 
   await firstMonitorStarted.promise;
-  assert.deepEqual(events, ['disabled', 'recovery', 'monitor-1']);
+  assert.deepEqual(events, [
+    'disabled',
+    'exit-stop',
+    'recovery',
+    'exit-idle',
+    'monitor-1',
+  ]);
   firstMonitorGate.resolve();
   await canonicalStarted.promise;
   pairChunkGate.resolve();
@@ -71,10 +83,13 @@ test('désactive les nouvelles passes monitor et draine celles lancées autour d
 
   assert.deepEqual(events, [
     'disabled',
+    'exit-stop',
     'recovery',
+    'exit-idle',
     'monitor-1',
     'canonical-start',
     'pair-finished',
+    'exit-idle',
     'monitor-2',
   ]);
   assert.equal(monitorRuns, 0);

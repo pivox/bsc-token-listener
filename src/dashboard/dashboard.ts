@@ -27,6 +27,8 @@ import {
 import { canManuallySell } from './action-policy.js';
 import { HeartbeatService, type ChainHealth } from '../heartbeat/heartbeat.js';
 import { renderDashboardPage } from './dashboard.page.js';
+import type { PositionExitSettingsProvider } from '../strategy/position-exit-settings.provider.js';
+import type { PositionExitSettings } from '../strategy/position-exit-settings.js';
 
 const OPEN_STATUSES = new Set<SessionStatus>([
   'BUY_PENDING',
@@ -150,6 +152,7 @@ interface DashboardTokenView {
     sellTaxAppliedBps: number | null;
     error: string | null;
   } | null;
+  positionExit: PositionExitView | null;
   exit: {
     mode: 'dry-run' | 'live';
     amountInToken: string;
@@ -178,6 +181,25 @@ interface DashboardTokenView {
     entryTransaction: string | null;
     exitTransaction: string | null;
   };
+}
+
+export interface PositionExitView {
+  nextEvaluationAt: string | null;
+  remainingHoldingSeconds: number | null;
+  netValueBnb: string | null;
+  economicPnlPercent: string | null;
+  referenceLiquidityBnb: string | null;
+  currentLiquidityBnb: string | null;
+  stopLossPercent: string;
+  takeProfitPercent: string;
+  trailingEnabled: boolean;
+  trailingArmed: boolean;
+  peakNetValueBnb: string | null;
+  lastProbeStatus: 'SAFE' | 'BLOCKED' | 'UNKNOWN' | null;
+  lastProbeAt: string | null;
+  lastReason: string | null;
+  staleReason: string | null;
+  settingsRevision: number | null;
 }
 
 interface DashboardSnapshot {
@@ -267,6 +289,61 @@ function formatBasisPoints(value: number | null): string | null {
   const sign = value < 0 ? '-' : '';
   const absolute = Math.abs(value);
   return `${sign}${Math.trunc(absolute / 100)}.${String(absolute % 100).padStart(2, '0')}`;
+}
+
+export function buildPositionExitView(
+  session: TokenSession,
+  settings: Readonly<PositionExitSettings>,
+  nowMs: number,
+): PositionExitView | null {
+  if (!session.entry || session.exit) return null;
+  const state = session.exitPolicy;
+  const entryCost =
+    session.entry.amountInWei + (session.entry.gasCostWei ?? 0n);
+  const economicPnl = state?.latestNetValueWei === undefined
+    ? null
+    : calculatePnl(entryCost, state.latestNetValueWei);
+  const closesAt =
+    session.entry.confirmedAtMs + settings.maxHoldingMinutes * 60_000;
+  return {
+    nextEvaluationAt:
+      state?.nextEvaluationAtMs === undefined
+        ? null
+        : isoDate(state.nextEvaluationAtMs),
+    remainingHoldingSeconds: Math.max(
+      0,
+      Math.ceil((closesAt - nowMs) / 1_000),
+    ),
+    netValueBnb:
+      state?.latestNetValueWei === undefined
+        ? null
+        : formatEther(state.latestNetValueWei),
+    economicPnlPercent: economicPnl?.percentage ?? null,
+    referenceLiquidityBnb:
+      state?.referenceLiquidityWbnbWei === undefined
+        ? null
+        : formatEther(state.referenceLiquidityWbnbWei),
+    currentLiquidityBnb:
+      state?.currentLiquidityWbnbWei === undefined
+        ? null
+        : formatEther(state.currentLiquidityWbnbWei),
+    stopLossPercent: `-${formatBasisPoints(settings.stopLossBps) ?? '0.00'}`,
+    takeProfitPercent: formatBasisPoints(settings.takeProfitBps) ?? '0.00',
+    trailingEnabled: settings.trailingEnabled,
+    trailingArmed: state?.trailingArmedAtMs !== undefined,
+    peakNetValueBnb:
+      state?.peakNetValueWei === undefined
+        ? null
+        : formatEther(state.peakNetValueWei),
+    lastProbeStatus: state?.lastProbeStatus ?? null,
+    lastProbeAt:
+      state?.lastProbeAtMs === undefined
+        ? null
+        : isoDate(state.lastProbeAtMs),
+    lastReason: state?.lastReason ?? null,
+    staleReason: state?.staleReason ?? null,
+    settingsRevision: state?.settingsRevision ?? null,
+  };
 }
 
 function explorerUrl(path: string): string {
@@ -458,6 +535,17 @@ export class DashboardService {
   constructor(
     private readonly repository: DashboardRepository,
     private readonly heartbeatService: HeartbeatService,
+    private readonly positionExitSettings: Pick<
+      PositionExitSettingsProvider,
+      'get'
+    > = {
+      get: async () => ({
+        settings: config.positionExitSettings,
+        revision: 0,
+        source: 'ENV',
+        updatedAt: null,
+      }),
+    },
   ) {}
 
   async getSnapshot(): Promise<DashboardSnapshot> {
@@ -489,12 +577,18 @@ export class DashboardService {
   }
 
   private async buildSnapshot(): Promise<DashboardSnapshot> {
-    const [records, counters, walletBalanceWei] = await Promise.all([
+    const [records, counters, walletBalanceWei, effectiveExitSettings] = await Promise.all([
       this.repository.listTokens(config.dashboardMaxRows),
       this.repository.getCounters(),
       this.readWalletBalance(),
+      this.positionExitSettings.get(),
     ]);
-    const tokens = await Promise.all(records.map((record) => this.toTokenView(record)));
+    const nowMs = Date.now();
+    const tokens = await Promise.all(
+      records.map((record) =>
+        this.toTokenView(record, effectiveExitSettings.settings, nowMs)
+      ),
+    );
     const openTokens = tokens.filter((token) =>
       token.entry !== null && token.exit === null && token.status !== 'DISCOVERED'
       && OPEN_STATUSES.has(token.status),
@@ -537,7 +631,11 @@ export class DashboardService {
     };
   }
 
-  private async toTokenView(record: DashboardRecord): Promise<DashboardTokenView> {
+  private async toTokenView(
+    record: DashboardRecord,
+    exitSettings: Readonly<PositionExitSettings>,
+    nowMs: number,
+  ): Promise<DashboardTokenView> {
     const session = record.session;
     const status = session?.status ?? 'DISCOVERED';
     const metadata = session?.metadata ?? record.metadata;
@@ -624,6 +722,9 @@ export class DashboardService {
           sellTaxAppliedBps: quote?.sellTaxAppliedBps ?? null,
           error: valuationError,
         }
+        : null,
+      positionExit: session
+        ? buildPositionExitView(session, exitSettings, nowMs)
         : null,
       exit: exit
         ? {
