@@ -1,13 +1,13 @@
 import type { Address, Hash } from 'viem';
 import { pancakePairAbi } from '../abi/pancake-pair.abi.js';
+import type { ConfirmedRangeRequest } from '../chain/canonical-chain.types.js';
 import { config } from '../config/env.js';
 import { publicClient, wsClient } from '../rpc/clients.js';
-import { CheckpointRepository } from '../storage/repositories.js';
+import type { CheckpointRepository } from '../storage/repositories.js';
 import { classifySwap } from '../strategy/swap-classifier.js';
-import { SessionEngine } from '../strategy/session-engine.js';
+import type { SessionEngine } from '../strategy/session-engine.js';
 import { isSessionMonitorable } from '../strategy/session-monitor-policy.js';
-import type { TokenSession } from '../types/domain.js';
-import { errorMessage } from '../utils/error.js';
+import type { SwapEvent, TokenSession } from '../types/domain.js';
 import { logger } from '../utils/logger.js';
 
 interface SwapLog {
@@ -26,51 +26,179 @@ interface SwapLog {
   logIndex: number | null;
 }
 
+function assertSwapLogIdentity(
+  log: SwapLog,
+): asserts log is SwapLog & {
+  blockNumber: bigint;
+  blockHash: Hash;
+  transactionHash: Hash;
+  transactionIndex: number;
+  logIndex: number;
+} {
+  if (typeof log.blockNumber !== 'bigint') {
+    throw new Error('Log Swap HTTP confirmé invalide: blockNumber absent.');
+  }
+  if (!log.blockHash) {
+    throw new Error('Log Swap HTTP confirmé invalide: blockHash absent.');
+  }
+  if (!log.transactionHash) {
+    throw new Error(
+      'Log Swap HTTP confirmé invalide: transactionHash absent.',
+    );
+  }
+  if (
+    !Number.isSafeInteger(log.transactionIndex)
+    || (log.transactionIndex ?? -1) < 0
+  ) {
+    throw new Error(
+      'Log Swap HTTP confirmé invalide: transactionIndex absent.',
+    );
+  }
+  if (!Number.isSafeInteger(log.logIndex) || (log.logIndex ?? -1) < 0) {
+    throw new Error('Log Swap HTTP confirmé invalide: logIndex absent.');
+  }
+}
+
+interface ListenerWatcher {
+  watchContractEvent(options: {
+    address: Address;
+    abi: readonly unknown[];
+    eventName: string;
+    onLogs(logs: readonly unknown[]): void;
+    onError(error: unknown): void;
+  }): () => void;
+}
+
+interface SwapLogReader {
+  getContractEvents(options: {
+    address: Address;
+    abi: readonly unknown[];
+    eventName: string;
+    fromBlock: bigint;
+    toBlock: bigint;
+  }): Promise<readonly unknown[]>;
+}
+
+interface ConfirmedRangeCoordinator {
+  reconcile(request: ConfirmedRangeRequest): Promise<void>;
+}
+
+interface SwapEngine {
+  onSwap(session: TokenSession, event: SwapEvent): Promise<boolean>;
+  expireIfNeeded(session: TokenSession): Promise<boolean>;
+  isTerminal(session: TokenSession): boolean;
+}
+
+export interface SwapListenerDependencies {
+  watcher: ListenerWatcher;
+  logReader: SwapLogReader;
+  coordinator: ConfirmedRangeCoordinator;
+  reconcileIntervalMs?: number;
+}
+
+const missingCoordinator: ConfirmedRangeCoordinator = {
+  reconcile: async () => {
+    throw new Error(
+      'CanonicalChainCoordinator requis pour ingérer les événements confirmés.',
+    );
+  },
+};
+
+const defaultDependencies: SwapListenerDependencies = {
+  watcher: wsClient as unknown as ListenerWatcher,
+  logReader: publicClient as unknown as SwapLogReader,
+  coordinator: missingCoordinator,
+};
+
+function safeErrorType(error: unknown): string {
+  if (!(error instanceof Error)) return typeof error;
+  return error.name !== 'Error' ? error.name : error.constructor.name;
+}
+
 export class SwapListener {
+  private readonly engine: SwapEngine;
+  private readonly onTerminal: (pair: Address) => void;
+  private readonly dependencies: SwapListenerDependencies;
   private stopWatch?: () => void;
   private interval?: NodeJS.Timeout;
-  private running = false;
+  private reconciliation: Promise<void> | null = null;
+  private reconcilePending = false;
   private stopped = false;
+  private terminalNotified = false;
   private readonly inFlight = new Set<Promise<unknown>>();
 
   constructor(
+    session: TokenSession,
+    checkpoints: CheckpointRepository,
+    engine: SessionEngine,
+    onTerminal: (pair: Address) => void,
+  );
+  constructor(
+    session: TokenSession,
+    engine: SwapEngine,
+    onTerminal: (pair: Address) => void,
+    dependencies: SwapListenerDependencies,
+  );
+  constructor(
     private readonly session: TokenSession,
-    private readonly checkpoints: CheckpointRepository,
-    private readonly engine: SessionEngine,
-    private readonly onTerminal: (pair: Address) => void,
-  ) {}
+    second: CheckpointRepository | SwapEngine,
+    third: SessionEngine | ((pair: Address) => void),
+    fourth: ((pair: Address) => void) | SwapListenerDependencies,
+  ) {
+    if (typeof third === 'function') {
+      this.engine = second as SwapEngine;
+      this.onTerminal = third;
+      this.dependencies = fourth as SwapListenerDependencies;
+      return;
+    }
+    void second;
+    this.engine = third;
+    this.onTerminal = fourth as (pair: Address) => void;
+    this.dependencies = defaultDependencies;
+  }
 
   async start(): Promise<void> {
-    this.stopWatch = wsClient.watchContractEvent({
+    this.stopped = false;
+    this.terminalNotified = false;
+    this.stopWatch = this.dependencies.watcher.watchContractEvent({
       address: this.session.pair.pair,
       abi: pancakePairAbi,
       eventName: 'Swap',
-      onLogs: (logs: unknown[]) => {
+      onLogs: () => {
         if (this.stopped) return;
-        void this.track(this.processLogs(logs as SwapLog[])).catch((error: unknown) =>
+        void this.requestReconcile().catch((error: unknown) =>
           logger.error(
-            { pair: this.session.pair.pair, error: errorMessage(error) },
-            'Erreur Swap WebSocket.',
+            {
+              pair: this.session.pair.pair,
+              errorType: safeErrorType(error),
+            },
+            'Réconciliation Swap déclenchée par WebSocket échouée.',
           ),
         );
       },
       onError: (error: unknown) => logger.error(
-        { pair: this.session.pair.pair, error: errorMessage(error) },
+        {
+          pair: this.session.pair.pair,
+          errorType: safeErrorType(error),
+        },
         'WebSocket Swap en erreur.',
       ),
     });
 
-    await this.track(this.reconcile());
+    await this.requestReconcile();
     if (this.stopped || !isSessionMonitorable(this.session)) return;
     this.interval = setInterval(() => {
       if (this.stopped) return;
       void this.track(this.tick()).catch((error: unknown) =>
         logger.error(
-          { pair: this.session.pair.pair, error: errorMessage(error) },
+          {
+            pair: this.session.pair.pair,
+            errorType: safeErrorType(error),
+          },
           'Réconciliation Swap échouée.',
         ),
       );
-    }, config.reconcileSeconds * 1000);
+    }, this.dependencies.reconcileIntervalMs ?? config.reconcileSeconds * 1_000);
 
     logger.info(
       {
@@ -97,65 +225,83 @@ export class SwapListener {
 
   private async tick(): Promise<void> {
     if (await this.engine.expireIfNeeded(this.session)) {
-      this.stop();
-      this.onTerminal(this.session.pair.pair);
+      this.stopAndNotifyTerminal();
       return;
     }
-    await this.reconcile();
+    await this.requestReconcile();
     if (this.engine.isTerminal(this.session)) {
-      this.stop();
-      this.onTerminal(this.session.pair.pair);
+      this.stopAndNotifyTerminal();
     }
   }
 
-  private async reconcile(): Promise<void> {
-    if (this.running) return;
-    this.running = true;
-    const key = `swap:${this.session.pair.pair.toLowerCase()}`;
-    try {
-      const latest = await publicClient.getBlockNumber();
-      const stored = await this.checkpoints.get(key);
-      let fromBlock = stored === null
-        ? this.session.pair.createdBlock
-        : stored.blockNumber + 1n;
-      const chunk = 1_500n;
-      while (fromBlock <= latest) {
-        const toBlock = fromBlock + chunk - 1n > latest ? latest : fromBlock + chunk - 1n;
-        const logs = await publicClient.getContractEvents({
-          address: this.session.pair.pair,
-          abi: pancakePairAbi,
-          eventName: 'Swap',
-          fromBlock,
-          toBlock,
-        });
-        const remainsActive = await this.processLogs(logs as SwapLog[]);
-        if (!remainsActive) return;
-        const block = await publicClient.getBlock({ blockNumber: toBlock });
-        await this.checkpoints.set(key, {
-          blockNumber: toBlock,
-          blockHash: block.hash,
-        });
-        fromBlock = toBlock + 1n;
-      }
-    } finally {
-      this.running = false;
+  private requestReconcile(): Promise<void> {
+    if (this.stopped) return Promise.resolve();
+    if (this.reconciliation) {
+      this.reconcilePending = true;
+      return this.reconciliation;
     }
+
+    const execution = (async () => {
+      let firstFailure: unknown;
+      let failed = false;
+      do {
+        this.reconcilePending = false;
+        try {
+          await this.dependencies.coordinator.reconcile({
+            listenerKey: `swap:${this.session.pair.pair.toLowerCase()}`,
+            startBlock: this.session.pair.createdBlock,
+            processChunk: (fromBlock, toBlock) =>
+              this.processChunk(fromBlock, toBlock),
+          });
+        } catch (error) {
+          if (!failed) firstFailure = error;
+          failed = true;
+        }
+      } while (this.reconcilePending && !this.stopped);
+      if (failed) throw firstFailure;
+    })();
+    const tracked = this.track(execution);
+    this.reconciliation = tracked.finally(() => {
+      this.reconciliation = null;
+    });
+    return this.reconciliation;
+  }
+
+  private async processChunk(
+    fromBlock: bigint,
+    toBlock: bigint,
+  ): Promise<boolean> {
+    const logs = await this.dependencies.logReader.getContractEvents({
+      address: this.session.pair.pair,
+      abi: pancakePairAbi,
+      eventName: 'Swap',
+      fromBlock,
+      toBlock,
+    });
+    return this.processLogs(logs as SwapLog[]);
   }
 
   private async processLogs(logs: SwapLog[]): Promise<boolean> {
-    const sorted = [...logs].sort((a, b) => {
-      if (a.blockNumber !== b.blockNumber) return (a.blockNumber ?? 0n) < (b.blockNumber ?? 0n) ? -1 : 1;
-      if (a.transactionIndex !== b.transactionIndex) return (a.transactionIndex ?? 0) - (b.transactionIndex ?? 0);
-      return (a.logIndex ?? 0) - (b.logIndex ?? 0);
+    const identified = logs.map((log) => {
+      assertSwapLogIdentity(log);
+      return log;
+    });
+    const sorted = [...identified].sort((a, b) => {
+      if (a.blockNumber !== b.blockNumber) {
+        return a.blockNumber < b.blockNumber ? -1 : 1;
+      }
+      if (a.transactionIndex !== b.transactionIndex) {
+        return a.transactionIndex - b.transactionIndex;
+      }
+      return a.logIndex - b.logIndex;
     });
 
     for (const log of sorted) {
       const args = log.args;
       if (
-        !args.sender || !args.to ||
-        args.amount0In === undefined || args.amount1In === undefined ||
-        args.amount0Out === undefined || args.amount1Out === undefined ||
-        log.blockNumber === null || !log.blockHash || !log.transactionHash
+        !args.sender || !args.to
+        || args.amount0In === undefined || args.amount1In === undefined
+        || args.amount0Out === undefined || args.amount1Out === undefined
       ) continue;
 
       const event = classifySwap(this.session.pair, {
@@ -163,8 +309,8 @@ export class SwapListener {
         transactionHash: log.transactionHash,
         blockHash: log.blockHash,
         blockNumber: log.blockNumber,
-        transactionIndex: log.transactionIndex ?? 0,
-        logIndex: log.logIndex ?? 0,
+        transactionIndex: log.transactionIndex,
+        logIndex: log.logIndex,
         sender: args.sender,
         recipient: args.to,
         amount0In: args.amount0In,
@@ -173,18 +319,19 @@ export class SwapListener {
         amount1Out: args.amount1Out,
       });
       const consumed = await this.engine.onSwap(this.session, event);
-      if (!consumed) {
-        this.stop();
-        this.onTerminal(this.session.pair.pair);
-        return false;
-      }
-      if (!isSessionMonitorable(this.session)) {
-        this.stop();
-        this.onTerminal(this.session.pair.pair);
+      if (!consumed || !isSessionMonitorable(this.session)) {
+        this.stopAndNotifyTerminal();
         return false;
       }
     }
     return true;
+  }
+
+  private stopAndNotifyTerminal(): void {
+    this.stop();
+    if (this.terminalNotified) return;
+    this.terminalNotified = true;
+    this.onTerminal(this.session.pair.pair);
   }
 
   private track<T>(operation: Promise<T>): Promise<T> {
