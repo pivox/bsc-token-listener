@@ -15,10 +15,12 @@ import { logger } from '../utils/logger.js';
 import { DashboardActionService } from './dashboard-action.service.js';
 import { DashboardService } from './dashboard.js';
 import { renderDashboardPage } from './dashboard.page.js';
+import { injectExitPolicyControls } from './exit-policy-controls.js';
+import type { ExitPolicyDashboardService } from './exit-policy.service.js';
 
 const RISK_CONFIRMATION = 'I_UNDERSTAND_UNKNOWN_RISK';
 const LIVE_ACTION_CONFIRMATION = 'I_UNDERSTAND_UI_CAN_SELL_REAL_FUNDS';
-const MAX_BODY_BYTES = 4_096;
+const MAX_BODY_BYTES = 16_384;
 
 function isLoopbackHost(host: string): boolean {
   return ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(host.toLowerCase());
@@ -282,6 +284,7 @@ export class ActionDashboardServer {
     private readonly service: DashboardService,
     private readonly riskSettings: RiskSettingsStore,
     private readonly actions: DashboardActionService,
+    private readonly exitPolicy: ExitPolicyDashboardService | null = null,
   ) {}
 
   async start(): Promise<void> {
@@ -350,6 +353,41 @@ export class ActionDashboardServer {
         });
         return;
       }
+      if (
+        method === 'GET' &&
+        pathname === '/api/dashboard/exit-policy' &&
+        this.exitPolicy
+      ) {
+        this.sendJson(response, 200, {
+          view: await this.exitPolicy.get(),
+          writable: this.actionsWritable,
+        });
+        return;
+      }
+      if (
+        method === 'POST' &&
+        pathname === '/api/dashboard/exit-policy/preview' &&
+        this.exitPolicy
+      ) {
+        await this.previewExitPolicy(request, response);
+        return;
+      }
+      if (
+        method === 'PUT' &&
+        pathname === '/api/dashboard/exit-policy' &&
+        this.exitPolicy
+      ) {
+        await this.updateExitPolicy(request, response);
+        return;
+      }
+      if (
+        method === 'DELETE' &&
+        pathname === '/api/dashboard/exit-policy' &&
+        this.exitPolicy
+      ) {
+        await this.resetExitPolicy(request, response);
+        return;
+      }
       if (method === 'POST' && pathname === '/api/dashboard/risk-settings') {
         await this.updateRiskSettings(request, response);
         return;
@@ -386,8 +424,8 @@ export class ActionDashboardServer {
         this.sendPage(response);
         return;
       }
-      if (method !== 'GET' && method !== 'POST') {
-        this.sendJson(response, 405, { error: 'Méthode non autorisée.' }, { Allow: 'GET, POST' });
+      if (!['GET', 'POST', 'PUT', 'DELETE'].includes(method)) {
+        this.sendJson(response, 405, { error: 'Méthode non autorisée.' }, { Allow: 'GET, POST, PUT, DELETE' });
         return;
       }
       this.sendJson(response, 404, { error: 'Ressource introuvable.' });
@@ -397,6 +435,105 @@ export class ActionDashboardServer {
         this.sendJson(response, 500, { error: 'Le dashboard ne peut pas traiter la requête.' });
       } else response.end();
     }
+  }
+
+  private async previewExitPolicy(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    if (!this.exitPolicy || !this.validateLocalJsonRequest(request, response)) {
+      return;
+    }
+    const payload = await this.readJsonBody(request) as {
+      settings?: unknown;
+      expectedRevision?: unknown;
+    };
+    try {
+      const preview = await this.exitPolicy.preview(
+        payload.settings,
+        Number(payload.expectedRevision),
+      );
+      this.sendJson(response, 200, preview);
+    } catch (error) {
+      this.sendExitPolicyError(response, error);
+    }
+  }
+
+  private async updateExitPolicy(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    if (!this.exitPolicy || !this.validateWritableRequest(request, response)) {
+      return;
+    }
+    if (
+      request.headers['x-exit-policy-confirmation'] !== 'APPLY_EXIT_POLICY'
+    ) {
+      this.sendJson(response, 400, {
+        error: 'Confirmation explicite APPLY_EXIT_POLICY requise.',
+      });
+      return;
+    }
+    const payload = await this.readJsonBody(request) as {
+      settings?: unknown;
+      expectedRevision?: unknown;
+    };
+    try {
+      const view = await this.exitPolicy.update(
+        payload.settings,
+        Number(payload.expectedRevision),
+      );
+      this.service.invalidate();
+      logger.warn(
+        { revision: view.revision },
+        'Politique de sortie modifiée depuis le dashboard local.',
+      );
+      this.sendJson(response, 200, { view, writable: true });
+    } catch (error) {
+      this.sendExitPolicyError(response, error);
+    }
+  }
+
+  private async resetExitPolicy(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    if (!this.exitPolicy || !this.validateWritableRequest(request, response)) {
+      return;
+    }
+    if (
+      request.headers['x-exit-policy-confirmation'] !== 'RESET_EXIT_POLICY'
+    ) {
+      this.sendJson(response, 400, {
+        error: 'Confirmation explicite RESET_EXIT_POLICY requise.',
+      });
+      return;
+    }
+    const payload = await this.readJsonBody(request) as {
+      expectedRevision?: unknown;
+    };
+    try {
+      const view = await this.exitPolicy.reset(
+        Number(payload.expectedRevision),
+      );
+      this.service.invalidate();
+      logger.warn(
+        'Politique de sortie restaurée depuis les valeurs environnement.',
+      );
+      this.sendJson(response, 200, { view, writable: true });
+    } catch (error) {
+      this.sendExitPolicyError(response, error);
+    }
+  }
+
+  private sendExitPolicyError(
+    response: ServerResponse,
+    error: unknown,
+  ): void {
+    const message = errorMessage(error);
+    this.sendJson(response, /révision/iu.test(message) ? 409 : 400, {
+      error: message,
+    });
   }
 
   private async executeAssetAction(
@@ -518,10 +655,13 @@ export class ActionDashboardServer {
       'X-Frame-Options': 'DENY',
       'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
     });
-    response.end(injectControls(
-      renderDashboardPage(nonce, config.dashboardRefreshSeconds),
+    response.end(injectExitPolicyControls(
+      injectControls(
+        renderDashboardPage(nonce, config.dashboardRefreshSeconds),
+        nonce,
+        config.riskMinScore,
+      ),
       nonce,
-      config.riskMinScore,
     ));
   }
 

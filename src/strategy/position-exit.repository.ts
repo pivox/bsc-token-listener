@@ -185,6 +185,10 @@ export class PositionExitRepository implements PositionExitSettingsStore {
     const client = await this.database.connect();
     try {
       await client.query('BEGIN');
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtext($1))',
+        [SETTING_KEY],
+      );
       const current = await client.query<SettingsRow>(
         `SELECT revision, setting_value, updated_at
          FROM strategy_settings WHERE setting_key = $1 FOR UPDATE`,
@@ -197,7 +201,18 @@ export class PositionExitRepository implements PositionExitSettingsStore {
           `Conflit de révision: attendu ${expectedRevision}, courant ${revision}.`,
         );
       }
-      const nextRevision = revision + 1;
+      const auditRevision = previous
+        ? revision
+        : Number(
+            (
+              await client.query<{ revision: string }>(
+                `SELECT COALESCE(MAX(revision), 0)::text AS revision
+                 FROM strategy_settings_audit WHERE setting_key = $1`,
+                [SETTING_KEY],
+              )
+            ).rows[0]?.revision ?? '0',
+          );
+      const nextRevision = auditRevision + 1;
       const saved = await client.query<SettingsRow>(
         `INSERT INTO strategy_settings(
            setting_key, revision, setting_value, created_at, updated_at
@@ -247,6 +262,10 @@ export class PositionExitRepository implements PositionExitSettingsStore {
     const client = await this.database.connect();
     try {
       await client.query('BEGIN');
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtext($1))',
+        [SETTING_KEY],
+      );
       const current = await client.query<SettingsRow>(
         `SELECT revision, setting_value, updated_at
          FROM strategy_settings WHERE setting_key = $1 FOR UPDATE`,
@@ -258,6 +277,15 @@ export class PositionExitRepository implements PositionExitSettingsStore {
         throw new Error(
           `Conflit de révision: attendu ${expectedRevision}, courant ${revision}.`,
         );
+      }
+      if (!previous) {
+        await client.query('COMMIT');
+        return {
+          settings: parsedDefaults,
+          revision: 0,
+          source: 'ENV',
+          updatedAt: null,
+        };
       }
       await client.query(
         `INSERT INTO strategy_settings_audit(

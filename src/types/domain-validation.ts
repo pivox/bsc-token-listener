@@ -154,6 +154,7 @@ const EXIT_POLICY_KEYS = new Set([
   'trailingArmedAtMs',
   'lastProbeStatus',
   'lastSellTaxBps',
+  'lastEstimatedExitGasWei',
   'pendingDecisionId',
   'lastPrimaryRule',
   'lastReason',
@@ -192,6 +193,7 @@ function exitPolicyState(value: unknown): boolean {
     && optional(candidate, 'lastSellTaxBps', (item) =>
       integer(item) && (item as number) <= 10_000
     )
+    && optional(candidate, 'lastEstimatedExitGasWei', bigint)
     && optional(candidate, 'pendingDecisionId', (item) =>
       typeof item === 'string' && item.length > 0
     )

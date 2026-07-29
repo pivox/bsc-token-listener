@@ -13,6 +13,7 @@ import { chain } from './config/chain.js';
 import { config } from './config/env.js';
 import { ActionDashboardServer } from './dashboard/action-dashboard.js';
 import { DashboardActionService } from './dashboard/dashboard-action.service.js';
+import { ExitPolicyDashboardService } from './dashboard/exit-policy.service.js';
 import {
   DashboardRepository,
   DashboardService,
@@ -308,6 +309,11 @@ async function main(): Promise<void> {
     (token) => activeSessionsByToken.get(token.toLowerCase()) ?? null,
     (pair) => stopMonitor(pair),
   );
+  const exitPolicyDashboard = new ExitPolicyDashboardService(
+    positionExitSettings,
+    sessions,
+    config.positionExitSettings,
+  );
   const dashboard = config.dashboardEnabled
     ? new ActionDashboardServer(
       new DashboardService(
@@ -317,6 +323,7 @@ async function main(): Promise<void> {
       ),
       riskSettings,
       dashboardActions,
+      exitPolicyDashboard,
     )
     : null;
 

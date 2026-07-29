@@ -52,6 +52,7 @@ export function evaluatePositionExit(
     nextEvaluationAtMs: input.nowMs + settings.monitorIntervalSeconds * 1_000,
     lastProbeStatus: metrics.probeStatus,
     lastSellTaxBps: metrics.sellTaxBps,
+    lastEstimatedExitGasWei: metrics.estimatedExitGasWei,
   };
   delete state.staleReason;
 
