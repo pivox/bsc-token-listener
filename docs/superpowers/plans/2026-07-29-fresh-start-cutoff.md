@@ -1187,10 +1187,11 @@ sessions, decisions, checkpoints, canonical blocks and fresh-start runs.
 
 Run two repository instances concurrently with the same cutoff. Assert:
 
-- both operations complete serially;
-- two immutable run rows exist;
-- no session or decision is counted twice as changed;
-- the latest cutoff remains correct.
+- exactly one operation succeeds and retains the session-level runtime lock;
+- the other operation refuses to start without mutating any table;
+- closing the first repository releases the lock;
+- a later launch can then apply a monotonic cutoff without counting an already
+  quarantined session or decision twice.
 
 Then apply a strictly newer cutoff and assert it wins. Attempt an older cutoff
 and a same-height different hash; both must reject without mutation.

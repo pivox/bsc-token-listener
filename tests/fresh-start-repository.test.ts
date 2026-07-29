@@ -34,12 +34,16 @@ test('la migration fresh-start est idempotente et bigint-safe', async () => {
 
 test('applique session, décision, checkpoints, journal et audit dans une transaction', async () => {
   const calls: Array<{ sql: string; values?: unknown[] }> = [];
+  let releases = 0;
   const client = {
     query: async <T = Record<string, unknown>>(
       sql: string,
       values?: unknown[],
     ): Promise<{ rows: T[] }> => {
       calls.push(values === undefined ? { sql } : { sql, values });
+      if (sql.includes('pg_try_advisory_lock')) {
+        return { rows: [{ locked: true }] as T[] };
+      }
       if (sql.includes('UPDATE token_sessions')) {
         return { rows: [{ pair_address: '0x1' }] as T[] };
       }
@@ -61,7 +65,9 @@ test('applique session, décision, checkpoints, journal et audit dans une transa
       }
       return { rows: [] as T[] };
     },
-    release(): void {},
+    release(): void {
+      releases += 1;
+    },
   };
   const repository = new FreshStartRepository({
     connect: async () => client,
@@ -90,6 +96,12 @@ test('applique session, décision, checkpoints, journal et audit dans une transa
   );
   assert.ok(calls.some(({ sql }) => /DELETE FROM canonical_blocks/u.test(sql)));
   assert.ok(calls.some(({ sql }) => /INSERT INTO fresh_start_runs/u.test(sql)));
+  assert.equal(releases, 0);
+
+  await repository.close();
+
+  assert.equal(releases, 1);
+  assert.ok(calls.some(({ sql }) => /pg_advisory_unlock/u.test(sql)));
 });
 
 test('rollback toute la transaction si une étape échoue', async () => {
@@ -98,6 +110,9 @@ test('rollback toute la transaction si une étape échoue', async () => {
     connect: async () => ({
       query: async <T>(sql: string): Promise<{ rows: T[] }> => {
         calls.push(sql);
+        if (sql.includes('pg_try_advisory_lock')) {
+          return { rows: [{ locked: true }] as T[] };
+        }
         if (sql.includes('UPDATE position_exit_decisions')) {
           throw new Error('decision update failed');
         }
@@ -116,4 +131,33 @@ test('rollback toute la transaction si une étape échoue', async () => {
   );
   assert.equal(calls.includes('ROLLBACK'), true);
   assert.equal(calls.includes('COMMIT'), false);
+});
+
+test('refuse une seconde instance tant que le verrou runtime est détenu', async () => {
+  const calls: string[] = [];
+  let releases = 0;
+  const repository = new FreshStartRepository({
+    connect: async () => ({
+      query: async <T>(sql: string): Promise<{ rows: T[] }> => {
+        calls.push(sql);
+        if (sql.includes('pg_try_advisory_lock')) {
+          return { rows: [{ locked: false }] as T[] };
+        }
+        throw new Error(`requête inattendue: ${sql}`);
+      },
+      release(): void {
+        releases += 1;
+      },
+    }),
+  });
+
+  await assert.rejects(
+    repository.apply(
+      { number: 10n, hash: HASH, parentHash: PARENT_HASH },
+      1,
+    ),
+    /instance.*déjà active/iu,
+  );
+  assert.equal(calls.includes('BEGIN'), false);
+  assert.equal(releases, 1);
 });

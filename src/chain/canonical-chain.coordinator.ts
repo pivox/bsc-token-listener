@@ -936,13 +936,6 @@ export class CanonicalChainCoordinator {
         ? await this.persistJournal(journalHeaders)
         : false;
       let checkpointPersisted = false;
-      if (needsCutoffAnchor && this.cutoff !== null) {
-        await this.setCheckpoint(request.listenerKey, {
-          blockNumber: this.cutoff.number,
-          blockHash: this.cutoff.hash,
-        });
-        checkpointPersisted = true;
-      }
       if (
         checkpoint?.blockHash === null
         && checkpoint.blockNumber <= head
@@ -962,6 +955,7 @@ export class CanonicalChainCoordinator {
 
       let chunkStart = fromBlock;
       let preparedChunk: CanonicalBlock[] = [];
+      let chunkAttempted = false;
       for await (const header of chunkHeaders.headers()) {
         preparedChunk.push(header);
         if (
@@ -985,6 +979,7 @@ export class CanonicalChainCoordinator {
         }
         const processChunk = () =>
           request.processChunk(chunkStart, header.number, canonicalHeaders);
+        chunkAttempted = true;
         const processed = this.runtimeBarrier
           ? await this.runtimeBarrier.runListener(processChunk)
           : await processChunk();
@@ -995,6 +990,17 @@ export class CanonicalChainCoordinator {
         });
         checkpointPersisted = true;
         chunkStart = header.number + 1n;
+      }
+      if (
+        needsCutoffAnchor
+        && this.cutoff !== null
+        && !chunkAttempted
+      ) {
+        await this.setCheckpoint(request.listenerKey, {
+          blockNumber: this.cutoff.number,
+          blockHash: this.cutoff.hash,
+        });
+        checkpointPersisted = true;
       }
 
       if (saved || checkpointPersisted) {

@@ -402,6 +402,33 @@ test('une erreur RPC ne persiste pas l’ancrage d’un checkpoint sous le cutof
   assert.deepEqual(checkpoints.writes, []);
 });
 
+test('une erreur RPC de logs ne persiste pas l’ancrage sous le cutoff', async () => {
+  const cutoff = block(100n);
+  const checkpoints = new MemoryCheckpoints();
+  checkpoints.values.set('pairs', {
+    blockNumber: 10n,
+    blockHash: hash(11n),
+  });
+  const subject = coordinator(
+    new MemoryBlockReader(110n),
+    new MemoryCanonicalStore([cutoff]),
+    checkpoints,
+    { cutoff },
+  );
+
+  await assert.rejects(
+    subject.reconcile({
+      listenerKey: 'pairs',
+      startBlock: 0n,
+      processChunk: async () => {
+        throw new Error('log RPC unavailable');
+      },
+    }),
+    /log RPC unavailable/u,
+  );
+  assert.deepEqual(checkpoints.writes, []);
+});
+
 test('passe en revue manuelle si une reorg traverse le cutoff', async () => {
   const cutoff = block(100n);
   const reader = new MemoryBlockReader(110n);

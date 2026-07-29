@@ -146,9 +146,9 @@ PostgreSQL. Les sessions mises en quarantaine sont exclues de la récupération
 périodique, même si elles conservent une référence d’exécution historique.
 
 Une erreur RPC pendant la lecture du head ou du header empêche entièrement le
-fresh-start : aucune session, décision ou checkpoint n’est alors modifié. Deux
-instances partageant PostgreSQL sérialisent l’opération avec un verrou
-transactionnel.
+fresh-start : aucune session, décision ou checkpoint n’est alors modifié. Le
+processus conserve un verrou PostgreSQL de session pendant toute sa durée de
+vie ; une seconde instance partageant la même base refuse de démarrer.
 
 ### Récupération pendant l’exécution courante
 

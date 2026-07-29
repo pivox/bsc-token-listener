@@ -204,12 +204,12 @@ test('quarantaine tous les états non terminaux et conserve les terminaux', asyn
     }
 
     const { FreshStartRepository } = await repository();
-    const result = await new FreshStartRepository(
-      scopedDatabase(schema),
-    ).apply(
+    const freshStart = new FreshStartRepository(scopedDatabase(schema));
+    const result = await freshStart.apply(
       { number: 100n, hash: HASH, parentHash: PARENT_HASH },
       1_000,
     );
+    await freshStart.close();
 
     assert.equal(result.quarantinedSessions, 6);
     const rows = await client.query<{
@@ -282,9 +282,9 @@ test('préserve bigint, décisions, checkpoints, journal et audit exacts', async
       parentHash: PARENT_HASH,
     };
     const { FreshStartRepository } = await repository();
-    const result = await new FreshStartRepository(
-      scopedDatabase(schema),
-    ).apply(cutoff, 2_000);
+    const freshStart = new FreshStartRepository(scopedDatabase(schema));
+    const result = await freshStart.apply(cutoff, 2_000);
+    await freshStart.close();
 
     assert.equal(result.cutoff.number, cutoff.number);
     assert.equal(result.quarantinedDecisions, 2);
@@ -417,7 +417,7 @@ test('rollback toutes les tables sur une erreur intermédiaire', async () => {
   });
 });
 
-test('sérialise les lancements et refuse les cutoffs régressifs', async () => {
+test('interdit deux runtimes et refuse les cutoffs régressifs', async () => {
   await withSchema('concurrency', async (client, schema) => {
     await insertSession(client, session('BUY_PENDING', 401));
     await insertDecision(
@@ -431,23 +431,42 @@ test('sérialise les lancements et refuse les cutoffs régressifs', async () => 
     const { FreshStartRepository } = await repository();
     const first = new FreshStartRepository(scopedDatabase(schema));
     const second = new FreshStartRepository(scopedDatabase(schema));
-    const concurrent = await Promise.all([
+    const concurrent = await Promise.allSettled([
       first.apply(cutoff, 4_000),
       second.apply(cutoff, 4_000),
     ]);
 
-    assert.deepEqual(
-      concurrent.map(({ quarantinedSessions }) => quarantinedSessions).sort(),
-      [0, 1],
+    assert.equal(
+      concurrent.filter(({ status }) => status === 'fulfilled').length,
+      1,
     );
-    assert.deepEqual(
-      concurrent.map(({ quarantinedDecisions }) => quarantinedDecisions).sort(),
-      [0, 1],
+    assert.equal(
+      concurrent.filter(({ status }) => status === 'rejected').length,
+      1,
     );
+    const activeIndex = concurrent.findIndex(
+      ({ status }) => status === 'fulfilled',
+    );
+    const active = activeIndex === 0 ? first : second;
+    const blocked = activeIndex === 0 ? second : first;
+    const successful = concurrent[activeIndex];
+    assert.ok(successful?.status === 'fulfilled');
+    assert.equal(successful.value.quarantinedSessions, 1);
+    assert.equal(successful.value.quarantinedDecisions, 1);
+    const rejected = concurrent.find(({ status }) => status === 'rejected');
+    assert.ok(rejected?.status === 'rejected');
+    assert.match(String(rejected.reason), /instance.*déjà active/iu);
+
     const runs = await client.query<{ count: string }>(
       'SELECT COUNT(*)::text AS count FROM fresh_start_runs',
     );
-    assert.equal(runs.rows[0]?.count, '2');
+    assert.equal(runs.rows[0]?.count, '1');
+
+    await active.close();
+    const restarted = await blocked.apply(cutoff, 4_500);
+    assert.equal(restarted.quarantinedSessions, 0);
+    assert.equal(restarted.quarantinedDecisions, 0);
+    await blocked.close();
 
     const newer = {
       number: 101n,
@@ -455,6 +474,7 @@ test('sérialise les lancements et refuse les cutoffs régressifs', async () => 
       parentHash: HASH,
     };
     await first.apply(newer, 3_000);
+    await first.close();
     const beforeRejected = await client.query<{
       cutoff_block_number: string;
       cutoff_block_hash: string;

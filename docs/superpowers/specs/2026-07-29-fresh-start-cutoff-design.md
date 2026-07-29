@@ -89,9 +89,11 @@ A dedicated `FreshStartService` owns the operation. It depends on:
 The RPC head and header are read before opening the database transaction. The
 returned number and hash are strictly validated.
 
-The repository then performs one PostgreSQL transaction:
+The repository first acquires a session-level PostgreSQL advisory lock that is
+retained for the entire bot lifetime. It then performs one PostgreSQL
+transaction:
 
-1. acquire a transaction-scoped advisory lock;
+1. acquire a transaction-scoped cutoff lock;
 2. ensure the candidate cutoff is not older than the latest committed cutoff;
 3. quarantine non-terminal sessions and update their JSON payloads consistently;
 4. quarantine recoverable position-exit decisions;
@@ -106,9 +108,11 @@ Any SQL failure rolls back sessions, decisions, checkpoints and the audit row
 together. A failure to read or validate the confirmed head happens before all
 database mutation.
 
-Two bot processes sharing PostgreSQL cannot apply overlapping cutoffs because
-of the advisory lock. After acquiring it, the later process rechecks the
-latest committed cutoff before writing.
+Two live bot processes cannot share PostgreSQL: the second startup fails while
+the first process retains the runtime lock. This prevents an older in-memory
+runtime from overwriting sessions or checkpoints after a newer cutoff. A clean
+shutdown explicitly releases the lock; a crash releases it with the PostgreSQL
+connection.
 
 ## 6. Ingestion boundary
 
@@ -200,7 +204,7 @@ sessions are not admitted to automatic pair monitoring.
 - `PENDING` and `EXECUTING` exit decisions become `MANUAL_REVIEW`;
 - session, decision, checkpoint and audit changes commit atomically;
 - an injected SQL failure leaves every table unchanged;
-- concurrent startup attempts serialize and retain monotonic cutoffs;
+- concurrent startup attempts allow one runtime and reject the other;
 - two successive launches create two audit rows and the newest cutoff wins;
 - large block numbers remain exact.
 

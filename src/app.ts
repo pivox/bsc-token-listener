@@ -75,6 +75,14 @@ import type { PairInfo, TokenSession } from './types/domain.js';
 import { errorMessage } from './utils/error.js';
 import { logger } from './utils/logger.js';
 
+let activeFreshStartRepository: FreshStartRepository | null = null;
+
+async function closeFreshStartRuntime(): Promise<void> {
+  const repository = activeFreshStartRepository;
+  activeFreshStartRepository = null;
+  await repository?.close();
+}
+
 async function main(): Promise<void> {
   const chainId = await publicClient.getChainId();
   if (chainId !== chain.id) {
@@ -120,9 +128,11 @@ async function main(): Promise<void> {
       };
     },
   };
+  const freshStartRepository = new FreshStartRepository();
+  activeFreshStartRepository = freshStartRepository;
   const freshStartService = new FreshStartService(
     canonicalBlockReader,
-    new FreshStartRepository(),
+    freshStartRepository,
     config.blockConfirmations,
   );
   const freshStartRun = await freshStartService.apply();
@@ -760,7 +770,10 @@ async function main(): Promise<void> {
       stopDashboard: async () => {
         await dashboard?.stop();
       },
-      closeDatabase,
+      closeDatabase: async () => {
+        await closeFreshStartRuntime();
+        await closeDatabase();
+      },
       onCleanupError: (error) => {
         logger.warn(
           { reason: errorMessage(error) },
@@ -866,6 +879,7 @@ async function main(): Promise<void> {
     } catch (error) {
       logger.warn({ reason: errorMessage(error) }, 'Arrêt du dashboard incomplet.');
     }
+    await closeFreshStartRuntime();
     await closeDatabase();
   };
 
@@ -873,7 +887,13 @@ async function main(): Promise<void> {
   process.once('SIGTERM', () => void shutdown('SIGTERM'));
 }
 
-main().catch((error: unknown) => {
+main().catch(async (error: unknown) => {
+  await closeFreshStartRuntime().catch((cleanupError: unknown) => {
+    logger.warn(
+      { reason: errorMessage(cleanupError) },
+      'Libération du verrou fresh-start incomplète.',
+    );
+  });
   logger.fatal({ error: errorMessage(error) }, 'Démarrage impossible.');
   process.exitCode = 1;
 });

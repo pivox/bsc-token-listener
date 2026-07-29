@@ -80,6 +80,9 @@ function mapRun(row: RunRow | undefined): FreshStartRun {
 }
 
 export class FreshStartRepository {
+  private runtimeClient: Client | null = null;
+  private acquiringRuntimeLock = false;
+
   constructor(
     private readonly database: Database = pool as unknown as Database,
   ) {}
@@ -88,9 +91,31 @@ export class FreshStartRepository {
     cutoff: FreshStartCutoff,
     nowMs: number,
   ): Promise<FreshStartRun> {
-    const client = await this.database.connect();
+    if (this.runtimeClient !== null || this.acquiringRuntimeLock) {
+      throw new Error('Une instance fresh-start est déjà active.');
+    }
+    this.acquiringRuntimeLock = true;
+    let client: Client;
     try {
+      client = await this.database.connect();
+    } catch (error) {
+      this.acquiringRuntimeLock = false;
+      throw error;
+    }
+    let runtimeLockHeld = false;
+    let transactionStarted = false;
+    try {
+      const runtimeLock = await client.query<{ locked: boolean }>(
+        `SELECT pg_try_advisory_lock(
+           hashtext('fresh-start-runtime')
+         ) AS locked`,
+      );
+      if (runtimeLock.rows[0]?.locked !== true) {
+        throw new Error('Une autre instance du bot est déjà active.');
+      }
+      runtimeLockHeld = true;
       await client.query('BEGIN');
+      transactionStarted = true;
       await client.query(
         `SELECT pg_advisory_xact_lock(hashtext('fresh-start-cutoff'))`,
       );
@@ -195,10 +220,37 @@ export class FreshStartRepository {
       );
       const run = mapRun(inserted.rows[0]);
       await client.query('COMMIT');
+      transactionStarted = false;
+      this.runtimeClient = client;
       return run;
     } catch (error) {
-      await client.query('ROLLBACK');
+      if (transactionStarted) {
+        await client.query('ROLLBACK').catch(() => undefined);
+      }
+      if (runtimeLockHeld) {
+        await client.query(
+          `SELECT pg_advisory_unlock(
+             hashtext('fresh-start-runtime')
+           )`,
+        ).catch(() => undefined);
+      }
+      client.release();
       throw error;
+    } finally {
+      this.acquiringRuntimeLock = false;
+    }
+  }
+
+  async close(): Promise<void> {
+    const client = this.runtimeClient;
+    if (client === null) return;
+    this.runtimeClient = null;
+    try {
+      await client.query(
+        `SELECT pg_advisory_unlock(
+           hashtext('fresh-start-runtime')
+         )`,
+      );
     } finally {
       client.release();
     }
