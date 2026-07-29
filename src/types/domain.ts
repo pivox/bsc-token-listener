@@ -1,4 +1,5 @@
 import type { Address, Hash } from 'viem';
+import type { PositionExitState } from '../strategy/position-exit.types.js';
 
 export type ExecutionMode = 'dry-run' | 'live';
 export type SessionStatus =
@@ -112,6 +113,8 @@ export interface TokenSession {
   pendingExecutionSourceEventId?: string;
   unreconciledExecution?: ExecutionReconciliationReference;
   recovery?: SessionRecoveryDiagnostic;
+  exitPolicy?: PositionExitState;
+  pendingExitDecisionId?: string;
   subsequentBuyCount: number;
   targetBuysAfterEntry: number;
   countedBuyTransactionHashes: Hash[];

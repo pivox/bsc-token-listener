@@ -143,6 +143,62 @@ function exitExecution(value: unknown): value is ExitExecution {
     );
 }
 
+const EXIT_POLICY_KEYS = new Set([
+  'referenceLiquidityWbnbWei',
+  'currentLiquidityWbnbWei',
+  'latestNetValueWei',
+  'peakNetValueWei',
+  'lastEvaluatedAtMs',
+  'lastProbeAtMs',
+  'nextEvaluationAtMs',
+  'trailingArmedAtMs',
+  'lastProbeStatus',
+  'pendingDecisionId',
+  'lastPrimaryRule',
+  'lastReason',
+  'staleReason',
+  'settingsRevision',
+]);
+
+const EXIT_RULES = new Set([
+  'SELLABILITY_UNCERTAIN',
+  'SELLABILITY_BLOCKED',
+  'LIQUIDITY_DROP',
+  'STOP_LOSS',
+  'MAX_HOLDING_TIME',
+  'TRAILING_STOP',
+  'TAKE_PROFIT',
+  'TARGET_BUYS',
+  'GAS_RATIO_EXCEEDED',
+  'EMERGENCY_GAS_EXCEEDED',
+]);
+
+function exitPolicyState(value: unknown): boolean {
+  const candidate = object(value);
+  return candidate !== null
+    && Object.keys(candidate).every((key) => EXIT_POLICY_KEYS.has(key))
+    && optional(candidate, 'referenceLiquidityWbnbWei', bigint)
+    && optional(candidate, 'currentLiquidityWbnbWei', bigint)
+    && optional(candidate, 'latestNetValueWei', bigint)
+    && optional(candidate, 'peakNetValueWei', bigint)
+    && optional(candidate, 'lastEvaluatedAtMs', integer)
+    && optional(candidate, 'lastProbeAtMs', integer)
+    && optional(candidate, 'nextEvaluationAtMs', integer)
+    && optional(candidate, 'trailingArmedAtMs', integer)
+    && optional(candidate, 'lastProbeStatus', (item) =>
+      item === 'SAFE' || item === 'BLOCKED' || item === 'UNKNOWN'
+    )
+    && optional(candidate, 'pendingDecisionId', (item) =>
+      typeof item === 'string' && item.length > 0
+    )
+    && optional(candidate, 'lastPrimaryRule', (item) =>
+      typeof item === 'string' && EXIT_RULES.has(item)
+    )
+    && optional(candidate, 'lastReason', (item) => typeof item === 'string')
+    && optional(candidate, 'staleReason', (item) => typeof item === 'string')
+    && optional(candidate, 'settingsRevision', integer);
+}
+
 const SESSION_STATUSES = new Set([
   'WAITING_FIRST_BUY',
   'RISK_CHECKING',
@@ -194,6 +250,10 @@ export function isTokenSession(value: unknown): value is TokenSession {
         && typeof diagnostic.lastReason === 'string'
         && integer(diagnostic.lastAttemptAtMs);
     })
+    && optional(candidate, 'exitPolicy', exitPolicyState)
+    && optional(candidate, 'pendingExitDecisionId', (item) =>
+      typeof item === 'string' && item.length > 0
+    )
     && integer(candidate.subsequentBuyCount)
     && integer(candidate.targetBuysAfterEntry)
     && Array.isArray(candidate.countedBuyTransactionHashes)
