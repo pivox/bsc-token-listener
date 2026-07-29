@@ -9,6 +9,7 @@ import type { CanonicalChainRepository } from '../../src/chain/canonical-chain.r
 import type {
   CanonicalBlock,
   ReorgReconciliation,
+  ReorgRollbackImpact,
 } from '../../src/chain/canonical-chain.types.js';
 import type { ReorgSessionReconciler } from '../../src/chain/reorg-session-reconciler.js';
 import type {
@@ -332,7 +333,7 @@ async function reorgReconciler(db: Database): Promise<ReorgSessionReconciler> {
 
 async function assertRetainedAudit(
   repository: CanonicalChainRepository,
-  expectedStatus: 'RECONCILING' | 'MANUAL_REVIEW' = 'RECONCILING',
+  expectedStatus: 'RECONCILING' | 'RECOVERED' | 'MANUAL_REVIEW' = 'RECONCILING',
 ): Promise<void> {
   const audit = await repository.getLastReorg();
   assert.ok(audit);
@@ -391,21 +392,98 @@ test('un reorg dans la fenêtre retenue orpheline les projections et rembobine l
   });
 });
 
-test('une divergence détectée après redémarrage relit l’impact persistant sans le perdre', async () => {
+test('une divergence détectée après redémarrage par le coordinateur rembobine le fork A', async () => {
   await withSchema('restart', async (db) => {
     const pair = address('b');
-    const first = await canonicalRepository(db);
-    await seedCanonicalWindow(db);
-    await insertSwap(db, swap(pair, 'restart-orphan', hash('e'), 11n, hash('2')), session(pair));
-    const impact = await first.rewindToAncestor(reorg());
+    const initialRepository = await canonicalRepository(db);
+    const initialCheckpoints = await checkpointRepository(db);
+    await initialRepository.saveCanonicalBlocks([
+      block(10n, hash('1'), hash('0')),
+      block(11n, hash('2'), hash('1')),
+      block(12n, hash('3'), hash('2')),
+    ]);
+    await initialCheckpoints.set('restart-listener', {
+      blockNumber: 12n,
+      blockHash: hash('3'),
+    });
+    await insertSwap(
+      db,
+      swap(pair, 'restart-orphan', hash('e'), 11n, hash('2')),
+      session(pair),
+    );
 
-    const restarted = await canonicalRepository(db);
-    const pending = await restarted.getPendingShallowReorg();
-    assert.ok(pending);
-    assert.deepEqual(pending.rollbackImpact, impact);
-    assert.equal(pending.audit.status, 'RECONCILING');
-    assert.equal((await restarted.getCanonicalTip())?.number, 10n);
-    await assertRetainedAudit(restarted);
+    const restartedRepository = await canonicalRepository(db);
+    const restartedCheckpoints = await checkpointRepository(db);
+    const { RuntimeRecoveryBarrier } =
+      await import('../../src/recovery/runtime-recovery-barrier.js');
+    const runtime = new RuntimeRecoveryBarrier();
+    const { CanonicalChainCoordinator: Coordinator } =
+      await import('../../src/chain/canonical-chain.coordinator.js');
+    const forkB = new Map<bigint, CanonicalBlock>([
+      [10n, block(10n, hash('1'), hash('0'))],
+      [11n, block(11n, hash('4'), hash('1'))],
+      [12n, block(12n, hash('5'), hash('4'))],
+      [13n, block(13n, hash('6'), hash('5'))],
+    ]);
+    let rollback: ReorgRollbackImpact | null = null;
+    let detectedFork: ReorgReconciliation | null = null;
+    const restartedCoordinator = new Coordinator({
+      blockReader: {
+        getBlockNumber: async () => 13n,
+        getBlock: async (number) => {
+          const header = forkB.get(number);
+          if (!header) throw new Error(`Header fork B absent: ${number}.`);
+          return header;
+        },
+      },
+      canonicalStore: restartedRepository,
+      checkpoints: restartedCheckpoints,
+      confirmations: 1,
+      runtimeBarrier: runtime,
+      reorgHandler: {
+        reconcileReorg: (fork) => runtime.runRecovery(async () => {
+          detectedFork = fork;
+          rollback = await restartedRepository.rewindToAncestor(fork);
+          return rollback;
+        }),
+      },
+      afterReorg: async () => {
+        const impact = rollback;
+        const fork = detectedFork;
+        assert.ok(impact);
+        assert.ok(fork);
+        await restartedRepository.completeReorg(impact.reorgId, 0);
+        return {
+          identity: `${fork.oldTip.hash.toLowerCase()}:${fork.newTip.hash.toLowerCase()}`,
+          reorgId: impact.reorgId,
+          replayedEvents: 0,
+        };
+      },
+    });
+
+    await restartedCoordinator.reconcile({
+      listenerKey: 'restart-listener',
+      startBlock: 10n,
+      processChunk: async () => {
+        assert.fail('aucun chunk métier avant le rewind après redémarrage');
+      },
+    });
+    await restartedCoordinator.waitForIdle();
+
+    assert.equal(restartedCoordinator.currentStatus.state, 'HEALTHY');
+    assert.equal(restartedCoordinator.currentStatus.lastReorg?.status, 'RECOVERED');
+    assert.equal(restartedCoordinator.currentStatus.lastReorg?.ancestor?.number, 10n);
+    assert.equal((await restartedRepository.getCanonicalTip())?.number, 10n);
+    assert.deepEqual(await restartedCheckpoints.get('restart-listener'), {
+      blockNumber: 10n,
+      blockHash: hash('1'),
+    });
+    const orphaned = await db.query<{ canonical: boolean }>(
+      'SELECT canonical FROM swap_events WHERE event_id = $1',
+      ['restart-orphan'],
+    );
+    assert.equal(orphaned.rows[0]?.canonical, false);
+    await assertRetainedAudit(restartedRepository, 'RECOVERED');
   });
 });
 
@@ -496,6 +574,84 @@ test('un achat compté disparu reconstruit le compteur depuis les seuls swaps ca
     const orphaned = await db.query<{ canonical: boolean }>(
       'SELECT canonical FROM swap_events WHERE event_id = $1', ['orphan-counted'],
     );
+    assert.equal(orphaned.rows[0]?.canonical, false);
+    await assertRetainedAudit(repository);
+  });
+});
+
+test('un signal de vente dry-run disparu restaure HOLDING et supersède sa projection', async () => {
+  await withSchema('sell-signal', async (db) => {
+    const pair = address('a');
+    const canonicalHash = hash('7');
+    const signalHash = hash('8');
+    const before = session(pair, 'HOLDING');
+    before.entry = {
+      mode: 'dry-run',
+      amountInWei: 10n,
+      amountOutToken: 20n,
+      confirmedAtMs: 1,
+      cursor: { blockNumber: 9n, transactionIndex: 0, logIndex: 0 },
+      transactionHash: hash('6'),
+    };
+    before.targetBuysAfterEntry = 2;
+    before.countedBuyTransactionHashes = [canonicalHash];
+    before.subsequentBuyCount = 1;
+    const current = structuredClone(before);
+    current.status = 'CLOSED';
+    current.countedBuyTransactionHashes = [canonicalHash, signalHash];
+    current.subsequentBuyCount = 2;
+    current.sellAttempts = 1;
+    current.exit = {
+      mode: 'dry-run',
+      amountInToken: 20n,
+      amountOutWei: 12n,
+      confirmedAtMs: 2,
+      transactionHash: signalHash,
+    };
+    const signal = swap(
+      pair,
+      'orphan-sell-signal',
+      signalHash,
+      11n,
+      hash('2'),
+    );
+    const repository = await canonicalRepository(db);
+    await seedCanonicalWindow(db);
+    await insertSession(db, current);
+    await insertSwap(
+      db,
+      swap(pair, 'canonical-before-sell', canonicalHash, 10n, hash('1')),
+      before,
+      before,
+    );
+    await insertSwap(db, signal, before);
+    await db.query(
+      `INSERT INTO trades(
+         trade_id, pair_address, token_address, side, mode, status,
+         source_event_id, canonical, payload, created_at, updated_at
+       ) VALUES ('orphan-dry-sell', $1, $2, 'SELL', 'dry-run', 'SIMULATED',
+         $3, TRUE, '{}'::jsonb, NOW(), NOW())`,
+      [pair.toLowerCase(), TOKEN.toLowerCase(), signal.id],
+    );
+
+    const impact = await repository.rewindToAncestor(reorg());
+    await (await reorgReconciler(db)).reconcile(impact);
+
+    const restored = await (await sessionRepository(db)).findByPair(pair);
+    assert.equal(restored?.status, 'HOLDING');
+    assert.equal(restored?.exit, undefined);
+    assert.equal(restored?.sellAttempts, 0);
+    assert.deepEqual(restored?.countedBuyTransactionHashes, [canonicalHash]);
+    assert.equal(restored?.subsequentBuyCount, 1);
+    const projection = await db.query<{ canonical: boolean }>(
+      'SELECT canonical FROM trades WHERE trade_id = $1',
+      ['orphan-dry-sell'],
+    );
+    const orphaned = await db.query<{ canonical: boolean }>(
+      'SELECT canonical FROM swap_events WHERE event_id = $1',
+      [signal.id],
+    );
+    assert.equal(projection.rows[0]?.canonical, false);
     assert.equal(orphaned.rows[0]?.canonical, false);
     await assertRetainedAudit(repository);
   });

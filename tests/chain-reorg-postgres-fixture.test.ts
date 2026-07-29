@@ -20,4 +20,9 @@ test('le schéma PostgreSQL isolé normalise le label de scénario avant interpo
   );
   assert.match(source, /await failingDatabase\.drain\(\);/u);
   assert.match(source, /UPDATE chain_reorgs SET orphaned_events/u);
+  assert.match(
+    source,
+    /new Coordinator\(\{[\s\S]*?reconcileReorg:[\s\S]*?rewindToAncestor/u,
+  );
+  assert.match(source, /un signal de vente dry-run disparu/u);
 });
