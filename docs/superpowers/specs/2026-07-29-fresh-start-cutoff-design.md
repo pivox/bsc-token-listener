@@ -95,9 +95,10 @@ The repository then performs one PostgreSQL transaction:
 2. ensure the candidate cutoff is not older than the latest committed cutoff;
 3. quarantine non-terminal sessions and update their JSON payloads consistently;
 4. quarantine recoverable position-exit decisions;
-5. anchor the `pair-created` checkpoint to the cutoff;
-6. retire or re-anchor obsolete `swap:*` checkpoints so none can request an
-   older range;
+5. re-anchor every existing listener checkpoint to the cutoff, including
+   internal canonical synchronization and obsolete `swap:*` checkpoints;
+6. create the `pair-created` checkpoint at the cutoff when it does not yet
+   exist;
 7. insert the immutable fresh-start audit row;
 8. commit.
 
@@ -118,6 +119,7 @@ as a hard lower bound:
 - a requested range starts no earlier than `cutoff + 1`;
 - a decoded event at or below the cutoff is rejected before business callbacks;
 - no checkpoint can be persisted below the cutoff;
+- the oldest-checkpoint calculation cannot retain a pre-cutoff internal key;
 - a legacy checkpoint below the cutoff is replaced by the cutoff anchor rather
   than replayed.
 
