@@ -83,6 +83,21 @@ export class PositionExitMonitor {
         }
         continue;
       }
+      if (session?.status === 'HOLDING' && !session.unreconciledExecution) {
+        const requeued = await this.dependencies.decisions.transitionDecision(
+          decision.id,
+          'EXECUTING',
+          'PENDING',
+        );
+        if (requeued) {
+          await this.dependencies.engine.requestPolicyExit(session, {
+            ...decision,
+            status: 'PENDING',
+            updatedAtMs: this.now(),
+          });
+        }
+        continue;
+      }
       if (session?.status === 'CLOSED' && session.exit) {
         await this.dependencies.decisions.transitionDecision(
           decision.id,

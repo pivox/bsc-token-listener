@@ -8,7 +8,7 @@ import type {
   PositionExitDecisionStatus,
   PositionMetricsSnapshot,
 } from '../src/strategy/position-exit.types.js';
-import type { TokenSession } from '../src/types/domain.js';
+import type { SwapEvent, TokenSession } from '../src/types/domain.js';
 
 const ADDRESS = '0x1111111111111111111111111111111111111111' as Address;
 const TOKEN = '0x2222222222222222222222222222222222222222' as Address;
@@ -90,10 +90,15 @@ function decision(): PositionExitDecision {
   };
 }
 
-function subject(probeStatus: PositionMetricsSnapshot['probeStatus'] = 'SAFE') {
+function subject(
+  probeStatus: PositionMetricsSnapshot['probeStatus'] = 'SAFE',
+  targetBuysAfterEntry = 3,
+) {
   const order: string[] = [];
   let persisted = session();
+  let persistedDecision = decision();
   let sellCalls = 0;
+  let createdDecisions = 0;
   const transitions: Array<[PositionExitDecisionStatus, PositionExitDecisionStatus]> = [];
   const engine = new SessionEngine(
     {
@@ -125,7 +130,10 @@ function subject(probeStatus: PositionMetricsSnapshot['probeStatus'] = 'SAFE') {
     {
       settings: {
         get: async () => ({
-          settings: defaultPositionExitSettings(),
+          settings: Object.freeze({
+            ...defaultPositionExitSettings(),
+            targetBuysAfterEntry,
+          }),
           revision: 0,
           source: 'ENV',
           updatedAt: null,
@@ -135,7 +143,18 @@ function subject(probeStatus: PositionMetricsSnapshot['probeStatus'] = 'SAFE') {
         collect: async () => metrics({ probeStatus }),
       },
       decisions: {
-        findDecision: async () => decision(),
+        createDecision: async (input) => {
+          createdDecisions += 1;
+          persistedDecision = {
+            ...input,
+            id: `decision-${createdDecisions}`,
+            status: 'PENDING',
+            createdAtMs: 2,
+            updatedAtMs: 2,
+          };
+          return persistedDecision;
+        },
+        findDecision: async () => persistedDecision,
         transitionDecision: async (
           _id: string,
           expected: PositionExitDecisionStatus,
@@ -158,6 +177,9 @@ function subject(probeStatus: PositionMetricsSnapshot['probeStatus'] = 'SAFE') {
     },
     get sellCalls() {
       return sellCalls;
+    },
+    get createdDecisions() {
+      return createdDecisions;
     },
     transitions,
   };
@@ -193,4 +215,33 @@ test('deux demandes concurrentes ne vendent qu’une fois', async () => {
     value.engine.sellManually(session()),
   ]);
   assert.equal(value.sellCalls, 1);
+});
+
+test('le seuil d’achats passe par le probe forcé avant toute vente', async () => {
+  const value = subject('UNKNOWN', 1);
+  const current = session();
+  current.targetBuysAfterEntry = 1;
+  const event: SwapEvent = {
+    id: 'swap-target',
+    pair: ADDRESS,
+    kind: 'BUY',
+    transactionHash: `0x${'4'.repeat(64)}`,
+    blockHash: `0x${'5'.repeat(64)}`,
+    sender: ADDRESS,
+    recipient: TOKEN,
+    amount0In: 1n,
+    amount1In: 0n,
+    amount0Out: 0n,
+    amount1Out: 1n,
+    cursor: { blockNumber: 2n, transactionIndex: 0, logIndex: 0 },
+    amountToken: 1n,
+    amountWbnb: 1n,
+    observedAtMs: 2,
+  };
+
+  await value.engine.onSwap(current, event);
+  assert.equal(value.createdDecisions, 1);
+  assert.equal(value.sellCalls, 0);
+  assert.equal(value.persisted.status, 'MANUAL_REVIEW');
+  assert.deepEqual(value.transitions, [['PENDING', 'MANUAL_REVIEW']]);
 });

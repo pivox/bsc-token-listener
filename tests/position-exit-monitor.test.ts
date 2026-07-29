@@ -235,3 +235,58 @@ test('persiste l’état avant de créer et soumettre une décision idempotente'
   assert.deepEqual(order, ['session', 'decision', 'engine']);
   assert.match(created?.idempotencyKey ?? '', /STOP_LOSS/u);
 });
+
+test('reprend une décision EXECUTING restée HOLDING avant toute diffusion', async () => {
+  let status: PositionExitDecision['status'] = 'EXECUTING';
+  const executing: PositionExitDecision = {
+    id: 'decision-executing',
+    idempotencyKey: 'pair:entry:0:STOP_LOSS',
+    pair: ADDRESS,
+    token: TOKEN,
+    settingsRevision: 0,
+    primaryRule: 'STOP_LOSS',
+    triggeredRules: ['STOP_LOSS'],
+    action: 'SELL',
+    status,
+    metrics: {
+      quoteWei: 800n,
+      entryCostWei: 1_000n,
+      netExitValueWei: 800n,
+      currentLiquidityWbnbWei: 1_000n,
+      estimatedExitGasWei: 10n,
+      sellTaxBps: 0,
+      probeStatus: 'SAFE',
+      probeMeasuredAtMs: 1_000,
+    },
+    reason: 'stop',
+    createdAtMs: 1_000,
+    executionStartedAtMs: 1_000,
+    updatedAtMs: 1_000,
+  };
+  let resumedStatus: PositionExitDecision['status'] | undefined;
+  const monitor = new PositionExitMonitor(
+    dependencies({
+      decisions: {
+        createDecision: async () => {
+          throw new Error('unexpected');
+        },
+        listRecoverableDecisions: async () => [{ ...executing, status }],
+        transitionDecision: async (_id, expected, next) => {
+          if (status !== expected) return false;
+          status = next;
+          return true;
+        },
+      },
+      engine: {
+        requestPolicyExit: async (session, value) => {
+          resumedStatus = value.status;
+          return session;
+        },
+      },
+    }),
+  );
+
+  await monitor.reconcilePendingDecisions();
+  assert.equal(status, 'PENDING');
+  assert.equal(resumedStatus, 'PENDING');
+});

@@ -190,10 +190,10 @@ test('migration, révisions concurrentes, audit et reset restent atomiques', asy
 
     const reset = await first.resetSettings(1, defaults);
     assert.equal(reset.source, 'ENV');
-    assert.equal(reset.revision, 0);
-    assert.equal(await first.getSettings(), null);
+    assert.equal(reset.revision, 2);
+    assert.equal((await first.getSettings())?.source, 'ENV');
 
-    const afterReset = await second.saveSettings(updated, 0, 'DASHBOARD');
+    const afterReset = await second.saveSettings(updated, 2, 'DASHBOARD');
     assert.equal(afterReset.revision, 3);
     const audit = await client.query<{
       revision: number;

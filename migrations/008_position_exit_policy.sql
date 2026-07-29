@@ -2,9 +2,14 @@ CREATE TABLE IF NOT EXISTS strategy_settings (
   setting_key TEXT PRIMARY KEY,
   revision INTEGER NOT NULL CHECK (revision > 0),
   setting_value JSONB NOT NULL,
+  source TEXT NOT NULL DEFAULT 'DATABASE' CHECK (source IN ('DATABASE', 'ENV')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE strategy_settings
+  ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'DATABASE'
+  CHECK (source IN ('DATABASE', 'ENV'));
 
 CREATE TABLE IF NOT EXISTS strategy_settings_audit (
   audit_id TEXT PRIMARY KEY,

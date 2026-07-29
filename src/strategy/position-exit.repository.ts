@@ -34,6 +34,7 @@ interface Database extends Queryable {
 interface SettingsRow {
   revision: number;
   setting_value: unknown;
+  source: string;
   updated_at: Date | string;
 }
 
@@ -162,16 +163,19 @@ export class PositionExitRepository implements PositionExitSettingsStore {
 
   async getSettings(): Promise<EffectivePositionExitSettings | null> {
     const result = await this.database.query<SettingsRow>(
-      `SELECT revision, setting_value, updated_at
+      `SELECT revision, setting_value, source, updated_at
        FROM strategy_settings WHERE setting_key = $1`,
       [SETTING_KEY],
     );
     const row = result.rows[0];
     if (!row) return null;
+    if (row.source !== 'DATABASE' && row.source !== 'ENV') {
+      throw new Error('Source de réglages persistée invalide.');
+    }
     return {
       settings: parsePositionExitSettings(parseJson<unknown>(row.setting_value)),
       revision: row.revision,
-      source: 'DATABASE',
+      source: row.source,
       updatedAt: iso(row.updated_at),
     };
   }
@@ -190,7 +194,7 @@ export class PositionExitRepository implements PositionExitSettingsStore {
         [SETTING_KEY],
       );
       const current = await client.query<SettingsRow>(
-        `SELECT revision, setting_value, updated_at
+        `SELECT revision, setting_value, source, updated_at
          FROM strategy_settings WHERE setting_key = $1 FOR UPDATE`,
         [SETTING_KEY],
       );
@@ -201,27 +205,26 @@ export class PositionExitRepository implements PositionExitSettingsStore {
           `Conflit de révision: attendu ${expectedRevision}, courant ${revision}.`,
         );
       }
-      const auditRevision = previous
-        ? revision
-        : Number(
-            (
-              await client.query<{ revision: string }>(
-                `SELECT COALESCE(MAX(revision), 0)::text AS revision
-                 FROM strategy_settings_audit WHERE setting_key = $1`,
-                [SETTING_KEY],
-              )
-            ).rows[0]?.revision ?? '0',
-          );
-      const nextRevision = auditRevision + 1;
+      const auditRevision = Number(
+        (
+          await client.query<{ revision: string }>(
+            `SELECT COALESCE(MAX(revision), 0)::text AS revision
+             FROM strategy_settings_audit WHERE setting_key = $1`,
+            [SETTING_KEY],
+          )
+        ).rows[0]?.revision ?? '0',
+      );
+      const nextRevision = Math.max(revision, auditRevision) + 1;
       const saved = await client.query<SettingsRow>(
         `INSERT INTO strategy_settings(
-           setting_key, revision, setting_value, created_at, updated_at
-         ) VALUES ($1, $2, $3::jsonb, NOW(), NOW())
+           setting_key, revision, setting_value, source, created_at, updated_at
+         ) VALUES ($1, $2, $3::jsonb, 'DATABASE', NOW(), NOW())
          ON CONFLICT (setting_key) DO UPDATE SET
            revision = EXCLUDED.revision,
            setting_value = EXCLUDED.setting_value,
+           source = EXCLUDED.source,
            updated_at = NOW()
-         RETURNING revision, setting_value, updated_at`,
+         RETURNING revision, setting_value, source, updated_at`,
         [SETTING_KEY, nextRevision, stringifyJson(parsed)],
       );
       await client.query(
@@ -267,7 +270,7 @@ export class PositionExitRepository implements PositionExitSettingsStore {
         [SETTING_KEY],
       );
       const current = await client.query<SettingsRow>(
-        `SELECT revision, setting_value, updated_at
+        `SELECT revision, setting_value, source, updated_at
          FROM strategy_settings WHERE setting_key = $1 FOR UPDATE`,
         [SETTING_KEY],
       );
@@ -287,6 +290,16 @@ export class PositionExitRepository implements PositionExitSettingsStore {
           updatedAt: null,
         };
       }
+      const auditRevision = Number(
+        (
+          await client.query<{ revision: string }>(
+            `SELECT COALESCE(MAX(revision), 0)::text AS revision
+             FROM strategy_settings_audit WHERE setting_key = $1`,
+            [SETTING_KEY],
+          )
+        ).rows[0]?.revision ?? '0',
+      );
+      const nextRevision = Math.max(revision, auditRevision) + 1;
       await client.query(
         `INSERT INTO strategy_settings_audit(
            audit_id, setting_key, revision, previous_value, next_value, source
@@ -294,21 +307,29 @@ export class PositionExitRepository implements PositionExitSettingsStore {
         [
           randomUUID(),
           SETTING_KEY,
-          revision + 1,
+          nextRevision,
           previous ? stringifyJson(previous.setting_value) : null,
           stringifyJson(parsedDefaults),
         ],
       );
-      await client.query(
-        'DELETE FROM strategy_settings WHERE setting_key = $1',
-        [SETTING_KEY],
+      const reset = await client.query<SettingsRow>(
+        `UPDATE strategy_settings SET
+           revision = $2,
+           setting_value = $3::jsonb,
+           source = 'ENV',
+           updated_at = NOW()
+         WHERE setting_key = $1
+         RETURNING revision, setting_value, source, updated_at`,
+        [SETTING_KEY, nextRevision, stringifyJson(parsedDefaults)],
       );
       await client.query('COMMIT');
+      const row = reset.rows[0];
+      if (!row) throw new Error('Réglages non retournés après reset.');
       return {
-        settings: parsedDefaults,
-        revision: 0,
+        settings: parsePositionExitSettings(parseJson<unknown>(row.setting_value)),
+        revision: row.revision,
         source: 'ENV',
-        updatedAt: null,
+        updatedAt: iso(row.updated_at),
       };
     } catch (error) {
       await client.query('ROLLBACK');

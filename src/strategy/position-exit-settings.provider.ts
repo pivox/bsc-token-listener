@@ -27,17 +27,14 @@ function frozenSnapshot(
 }
 
 export class PositionExitSettingsProvider {
-  private snapshot: EffectivePositionExitSettings | null = null;
-
   constructor(
     private readonly repository: PositionExitSettingsStore,
     private readonly defaults: Readonly<PositionExitSettings>,
   ) {}
 
   async get(): Promise<EffectivePositionExitSettings> {
-    if (this.snapshot) return this.snapshot;
     const persisted = await this.repository.getSettings();
-    this.snapshot = persisted
+    return persisted
       ? frozenSnapshot(persisted)
       : frozenSnapshot({
           settings: parsePositionExitSettings(this.defaults),
@@ -45,7 +42,6 @@ export class PositionExitSettingsProvider {
           source: 'ENV',
           updatedAt: null,
         });
-    return this.snapshot;
   }
 
   async update(
@@ -57,8 +53,7 @@ export class PositionExitSettingsProvider {
       expectedRevision,
       'DASHBOARD',
     );
-    this.snapshot = frozenSnapshot(committed);
-    return this.snapshot;
+    return frozenSnapshot(committed);
   }
 
   async reset(expectedRevision: number): Promise<EffectivePositionExitSettings> {
@@ -66,7 +61,6 @@ export class PositionExitSettingsProvider {
       expectedRevision,
       parsePositionExitSettings(this.defaults),
     );
-    this.snapshot = frozenSnapshot(committed);
-    return this.snapshot;
+    return frozenSnapshot(committed);
   }
 }

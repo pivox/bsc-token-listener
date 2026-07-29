@@ -107,8 +107,39 @@ test('utilise les valeurs environnement en révision zéro sans override', async
   assert.equal(Object.isFrozen(result.settings), true);
 });
 
+test('rafraîchit les réglages persistés par un autre processus', async () => {
+  let persisted: EffectivePositionExitSettings | null = null;
+  const provider = new PositionExitSettingsProvider(
+    {
+      getSettings: async () => persisted,
+      saveSettings: async () => {
+        throw new Error('unexpected');
+      },
+      resetSettings: async () => {
+        throw new Error('unexpected');
+      },
+    },
+    defaultPositionExitSettings(),
+  );
+
+  assert.equal((await provider.get()).source, 'ENV');
+  persisted = {
+    settings: Object.freeze({
+      ...defaultPositionExitSettings(),
+      stopLossBps: 2_500,
+    }),
+    revision: 4,
+    source: 'DATABASE',
+    updatedAt: new Date(0).toISOString(),
+  };
+  const refreshed = await provider.get();
+  assert.equal(refreshed.revision, 4);
+  assert.equal(refreshed.settings.stopLossBps, 2_500);
+});
+
 test('ne publie une révision qu’après le commit du repository', async () => {
   let fail = true;
+  let persisted: EffectivePositionExitSettings | null = null;
   const committed: EffectivePositionExitSettings = {
     settings: Object.freeze({
       ...defaultPositionExitSettings(),
@@ -120,9 +151,10 @@ test('ne publie une révision qu’après le commit du repository', async () => 
   };
   const provider = new PositionExitSettingsProvider(
     {
-      getSettings: async () => null,
+      getSettings: async () => persisted,
       saveSettings: async () => {
         if (fail) throw new Error('commit impossible');
+        persisted = committed;
         return committed;
       },
       resetSettings: async () => {
