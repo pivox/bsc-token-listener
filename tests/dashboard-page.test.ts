@@ -49,3 +49,13 @@ test('dashboard utilise la décision serveur pour afficher la vente', () => {
   assert.match(html, /token\.canSell/u);
   assert.match(html, /finally\s*\{\s*try\s*\{\s*await Promise\.all/u);
 });
+
+test('dashboard affiche la surveillance de sortie d’une position', () => {
+  const html = renderDashboardPage('nonce', 5);
+  assert.match(html, /Prochaine évaluation/u);
+  assert.match(html, /Durée restante/u);
+  assert.match(html, /Stop-loss/u);
+  assert.match(html, /Take-profit/u);
+  assert.match(html, /lastProbeStatus/u);
+  assert.match(html, /economicPnlPercent/u);
+});

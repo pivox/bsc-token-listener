@@ -310,7 +310,11 @@ async function main(): Promise<void> {
   );
   const dashboard = config.dashboardEnabled
     ? new ActionDashboardServer(
-      new DashboardService(new DashboardRepository(), heartbeat),
+      new DashboardService(
+        new DashboardRepository(),
+        heartbeat,
+        positionExitSettings,
+      ),
       riskSettings,
       dashboardActions,
     )
