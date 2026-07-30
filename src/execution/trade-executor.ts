@@ -16,6 +16,7 @@ import {
   calculateGasCost,
   calculateSellProceeds,
 } from './trade-accounting.js';
+import { logger } from '../utils/logger.js';
 import type {
   ExecutionGateway,
   ExecutionReceipt,
@@ -91,6 +92,15 @@ export class TradeExecutor {
     requestedAmountInWei: bigint,
     sourceEventId?: string,
   ): Promise<EntryExecution> {
+    logger.info(
+      {
+        pair: session.pair.pair,
+        token: session.pair.token,
+        mode: this.mode,
+        requestedAmountInWei: requestedAmountInWei.toString(),
+      },
+      'Lancement d’un achat.',
+    );
     return this.queue.run(async () => {
       const trade = this.newTrade(session, 'BUY', requestedAmountInWei, sourceEventId);
       await this.trades.save(trade);
@@ -103,11 +113,27 @@ export class TradeExecutor {
           path,
           amountIn: requestedAmountInWei,
         });
+        logger.debug(
+          {
+            pair: session.pair.pair,
+            tradeId: trade.id,
+            quotedAmountOutToken: quotedAmountOutToken.toString(),
+          },
+          'Quote d’achat obtenue.',
+        );
         trade.amountOut = quotedAmountOutToken;
         trade.quotedAmountOut = quotedAmountOutToken;
         trade.updatedAtMs = Date.now();
         await this.trades.save(trade);
       } catch (error) {
+        logger.error(
+          {
+            pair: session.pair.pair,
+            tradeId: trade.id,
+            error: errorMessage(error),
+          },
+          'Quote d’achat échouée.',
+        );
         await this.failTrade(trade, error);
         throw error;
       }
@@ -140,6 +166,10 @@ export class TradeExecutor {
       }
 
       const wallet = await this.requireWalletForTrade(trade);
+      logger.debug(
+        { tradeId: trade.id, wallet },
+        'Wallet d’achat résolu.',
+      );
       let nativeBalanceBefore: bigint;
       let tokenBalanceBefore: bigint;
       let prepared: PreparedExecutionTransaction;
@@ -155,7 +185,23 @@ export class TradeExecutor {
           minimumOut: minimumOut(quotedAmountOutToken),
           deadline: deadline(),
         });
+        logger.debug(
+          {
+            tradeId: trade.id,
+            step: prepared.step,
+            txHash: prepared.hash,
+          },
+          'Transaction d’achat préparée.',
+        );
       } catch (error) {
+        logger.error(
+          {
+            pair: session.pair.pair,
+            tradeId: trade.id,
+            error: errorMessage(error),
+          },
+          'Préparation d’achat échouée.',
+        );
         await this.failTrade(trade, error);
         throw error;
       }
@@ -167,6 +213,15 @@ export class TradeExecutor {
         tokenBalanceBefore,
       });
       const receipt = await this.submit(trade, transaction, prepared, true);
+      logger.debug(
+        {
+          pair: session.pair.pair,
+          tradeId: trade.id,
+          receiptBlock: receipt.blockNumber.toString(),
+          receiptStatus: receipt.status,
+        },
+        'Receipt d’achat reçu.',
+      );
 
       try {
         const [nativeBalanceAfter, tokenBalanceAfter] = await Promise.all([
@@ -194,6 +249,15 @@ export class TradeExecutor {
         trade.amountOut = receivedToken;
         trade.updatedAtMs = Date.now();
         await this.trades.saveLifecycle(trade, transaction);
+        logger.info(
+          {
+            pair: session.pair.pair,
+            tradeId: trade.id,
+            actualAmountIn: actualAmountIn.toString(),
+            receivedToken: receivedToken.toString(),
+          },
+          'Achat confirmé.',
+        );
 
         return {
           mode: 'live',
@@ -211,6 +275,14 @@ export class TradeExecutor {
           },
         };
       } catch (error) {
+        logger.error(
+          {
+            pair: session.pair.pair,
+            tradeId: trade.id,
+            error: errorMessage(error),
+          },
+          'Mesure post-achat échouée.',
+        );
         await this.recordMeasurementFailure(trade, transaction, error);
         throw new ExecutionMeasurementError(
           `Achat confirmé mais mesure des soldes impossible: ${errorMessage(error)}`,
@@ -232,9 +304,22 @@ export class TradeExecutor {
     recovered?: { trade: TradeRecord; approvalGasWei: bigint },
     sourceEventId?: string,
   ): Promise<ExitExecution> {
+    logger.info(
+      {
+        pair: session.pair.pair,
+        token: session.pair.token,
+        mode: this.mode,
+        recovered: Boolean(recovered),
+      },
+      'Lancement d’une vente.',
+    );
     return this.queue.run(async () => {
       const positionAmount = session.entry?.amountOutToken ?? 0n;
       if (positionAmount <= 0n) throw new Error('Aucun token à vendre.');
+      logger.debug(
+        { pair: session.pair.pair, positionAmount: positionAmount.toString() },
+        'Montant de position détecté pour vente.',
+      );
 
       const trade = recovered?.trade
         ?? this.newTrade(session, 'SELL', positionAmount, sourceEventId);
@@ -280,11 +365,19 @@ export class TradeExecutor {
         trade.updatedAtMs = Date.now();
         await this.trades.save(trade);
       } catch (error) {
+        logger.error(
+          { pair: session.pair.pair, tradeId: trade.id, error: errorMessage(error) },
+          'Quote de vente échouée.',
+        );
         await this.failTrade(trade, error);
         throw error;
       }
 
       if (this.mode === 'dry-run') {
+        logger.debug(
+          { pair: session.pair.pair, tradeId: trade.id },
+          'Vente dry-run simulée.',
+        );
         trade.status = 'SIMULATED';
         trade.updatedAtMs = Date.now();
         await this.trades.save(trade);
@@ -315,6 +408,10 @@ export class TradeExecutor {
       }
 
       let approvalGasWei = recovered?.approvalGasWei ?? 0n;
+      logger.debug(
+        { tradeId: trade.id, wallet },
+        'Vérification allowance/approval de vente.',
+      );
       try {
         const allowance = await this.gateway.getAllowance({
           token: session.pair.token,
@@ -367,6 +464,10 @@ export class TradeExecutor {
           deadline: deadline(),
         });
       } catch (error) {
+        logger.error(
+          { pair: session.pair.pair, tradeId: trade.id, error: errorMessage(error) },
+          'Préparation de vente échouée.',
+        );
         await this.failTrade(trade, error);
         throw error;
       }
@@ -377,6 +478,15 @@ export class TradeExecutor {
         tokenBalanceBefore,
       });
       const receipt = await this.submit(trade, transaction, prepared, true);
+      logger.debug(
+        {
+          pair: session.pair.pair,
+          tradeId: trade.id,
+          receiptBlock: receipt.blockNumber.toString(),
+          receiptStatus: receipt.status,
+        },
+        'Receipt de vente reçu.',
+      );
 
       try {
         const [nativeBalanceAfter, tokenBalanceAfter] = await Promise.all([
@@ -404,6 +514,15 @@ export class TradeExecutor {
         trade.amountOut = actualAmountOut;
         trade.updatedAtMs = Date.now();
         await this.trades.saveLifecycle(trade, transaction);
+        logger.info(
+          {
+            pair: session.pair.pair,
+            tradeId: trade.id,
+            amountIn: actualAmountIn.toString(),
+            amountOut: actualAmountOut.toString(),
+          },
+          'Vente confirmée.',
+        );
 
         return {
           mode: 'live',
@@ -417,6 +536,10 @@ export class TradeExecutor {
           confirmedAtMs: transaction.confirmedAtMs ?? Date.now(),
         };
       } catch (error) {
+        logger.error(
+          { pair: session.pair.pair, tradeId: trade.id, error: errorMessage(error) },
+          'Mesure post-vente échouée.',
+        );
         await this.recordMeasurementFailure(trade, transaction, error);
         throw new ExecutionMeasurementError(
           `Vente confirmée mais mesure des soldes impossible: ${errorMessage(error)}`,
@@ -439,6 +562,15 @@ export class TradeExecutor {
     wallet: `0x${string}`,
     amount: bigint,
   ): Promise<bigint> {
+    logger.debug(
+      {
+        tradeId: trade.id,
+        pair: session.pair.pair,
+        wallet,
+        amount: amount.toString(),
+      },
+      'Préparation d’approval en cours.',
+    );
     const nativeBalanceBefore = await this.gateway.getNativeBalance(wallet);
     const prepared = await this.gateway.prepareApproval({
       token: session.pair.token,
@@ -449,6 +581,10 @@ export class TradeExecutor {
       nativeBalanceBefore,
     });
     const receipt = await this.submit(trade, transaction, prepared, false);
+    logger.debug(
+      { tradeId: trade.id, receiptStatus: receipt.status },
+      'Approval soumis.',
+    );
     const gasCostWei = calculateGasCost(receipt.gasUsed, receipt.effectiveGasPrice);
     try {
       transaction.nativeBalanceAfter = await this.gateway.getNativeBalance(wallet);
@@ -456,7 +592,15 @@ export class TradeExecutor {
       trade.gasCostWei = gasCostWei;
       trade.updatedAtMs = Date.now();
       await this.trades.saveLifecycle(trade, transaction);
+      logger.debug(
+        { tradeId: trade.id, gasCostWei: gasCostWei.toString() },
+        'Approval confirmé.',
+      );
     } catch (error) {
+      logger.error(
+        { tradeId: trade.id, error: errorMessage(error) },
+        'Mesure post-approval échouée.',
+      );
       await this.recordMeasurementFailure(trade, transaction, error, 'UNKNOWN');
       throw new ExecutionMeasurementError(
         `Approval confirmé mais mesure du solde impossible: ${errorMessage(error)}`,
@@ -482,6 +626,13 @@ export class TradeExecutor {
     trade.status = 'CREATED';
     trade.updatedAtMs = Date.now();
     await this.trades.saveLifecycle(trade, transaction);
+    logger.debug(
+      {
+        tradeId: trade.id,
+        step: transaction.step,
+      },
+      'Soumission transaction.',
+    );
 
     try {
       const returnedHash = await this.gateway.sendRawTransaction(
@@ -491,6 +642,10 @@ export class TradeExecutor {
         throw new Error(`Hash RPC inattendu: ${returnedHash}.`);
       }
     } catch (error) {
+      logger.error(
+        { tradeId: trade.id, step: transaction.step, error: errorMessage(error) },
+        'Échec de diffusion.',
+      );
       const safeError = new Error(
         `Échec RPC de diffusion (${error instanceof Error ? error.name : typeof error}); `
         + `hash local ${prepared.hash}.`,
@@ -536,7 +691,19 @@ export class TradeExecutor {
         transaction.error = trade.error;
       }
       await this.trades.saveLifecycle(trade, transaction);
+      logger.debug(
+        {
+          tradeId: trade.id,
+          step: transaction.step,
+          status: receipt.status,
+        },
+        'Receipt de soumission traité.',
+      );
     } catch (error) {
+      logger.error(
+        { tradeId: trade.id, step: transaction.step, error: errorMessage(error) },
+        'État post-diffusion inconnu.',
+      );
       return this.raiseUnknown(
         trade,
         transaction,
@@ -557,6 +724,10 @@ export class TradeExecutor {
     context: string,
     error: unknown,
   ): Promise<never> {
+    logger.error(
+      { tradeId: trade.id, context, reason: errorMessage(error) },
+      'Execution en UNKNOWN.',
+    );
     const now = Date.now();
     let reason = errorMessage(error);
     trade.status = 'UNKNOWN';
@@ -584,6 +755,14 @@ export class TradeExecutor {
     error: unknown,
     tradeStatus: 'CONFIRMED' | 'UNKNOWN' = 'CONFIRMED',
   ): Promise<void> {
+    logger.warn(
+      {
+        tradeId: trade.id,
+        step: transaction.step,
+        tradeStatus,
+      },
+      'Enregistrement d’échec de mesure.',
+    );
     const now = Date.now();
     const reason = errorMessage(error);
     trade.status = tradeStatus;
@@ -602,6 +781,10 @@ export class TradeExecutor {
   }
 
   private async failTrade(trade: TradeRecord, error: unknown): Promise<void> {
+    logger.warn(
+      { tradeId: trade.id, error: errorMessage(error) },
+      'Trade marqué FAILED.',
+    );
     trade.status = 'FAILED';
     trade.error = errorMessage(error);
     trade.updatedAtMs = Date.now();
