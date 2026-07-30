@@ -32,6 +32,14 @@ test('dashboard affiche les champs heartbeat dans la page', () => {
   assert.match(html, /chain\.state/);
 });
 
+test('dashboard affiche l’entrée à la seconde et le lien Dexscreener de la paire', () => {
+  const html = renderDashboardPage('nonce', 5);
+  assert.match(html, /<th>Entrée<\/th>/u);
+  assert.match(html, /formatDate\(token\.entry\.confirmedAt\)/u);
+  assert.match(html, /https:\/\/dexscreener\.com\/bsc\/' \+ token\.pairAddress/u);
+  assert.match(html, /allowedHosts = \['bscscan\.com', 'testnet\.bscscan\.com', 'dexscreener\.com'\]/u);
+});
+
 test('dashboard distingue PnL brut, gas, PnL net et simulation', () => {
   const html = renderDashboardPage('nonce', 5);
   assert.match(html, /PnL brut/u);

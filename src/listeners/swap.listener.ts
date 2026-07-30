@@ -11,6 +11,7 @@ import { classifySwap } from '../strategy/swap-classifier.js';
 import type { SessionEngine } from '../strategy/session-engine.js';
 import { isSessionMonitorable } from '../strategy/session-monitor-policy.js';
 import type { SwapEvent, TokenSession } from '../types/domain.js';
+import { errorMessage } from '../utils/error.js';
 import { logger } from '../utils/logger.js';
 
 interface SwapLog {
@@ -163,6 +164,14 @@ export class SwapListener {
   }
 
   async start(options: { signal?: AbortSignal } = {}): Promise<void> {
+    logger.debug(
+      {
+        pair: this.session.pair.pair,
+        token: this.session.pair.token,
+        hasSignal: Boolean(options.signal),
+      },
+      'Démarrage de l’écouteur Swap.',
+    );
     this.stopped = false;
     this.terminalNotified = false;
     this.externalIngestionEnabled = true;
@@ -180,6 +189,14 @@ export class SwapListener {
   }
 
   async startForReplay(): Promise<void> {
+    logger.debug(
+      {
+        pair: this.session.pair.pair,
+        token: this.session.pair.token,
+        createdBlock: this.session.pair.createdBlock.toString(),
+      },
+      'Démarrage de l’écouteur Swap en mode replay.',
+    );
     this.stopped = false;
     this.terminalNotified = false;
     this.externalIngestionEnabled = false;
@@ -190,6 +207,13 @@ export class SwapListener {
 
   activateAfterReplay(): void {
     if (this.stopped || !this.replayPrepared) return;
+    logger.debug(
+      {
+        pair: this.session.pair.pair,
+        token: this.session.pair.token,
+      },
+      'Fin du replay Swap: activation de l’ingestion WS.',
+    );
     this.replayPrepared = false;
     this.externalIngestionEnabled = true;
     if (!isSessionMonitorable(this.session)) return;
@@ -198,6 +222,13 @@ export class SwapListener {
   }
 
   private installWatcher(): void {
+    logger.debug(
+      {
+        pair: this.session.pair.pair,
+        listenerMode: this.replayPrepared ? 'replay' : 'live',
+      },
+      'Installation du watcher Swap.',
+    );
     this.stopWatch = this.dependencies.watcher.watchContractEvent({
       address: this.session.pair.pair,
       abi: pancakePairAbi,
@@ -226,8 +257,20 @@ export class SwapListener {
 
   private installInterval(): void {
     if (this.interval) clearInterval(this.interval);
+    logger.debug(
+      {
+        pair: this.session.pair.pair,
+        intervalMs: this.dependencies.reconcileIntervalMs
+          ?? config.reconcileSeconds * 1_000,
+      },
+      'Installation de la réconciliation périodique Swap.',
+    );
     this.interval = setInterval(() => {
       if (this.stopped) return;
+      logger.debug(
+        { pair: this.session.pair.pair },
+        'Tick de réconciliation Swap planifié.',
+      );
       void this.track(this.tick()).catch((error: unknown) =>
         logger.error(
           {
@@ -252,6 +295,13 @@ export class SwapListener {
   }
 
   stop(): void {
+    logger.debug(
+      {
+        pair: this.session.pair.pair,
+        inFlight: this.inFlight.size,
+      },
+      'Arrêt de l’écouteur Swap.',
+    );
     this.stopped = true;
     this.externalIngestionEnabled = false;
     this.replayPrepared = false;
@@ -260,33 +310,88 @@ export class SwapListener {
   }
 
   async stopAndDrain(): Promise<void> {
+    logger.debug(
+      {
+        pair: this.session.pair.pair,
+      },
+      'Drain des opérations Swap en cours.',
+    );
     this.stop();
     while (this.inFlight.size > 0) {
       await Promise.allSettled([...this.inFlight]);
     }
+    logger.debug(
+      {
+        pair: this.session.pair.pair,
+      },
+      'Opérations Swap en cours drainées.',
+    );
   }
 
   reconcileNow(): Promise<void> {
+    logger.debug(
+      {
+        pair: this.session.pair.pair,
+      },
+      'Réconciliation Swap déclenchée manuellement.',
+    );
     return this.requestReconcile();
   }
 
   private async tick(): Promise<void> {
+    logger.debug(
+      {
+        pair: this.session.pair.pair,
+        status: this.session.status,
+      },
+      'Tick Swap exécuté.',
+    );
     if (await this.engine.expireIfNeeded(this.session)) {
+      logger.debug(
+        { pair: this.session.pair.pair },
+        'Session expirée au tick Swap.',
+      );
       this.stopAndNotifyTerminal();
       return;
     }
     await this.requestReconcile();
     if (this.engine.isTerminal(this.session)) {
+      logger.debug(
+        {
+          pair: this.session.pair.pair,
+          status: this.session.status,
+        },
+        'Session devenue terminale pendant tick Swap.',
+      );
       this.stopAndNotifyTerminal();
     }
   }
 
   private requestReconcile(signal?: AbortSignal): Promise<void> {
-    if (this.stopped) return Promise.resolve();
+    if (this.stopped) {
+      logger.debug(
+        { pair: this.session.pair.pair },
+        'Réconciliation Swap ignorée: listener arrêté.',
+      );
+      return Promise.resolve();
+    }
     if (this.reconciliation) {
       this.reconcilePending = true;
+      logger.debug(
+        { pair: this.session.pair.pair, pending: this.reconcilePending },
+        'Réconciliation Swap déjà en cours; passage planifié.',
+      );
       return this.reconciliation;
     }
+
+    logger.debug(
+      {
+        pair: this.session.pair.pair,
+        createdBlock: this.session.pair.createdBlock.toString(),
+        hasSignal: Boolean(signal),
+      },
+      'Début d’un cycle de réconciliation Swap.',
+    );
 
     const execution = (async () => {
       let firstFailure: unknown;
@@ -302,10 +407,32 @@ export class SwapListener {
               this.processChunk(fromBlock, toBlock, canonicalHeaders),
           });
         } catch (error) {
+          logger.error(
+            {
+              pair: this.session.pair.pair,
+              attempt: failed ? 'retry' : 'first',
+              error: errorMessage(error),
+            },
+            'Échec de réconciliation Swap.',
+          );
           if (!failed) firstFailure = error;
           failed = true;
         }
       } while (this.reconcilePending && !this.stopped && !signal?.aborted);
+      if (failed) {
+        logger.error(
+          {
+            pair: this.session.pair.pair,
+            error: errorMessage(firstFailure),
+          },
+          'Cycle de réconciliation Swap terminé en erreur.',
+        );
+      } else {
+        logger.debug(
+          { pair: this.session.pair.pair },
+          'Cycle de réconciliation Swap terminé avec succès.',
+        );
+      }
       if (failed) throw firstFailure;
     })();
     const tracked = this.track(execution);
@@ -320,6 +447,15 @@ export class SwapListener {
     toBlock: bigint,
     canonicalHeaders: readonly CanonicalBlock[],
   ): Promise<boolean> {
+    logger.debug(
+      {
+        pair: this.session.pair.pair,
+        fromBlock: fromBlock.toString(),
+        toBlock: toBlock.toString(),
+        expectedHeaderCount: canonicalHeaders.length,
+      },
+      'Lecture de chunk Swap confirmé.',
+    );
     const logs = await this.dependencies.logReader.getContractEvents({
       address: this.session.pair.pair,
       abi: pancakePairAbi,
@@ -327,6 +463,13 @@ export class SwapListener {
       fromBlock,
       toBlock,
     });
+    logger.debug(
+      {
+        pair: this.session.pair.pair,
+        rawLogCount: logs.length,
+      },
+      'Chunk Swap confirmé récupéré.',
+    );
     return this.processLogs(
       logs as SwapLog[],
       fromBlock,
@@ -341,6 +484,16 @@ export class SwapListener {
     toBlock: bigint,
     canonicalHeaders: readonly CanonicalBlock[],
   ): Promise<boolean> {
+    logger.debug(
+      {
+        pair: this.session.pair.pair,
+        fromBlock: fromBlock.toString(),
+        toBlock: toBlock.toString(),
+        headerCount: canonicalHeaders.length,
+        received: logs.length,
+      },
+      'Traitement des logs Swap confirmés.',
+    );
     const expectedHashes = new Map(
       canonicalHeaders.map((header) => [
         header.number,
@@ -364,6 +517,13 @@ export class SwapListener {
       }
       return log;
     });
+    logger.debug(
+      {
+        pair: this.session.pair.pair,
+        identifiedCount: identified.length,
+      },
+      'Logs Swap validés et alignés avec la chaîne canonique.',
+    );
     const sorted = [...identified].sort((a, b) => {
       if (a.blockNumber !== b.blockNumber) {
         return a.blockNumber < b.blockNumber ? -1 : 1;
@@ -381,6 +541,13 @@ export class SwapListener {
         || args.amount0In === undefined || args.amount1In === undefined
         || args.amount0Out === undefined || args.amount1Out === undefined
       ) continue;
+      logger.debug(
+        {
+          pair: this.session.pair.pair,
+          blockNumber: log.blockNumber.toString(),
+        },
+        'Log Swap ignoré: champs requis manquants.',
+      );
 
       const event = classifySwap(this.session.pair, {
         pair: this.session.pair.pair,
@@ -398,14 +565,32 @@ export class SwapListener {
       });
       const consumed = await this.engine.onSwap(this.session, event);
       if (!consumed || !isSessionMonitorable(this.session)) {
+        logger.debug(
+          {
+            pair: this.session.pair.pair,
+            consumed,
+          },
+          'Arrêt du traitement Swap: session plus monitorable ou événement non consommé.',
+        );
         this.stopAndNotifyTerminal();
         return false;
       }
     }
+    logger.debug(
+      {
+        pair: this.session.pair.pair,
+        processed: sorted.length,
+      },
+      'Chunk Swap terminé.',
+    );
     return true;
   }
 
   private stopAndNotifyTerminal(): void {
+    logger.warn(
+      { pair: this.session.pair.pair },
+      'Session terminale détectée, arrêt de l’écouteur Swap.',
+    );
     this.stop();
     if (this.terminalNotified) return;
     this.terminalNotified = true;

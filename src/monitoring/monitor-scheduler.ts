@@ -76,6 +76,10 @@ export class MonitorScheduler {
   }
 
   waitForIdle(): Promise<void> {
+    logger.debug(
+      { active: this.activePairsCount() },
+      'Attente de l’idleness du scheduler.',
+    );
     return this.running?.then(() => undefined) ?? Promise.resolve();
   }
 
@@ -85,6 +89,13 @@ export class MonitorScheduler {
       return this.running;
     }
 
+    logger.debug(
+      {
+        active: this.activePairKeys().size,
+        capacity: this.status.capacity,
+      },
+      'Relance du scheduler de monitoring.',
+    );
     this.running = this.runUntilStable();
     return this.running;
   }
@@ -103,12 +114,27 @@ export class MonitorScheduler {
   }
 
   private async runPass(): Promise<Address[]> {
+    logger.debug(
+      { capacity: this.dependencies.capacity },
+      'Début d’un passage de scheduling.',
+    );
     const now = this.now();
     const sessions = await this.dependencies.loadSessions();
+    logger.debug(
+      { sessions: sessions.length, now },
+      'Sessions chargées pour scheduling.',
+    );
     const eligible: TokenSession[] = [];
     const reservedPairs = new Set<string>();
 
     for (const session of sessions) {
+      logger.debug(
+        {
+          pair: session.pair.pair,
+          status: session.status,
+        },
+        'Évaluation d’éligibilité monitoring.',
+      );
       const pairKey = session.pair.pair.toLowerCase();
       const isActive = this.activePairKeys().has(pairKey);
       if (
@@ -171,6 +197,15 @@ export class MonitorScheduler {
       let activePairs = this.activePairKeys();
       const pairKey = queuedSession.pair.pair.toLowerCase();
       if (activePairs.has(pairKey)) continue;
+      logger.debug(
+        {
+          pair: queuedSession.pair.pair,
+          status: queuedSession.status,
+          activePairs: activePairs.size,
+          capacity: this.dependencies.capacity,
+        },
+        'Tentative d’admission monitoring.',
+      );
       if (this.dependencies.canStart && !this.dependencies.canStart()) break;
       if (
         activePairs.size + reservedFailedHoldingSlots
@@ -267,6 +302,10 @@ export class MonitorScheduler {
       );
     }
     return failedPairs;
+  }
+
+  private activePairsCount(): number {
+    return this.activePairKeys().size;
   }
 
   private activePairKeys(): Set<string> {

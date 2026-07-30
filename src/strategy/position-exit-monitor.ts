@@ -39,11 +39,13 @@ export class PositionExitMonitor {
 
   start(): void {
     if (this.enabled) return;
+    logger.info({ }, 'Démarrage du monitor de sortie positions.');
     this.enabled = true;
     void this.scheduleNext();
   }
 
   stop(): void {
+    logger.info({ }, 'Arrêt du monitor de sortie positions.');
     this.enabled = false;
     if (this.timer) {
       (this.dependencies.clearTimer ?? clearTimeout)(this.timer);
@@ -54,22 +56,37 @@ export class PositionExitMonitor {
   async reconcileNow(): Promise<void> {
     if (this.active) {
       this.rerunRequested = true;
+      logger.debug(
+        { },
+        'Réconciliation de sortie en cours, nouvelle passe demandée.',
+      );
       return this.active;
     }
     this.active = (async () => {
+      logger.debug({ }, 'Début de la passe de sortie positions.');
       do {
         this.rerunRequested = false;
         await this.dependencies.barrier.runListener(async () => this.runPass());
       } while (this.rerunRequested);
     })().finally(() => {
+      logger.debug({ }, 'Fin de la passe de sortie positions.');
       this.active = null;
     });
     return this.active;
   }
 
   async reconcilePendingDecisions(): Promise<void> {
+    logger.debug({ }, 'Traitement des décisions de sortie en attente.');
     const decisions = await this.dependencies.decisions.listRecoverableDecisions();
     for (const decision of decisions) {
+      logger.debug(
+        {
+          decisionId: decision.id,
+          status: decision.status,
+          pair: decision.pair,
+        },
+        'Évaluation décision de sortie.',
+      );
       const session = await this.dependencies.sessions.findByPair(decision.pair);
       if (decision.status === 'PENDING') {
         if (session?.status === 'HOLDING') {
@@ -128,6 +145,7 @@ export class PositionExitMonitor {
   }
 
   private async runPass(): Promise<void> {
+    logger.debug({ }, 'Début de la passe de monitoring de sortie.');
     await this.reconcilePendingDecisions();
     const sessions = await this.dependencies.sessions.loadHolding();
     let passError: string | null = null;
@@ -147,10 +165,24 @@ export class PositionExitMonitor {
     }
     this.lastErrorType = passError;
     this.lastCompletedAtMs = this.now();
+    logger.debug(
+      {
+        holdingCount: sessions.length,
+        passError,
+      },
+      'Passe de sortie terminée.',
+    );
   }
 
   private async evaluateSession(session: TokenSession): Promise<void> {
     if (!session.entry || session.status !== 'HOLDING') return;
+    logger.debug(
+      {
+        pair: session.pair.pair,
+        buysAfterEntry: session.subsequentBuyCount,
+      },
+      'Évaluation de session HOLDING.',
+    );
     const effective = await this.dependencies.settings.get();
     const nowMs = this.now();
     let metrics;
@@ -194,6 +226,14 @@ export class PositionExitMonitor {
       evaluation.action === 'HOLD' ||
       evaluation.primaryRule === undefined
     ) {
+      logger.debug(
+        {
+          pair: session.pair.pair,
+          action: evaluation.action,
+          primaryRule: evaluation.primaryRule,
+        },
+        'Sortie maintenue.',
+      );
       return;
     }
     const entryReference =
@@ -237,6 +277,12 @@ export class PositionExitMonitor {
         })
         .finally(() => this.scheduleNext());
     }, effective.settings.monitorIntervalSeconds * 1_000);
+    logger.debug(
+      {
+        monitorIntervalSeconds: effective.settings.monitorIntervalSeconds,
+      },
+      'Prochaine passe de sortie programmée.',
+    );
   }
 
   private now(): number {

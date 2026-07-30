@@ -147,11 +147,23 @@ export class PairCreatedListener {
 
   async start(): Promise<void> {
     this.stopped = false;
+    logger.debug(
+      {
+        factory: config.factory,
+        reconcileSeconds: config.reconcileSeconds,
+        startBlock: 0,
+      },
+      'Démarrage de l’écouteur PairCreated.',
+    );
     this.stopWatch = this.dependencies.watcher.watchContractEvent({
       address: config.factory,
       abi: pancakeFactoryAbi,
       eventName: 'PairCreated',
       onLogs: () => {
+        logger.debug(
+          { factory: config.factory },
+          'PairCreated: événements WS reçus, lancement réconciliation immédiate.',
+        );
         void this.requestReconcile().catch((error: unknown) =>
           logger.error(
             { errorType: safeErrorType(error) },
@@ -168,6 +180,10 @@ export class PairCreatedListener {
     await this.requestReconcile();
     if (this.stopped) return;
     this.interval = setInterval(() => {
+      logger.debug(
+        { factory: config.factory },
+        'Réconciliation périodique PairCreated planifiée.',
+      );
       void this.requestReconcile().catch((error: unknown) =>
         logger.error(
           { errorType: safeErrorType(error) },
@@ -183,26 +199,44 @@ export class PairCreatedListener {
   }
 
   stop(): void {
+    logger.debug(
+      { factory: config.factory },
+      'Arrêt de l’écouteur PairCreated.',
+    );
     this.stopped = true;
     this.stopWatch?.();
     if (this.interval) clearInterval(this.interval);
   }
 
   reconcileNow(): Promise<void> {
+    logger.debug(
+      { factory: config.factory },
+      'Réconciliation PairCreated déclenchée manuellement.',
+    );
     return this.requestReconcile();
   }
 
   private requestReconcile(): Promise<void> {
-    if (this.stopped) return Promise.resolve();
+    if (this.stopped) {
+      logger.debug(
+        { factory: config.factory },
+        'Réconciliation PairCreated ignorée: listener arrêté.',
+      );
+      return Promise.resolve();
+    }
     if (this.reconciliation) {
       this.reconcilePending = true;
+      logger.debug(
+        { factory: config.factory },
+        'Réconciliation PairCreated déjà en cours; marquage en attente.',
+      );
       return this.reconciliation;
     }
 
     const execution = (async () => {
       let firstFailure: unknown;
-      let failed = false;
-      do {
+        let failed = false;
+        do {
         this.reconcilePending = false;
         try {
           await this.dependencies.coordinator.reconcile({
@@ -237,6 +271,15 @@ export class PairCreatedListener {
       fromBlock,
       toBlock,
     });
+    logger.debug(
+      {
+        listenerKey: 'pair-created',
+        fromBlock: fromBlock.toString(),
+        toBlock: toBlock.toString(),
+        rawLogCount: logs.length,
+      },
+      'Chunk PairCreated confirmé récupéré.',
+    );
     await this.processLogs(
       logs as PairCreatedLog[],
       fromBlock,
@@ -252,6 +295,16 @@ export class PairCreatedListener {
     toBlock: bigint,
     canonicalHeaders: readonly CanonicalBlock[],
   ): Promise<void> {
+    const totalLogs = logs.length;
+    logger.debug(
+      {
+        listenerKey: 'pair-created',
+        totalLogs,
+        fromBlock: fromBlock.toString(),
+        toBlock: toBlock.toString(),
+      },
+      'Traitement des logs PairCreated confirmés.',
+    );
     const expectedHashes = new Map(
       canonicalHeaders.map((header) => [
         header.number,
@@ -284,17 +337,44 @@ export class PairCreatedListener {
       }
       return a.logIndex - b.logIndex;
     });
+    logger.debug(
+      { identified: sorted.length },
+      'Logs PairCreated identifiés après validation.',
+    );
 
     for (const log of sorted) {
       const { token0, token1, pair } = log.args;
-      if (
-        !token0 || !token1 || !pair
-      ) continue;
+      if (!token0 || !token1 || !pair) {
+        logger.debug(
+          { blockNumber: log.blockNumber.toString() },
+          'Log PairCreated ignoré: champs token/pair manquants.',
+        );
+        continue;
+      }
       const token0IsWbnb =
         token0.toLowerCase() === config.wbnb.toLowerCase();
       const token1IsWbnb =
         token1.toLowerCase() === config.wbnb.toLowerCase();
-      if (!token0IsWbnb && !token1IsWbnb) continue;
+      if (!token0IsWbnb && !token1IsWbnb) {
+        logger.debug(
+          {
+            pair,
+            token0,
+            token1,
+          },
+          'Log PairCreated ignoré: paire non liée au WBNB.',
+        );
+        continue;
+      }
+      logger.debug(
+        {
+          pair,
+          token: token0IsWbnb ? token1 : token0,
+          token0IsWbnb,
+          totalRawLogs: totalLogs,
+        },
+        'Log PairCreated WBNB détecté.',
+      );
 
       await this.onPair({
         factory: config.factory,

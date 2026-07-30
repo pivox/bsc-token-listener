@@ -129,7 +129,7 @@ export function renderDashboardPage(nonce: string, refreshSeconds: number): stri
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Token</th><th>Détection</th><th>Risque</th><th>Statut</th><th>Investi</th><th>Valeur / récupéré</th><th>PnL</th><th>Déclencheur</th><th></th></tr></thead>
+          <thead><tr><th>Token</th><th>Détection</th><th>Entrée</th><th>Risque</th><th>Statut</th><th>Investi</th><th>Valeur / récupéré</th><th>PnL</th><th>Déclencheur</th><th></th></tr></thead>
           <tbody id="tokens-body"></tbody>
         </table>
         <div class="empty" id="empty-state" hidden>Aucun token dans cette vue.</div>
@@ -178,7 +178,8 @@ export function renderDashboardPage(nonce: string, refreshSeconds: number): stri
       if (!url) return '';
       try {
         const parsed = new URL(url);
-        if (parsed.protocol !== 'https:' || (parsed.hostname !== 'bscscan.com' && parsed.hostname !== 'testnet.bscscan.com')) return '';
+        const allowedHosts = ['bscscan.com', 'testnet.bscscan.com', 'dexscreener.com'];
+        if (parsed.protocol !== 'https:' || !allowedHosts.includes(parsed.hostname)) return '';
         return '<a href="' + escapeHtml(parsed.href) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(label) + '</a>';
       } catch (_error) { return ''; }
     };
@@ -307,6 +308,8 @@ export function renderDashboardPage(nonce: string, refreshSeconds: number): stri
         const label = token.symbol || token.name || 'Token';
         const risk = token.risk.verdict ? '<span class="status ' + riskTone(token.risk.verdict) + '">' + escapeHtml(token.risk.verdict) + ' · ' + escapeHtml(token.risk.score) + '/100</span>' : '—';
         const invested = token.entry ? formatBnb(token.entry.amountInBnb) : '—';
+        const entry = token.entry ? formatDate(token.entry.confirmedAt) : '—';
+        const dexscreener = token.pairAddress ? 'https://dexscreener.com/bsc/' + token.pairAddress : null;
         const value = token.exit ? formatBnb(token.exit.amountOutBnb) : token.valuation ? formatBnb(token.valuation.estimatedNetValueBnb) : '—';
         const realizedValue = token.pnl.realizedNetBnb === null ? token.pnl.realizedGrossBnb : token.pnl.realizedNetBnb;
         const realizedPercent = token.pnl.realizedNetPercent === null ? token.pnl.realizedGrossPercent : token.pnl.realizedNetPercent;
@@ -316,13 +319,14 @@ export function renderDashboardPage(nonce: string, refreshSeconds: number): stri
         return '<tr>' +
           '<td><span class="token-name">' + escapeHtml(label) + '</span><span class="sub">' + escapeHtml(shortAddress(token.tokenAddress)) + '</span></td>' +
           '<td>' + escapeHtml(formatDate(token.detectedAt)) + '<span class="sub">' + escapeHtml(token.source) + '</span></td>' +
+          '<td>' + escapeHtml(entry) + '</td>' +
           '<td>' + risk + '</td>' +
           '<td><span class="status ' + statusTone(token.status) + '">' + escapeHtml(token.statusLabel) + '</span></td>' +
           '<td>' + escapeHtml(invested) + '</td>' +
           '<td>' + escapeHtml(value) + '</td>' +
           '<td>' + pnl + '</td>' +
           '<td>' + progress + '</td>' +
-          '<td><button type="button" class="details-button" data-index="' + index + '">Voir</button></td>' +
+          '<td>' + safeLink(dexscreener, 'Dexscreener') + ' <button type="button" class="details-button" data-index="' + index + '">Voir</button></td>' +
           '</tr>';
       }).join('');
     }
@@ -354,6 +358,7 @@ export function renderDashboardPage(nonce: string, refreshSeconds: number): stri
       const links = [
         safeLink(token.links.token, 'Token BscScan'),
         safeLink(token.links.pair, 'Paire BscScan'),
+        safeLink(token.pairAddress ? 'https://dexscreener.com/bsc/' + token.pairAddress : null, 'Dexscreener'),
         safeLink(token.links.creationTransaction, 'Transaction de création'),
         safeLink(token.links.entryTransaction, 'Transaction d’achat'),
         safeLink(token.links.exitTransaction, 'Transaction de vente')

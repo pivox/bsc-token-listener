@@ -64,21 +64,60 @@ export class SessionEngine {
   ) {}
 
   async onSwap(session: TokenSession, event: SwapEvent): Promise<boolean> {
+    logger.debug(
+      {
+        pair: session.pair.pair,
+        token: session.pair.token,
+        eventId: event.id,
+        eventKind: event.kind,
+        status: session.status,
+      },
+      'Réception d’un événement Swap.',
+    );
     return this.withLock(session, async () => {
       const current = await this.sessions.findByPair(session.pair.pair);
-      if (!current) return false;
+      if (!current) {
+        logger.warn(
+          { pair: session.pair.pair, eventId: event.id },
+          'Swap ignoré: session introuvable.',
+        );
+        return false;
+      }
       this.replaceSession(session, current);
-      if (!isSessionMonitorable(session)) return false;
+      if (!isSessionMonitorable(session)) {
+        logger.debug(
+          {
+            pair: session.pair.pair,
+            status: session.status,
+          },
+          'Swap ignoré: session non monitorable.',
+        );
+        return false;
+      }
       const claimed = await this.eventLifecycle.claim(
         event,
         structuredClone(session),
       );
-      if (!claimed) return true;
+      if (!claimed) {
+        logger.debug(
+          { pair: session.pair.pair, eventId: event.id },
+          'Swap non traité: déjà pris en charge par une autre opération.',
+        );
+        return true;
+      }
       try {
         await this.handle(session, event);
         await this.eventLifecycle.markProcessed(
           event.id,
           structuredClone(session),
+        );
+        logger.debug(
+          {
+            pair: session.pair.pair,
+            status: session.status,
+            eventId: event.id,
+          },
+          'Swap traité avec succès.',
         );
         return true;
       } catch (error) {
@@ -101,6 +140,14 @@ export class SessionEngine {
   }
 
   async sellManually(session: TokenSession): Promise<TokenSession> {
+    logger.info(
+      {
+        pair: session.pair.pair,
+        token: session.pair.token,
+        status: session.status,
+      },
+      'Demande de vente manuelle reçue.',
+    );
     return this.withLock(session, async () => {
       const current = await this.sessions.findByPair(session.pair.pair);
       if (!current) throw new Error('Session introuvable.');
@@ -129,6 +176,15 @@ export class SessionEngine {
     session: TokenSession,
     decision: PositionExitDecision,
   ): Promise<TokenSession> {
+    logger.debug(
+      {
+        pair: session.pair.pair,
+        token: session.pair.token,
+        decisionId: decision.id,
+        action: decision.action,
+      },
+      'Demande d’exécution de politique de sortie.',
+    );
     if (!this.positionExits) {
       throw new Error('Politique de sortie non configurée.');
     }
@@ -141,6 +197,10 @@ export class SessionEngine {
   }
 
   async ignoreManually(session: TokenSession): Promise<TokenSession> {
+    logger.warn(
+      { pair: session.pair.pair },
+      'Demande d’ignorance manuelle reçue.',
+    );
     return this.withLock(session, async () => {
       const current = await this.sessions.findByPair(session.pair.pair);
       if (!current) throw new Error('Session introuvable.');
@@ -168,11 +228,28 @@ export class SessionEngine {
   }
 
   async expireIfNeeded(session: TokenSession): Promise<boolean> {
+    logger.debug(
+      {
+        pair: session.pair.pair,
+        status: session.status,
+        createdAtMs: session.createdAtMs,
+      },
+      'Évaluation d’expiration de session.',
+    );
     return this.withLock(session, async () => {
       const current = await this.sessions.findByPair(session.pair.pair);
       if (!current || current.status !== 'WAITING_FIRST_BUY') return false;
       const ttlMs = config.pairMonitorTtlMinutes * 60_000;
       if (Date.now() - current.createdAtMs < ttlMs) return false;
+      logger.warn(
+        {
+          pair: session.pair.pair,
+          token: session.pair.token,
+          waitedMs: Date.now() - current.createdAtMs,
+          ttlMs,
+        },
+        'Session WAITING_FIRST_BUY expirée.',
+      );
       current.status = 'EXPIRED';
       current.updatedAtMs = Date.now();
       current.rejectionReason = 'Aucun premier achat avant expiration du moniteur.';
@@ -195,10 +272,18 @@ export class SessionEngine {
       resolveCurrent = resolve;
     });
     const current = previous.catch(() => undefined).then(async () => {
+      logger.debug(
+        { pair: session.pair.pair },
+        'Entrée dans la file d’exécution session.',
+      );
       try {
         return await this.runtimeBarrier.runListener(operation);
       } finally {
         resolveCurrent?.();
+        logger.debug(
+          { pair: session.pair.pair },
+          'Sortie de la file d’exécution session.',
+        );
       }
     });
     this.locks.set(key, marker);
@@ -211,6 +296,15 @@ export class SessionEngine {
 
   private async handle(session: TokenSession, event: SwapEvent): Promise<void> {
     if (this.isTerminal(session)) return;
+    logger.debug(
+      {
+        pair: session.pair.pair,
+        eventId: event.id,
+        fromStatus: session.status,
+        eventKind: event.kind,
+      },
+      'Traitement principal du swap.',
+    );
     session.lastProcessedCursor = event.cursor;
     session.updatedAtMs = Date.now();
 

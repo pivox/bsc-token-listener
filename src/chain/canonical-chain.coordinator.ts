@@ -575,6 +575,14 @@ export class CanonicalChainCoordinator {
 
   reconcile(request: ConfirmedRangeRequest): Promise<void> {
     const scope = this.postReorgScopes.getStore();
+    logger.debug(
+      {
+        listenerKey: request.listenerKey,
+        state: this.status.state,
+        pendingRequests: this.status.pendingRequests + 1,
+      },
+      'Réception d’une demande de réconciliation canonique.',
+    );
     this.status = {
       ...this.status,
       pendingRequests: this.status.pendingRequests + 1,
@@ -610,6 +618,10 @@ export class CanonicalChainCoordinator {
         ...this.status,
         pendingRequests: this.status.pendingRequests - 1,
       };
+      logger.debug(
+        { listenerKey: request.listenerKey },
+        'Requête canonique désenregistrée des pending.',
+      );
     };
     const cancelQueuedRequest = (): boolean => {
       if (requestStarted || requestCancelled) return false;
@@ -625,6 +637,10 @@ export class CanonicalChainCoordinator {
     };
 
     if (this.status.state === 'RECONCILING') {
+      logger.debug(
+        { listenerKey: request.listenerKey },
+        'Mode RECONCILING: sérialisation de la demande en queue.',
+      );
       const operation = this.tail.then(async () => {
         try {
           if (queuedRequestCancelled()) return;
@@ -650,6 +666,10 @@ export class CanonicalChainCoordinator {
     const operation = this.tail.then(() => {
       if (queuedRequestCancelled()) return false;
       requestStarted = true;
+      logger.debug(
+        { listenerKey: request.listenerKey },
+        'Lancement immédiat de la réconciliation canonique.',
+      );
       return this.runRequest(request);
     });
     const execution = operation.then(() => undefined);
@@ -723,6 +743,13 @@ export class CanonicalChainCoordinator {
   private async runRequest(
     request: ConfirmedRangeRequest,
   ): Promise<boolean> {
+    logger.debug(
+      {
+        listenerKey: request.listenerKey,
+        activeRequests: this.activeRequests + 1,
+      },
+      'Démarrage d’une requête runRequest.',
+    );
     this.activeRequests += 1;
     this.status = { ...this.status, running: true };
     try {
@@ -734,6 +761,14 @@ export class CanonicalChainCoordinator {
         running: this.activeRequests > 0,
         pendingRequests: this.status.pendingRequests - 1,
       };
+      logger.debug(
+        {
+          listenerKey: request.listenerKey,
+          activeRequests: this.activeRequests,
+          running: this.status.running,
+        },
+        'runRequest terminée.',
+      );
     }
   }
 
@@ -790,10 +825,27 @@ export class CanonicalChainCoordinator {
 
   private async execute(request: ConfirmedRangeRequest): Promise<boolean> {
     const inPostReorgScope = this.postReorgScopes.getStore()?.active === true;
+    logger.debug(
+      {
+        listenerKey: request.listenerKey,
+        inPostReorgScope,
+        state: this.status.state,
+      },
+      'Entrée execute() canonique.',
+    );
     if (
       this.status.state !== 'HEALTHY'
       && !(this.status.state === 'RECONCILING' && inPostReorgScope)
-    ) return false;
+    ) {
+      logger.debug(
+        {
+          listenerKey: request.listenerKey,
+          state: this.status.state,
+        },
+        'Execution canonique ignorée pour état incompatible.',
+      );
+      return false;
+    }
     if (
       request.bootstrap !== undefined
       && request.bootstrap !== 'confirmed-head'
@@ -805,6 +857,14 @@ export class CanonicalChainCoordinator {
 
     const latestBlock = await this.blockReader.getBlockNumber();
     const head = confirmedHead(latestBlock, this.confirmations);
+    logger.debug(
+      {
+        listenerKey: request.listenerKey,
+        latestBlock: latestBlock.toString(),
+        head: head === null ? null : head.toString(),
+      },
+      'Tête confirmée calculée.',
+    );
     if (head === null) return false;
     if (this.cutoff !== null && head < this.cutoff.number) return false;
 
@@ -1027,6 +1087,15 @@ export class CanonicalChainCoordinator {
     descending: CanonicalBlock[],
     head: bigint,
   ): Promise<void> {
+    logger.warn(
+      {
+        oldTip: oldTip.number.toString(),
+        remoteTip: remoteOldTip.hash,
+        descendingCount: descending.length,
+        head: head.toString(),
+      },
+      'Divergence canonique détectée; démarrage reorg.',
+    );
     const validatedWindow = this.validateDescendingWindow(oldTip, descending);
     const window = this.cutoff === null
       ? validatedWindow
@@ -1075,6 +1144,15 @@ export class CanonicalChainCoordinator {
       newTip,
       depth,
     };
+    logger.debug(
+      {
+        oldTip: oldTip.number.toString(),
+        newTip: newTip.number.toString(),
+        ancestor: ancestor?.number.toString() ?? null,
+        depth,
+      },
+      'Reconciliation de divergence préparée.',
+    );
     const detectedAtMs = Date.now();
     this.reorgReadyForFinalization = false;
     this.status = {
@@ -1270,6 +1348,10 @@ export class CanonicalChainCoordinator {
     }
     const scanStart = minimum(scanCandidates);
     if (scanStart === null) {
+      logger.debug(
+        { checkpoint: checkpoint?.blockNumber?.toString() ?? null },
+        'Aucun scan canonique à préparer.',
+      );
       return {
         legacyHeader: null,
       };
@@ -1322,6 +1404,14 @@ export class CanonicalChainCoordinator {
       }
       previous = header;
     }
+    logger.debug(
+      {
+        checkpoint: checkpoint?.blockNumber?.toString() ?? null,
+        scanStart: scanStart.toString(),
+        legacyHeader: legacyHeader === null ? null : legacyHeader.number.toString(),
+      },
+      'Préparation de scan canonique terminée.',
+    );
     return { legacyHeader };
   }
 
