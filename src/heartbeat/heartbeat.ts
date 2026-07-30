@@ -55,11 +55,30 @@ export interface HeartbeatSnapshot {
     manualReviewSessions: number;
   };
   chain: ChainHealth;
+  providers: HeartbeatProviderSnapshot[];
 }
+
+export type HeartbeatProviderSnapshot = {
+  id: string;
+  kind: 'HTTP' | 'WEBSOCKET' | 'TX';
+  status: RpcStatus;
+  lagging: boolean;
+  blockNumber: string | null;
+  errorRate: number;
+  latencyMs: number | null;
+  switches: number;
+  lastError: string | null;
+  maxLogBlockRange: number;
+  lastBlockAgeMs: number | null;
+  lastWsMessageAgeMs: number | null;
+  inCooldownUntilMs: number | null;
+  consensusLag: string | null;
+};
 
 export interface HeartbeatDependencies {
   getHttpLatestBlock: () => Promise<bigint>;
   getWsLatestBlock: () => Promise<bigint>;
+  getProviderSnapshots?: () => Promise<HeartbeatProviderSnapshot[]>;
 }
 
 interface RecoveryStatusProvider {
@@ -110,11 +129,13 @@ export class HeartbeatService {
       activeSessions,
       http,
       webSocket,
+      providers,
     ] = await Promise.all([
       this.checkpoints.get('pair-created'),
       this.sessions.countActive(),
       this.fetchRpcHealth(this.dependencies.getHttpLatestBlock),
       this.fetchRpcHealth(this.dependencies.getWsLatestBlock),
+      this.fetchProviderSnapshots(),
     ]);
 
     const latestBlock = http.blockNumber ?? this.snapshot?.latestBlock ?? null;
@@ -140,9 +161,21 @@ export class HeartbeatService {
       webSocket,
       recovery: this.recoverySnapshot(),
       chain,
+      providers,
     };
 
     return this.snapshot;
+  }
+
+  private async fetchProviderSnapshots(): Promise<HeartbeatSnapshot['providers']> {
+    if (!this.dependencies.getProviderSnapshots) {
+      return [];
+    }
+    try {
+      return await this.dependencies.getProviderSnapshots();
+    } catch {
+      return [];
+    }
   }
 
   private async fetchChainHealth(latestBlock: bigint | null): Promise<ChainHealth> {

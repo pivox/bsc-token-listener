@@ -6,7 +6,6 @@ import type {
 } from '../chain/canonical-chain.types.js';
 import { config } from '../config/env.js';
 import { publicClient, wsClient } from '../rpc/clients.js';
-import type { CheckpointRepository } from '../storage/repositories.js';
 import { classifySwap } from '../strategy/swap-classifier.js';
 import type { SessionEngine } from '../strategy/session-engine.js';
 import { isSessionMonitorable } from '../strategy/session-monitor-policy.js';
@@ -14,7 +13,7 @@ import type { SwapEvent, TokenSession } from '../types/domain.js';
 import { errorMessage } from '../utils/error.js';
 import { logger } from '../utils/logger.js';
 
-interface SwapLog {
+export interface SwapLog {
   args: {
     sender?: Address;
     to?: Address;
@@ -40,26 +39,22 @@ function assertSwapLogIdentity(
   logIndex: number;
 } {
   if (typeof log.blockNumber !== 'bigint') {
-    throw new Error('Log Swap HTTP confirmé invalide: blockNumber absent.');
+    throw new Error('Log Swap HTTP invalide: blockNumber absent.');
   }
   if (!log.blockHash) {
-    throw new Error('Log Swap HTTP confirmé invalide: blockHash absent.');
+    throw new Error('Log Swap HTTP invalide: blockHash absent.');
   }
   if (!log.transactionHash) {
-    throw new Error(
-      'Log Swap HTTP confirmé invalide: transactionHash absent.',
-    );
+    throw new Error('Log Swap HTTP invalide: transactionHash absent.');
   }
   if (
     !Number.isSafeInteger(log.transactionIndex)
     || (log.transactionIndex ?? -1) < 0
   ) {
-    throw new Error(
-      'Log Swap HTTP confirmé invalide: transactionIndex absent.',
-    );
+    throw new Error('Log Swap HTTP invalide: transactionIndex absent.');
   }
   if (!Number.isSafeInteger(log.logIndex) || (log.logIndex ?? -1) < 0) {
-    throw new Error('Log Swap HTTP confirmé invalide: logIndex absent.');
+    throw new Error('Log Swap HTTP invalide: logIndex absent.');
   }
 }
 
@@ -97,6 +92,7 @@ export interface SwapListenerDependencies {
   watcher: ListenerWatcher;
   logReader: SwapLogReader;
   coordinator: ConfirmedRangeCoordinator;
+  requestReconcile?: (pair: Address) => void;
   reconcileIntervalMs?: number;
 }
 
@@ -119,48 +115,62 @@ function safeErrorType(error: unknown): string {
   return error.name !== 'Error' ? error.name : error.constructor.name;
 }
 
+function getCoordinatorKey(pair: Address): string {
+  return `swap:${pair.toLowerCase()}`;
+}
+
 export class SwapListener {
   private readonly engine: SwapEngine;
   private readonly onTerminal: (pair: Address) => void;
   private readonly dependencies: SwapListenerDependencies;
-  private stopWatch?: () => void;
-  private interval?: NodeJS.Timeout;
+  private stopWatch: (() => void) | null = null;
   private reconciliation: Promise<void> | null = null;
   private reconcilePending = false;
   private stopped = false;
   private terminalNotified = false;
   private externalIngestionEnabled = false;
   private replayPrepared = false;
+  private readonly hasCentralReconciliation: boolean;
   private readonly inFlight = new Set<Promise<unknown>>();
 
   constructor(
-    session: TokenSession,
-    checkpoints: CheckpointRepository,
-    engine: SessionEngine,
-    onTerminal: (pair: Address) => void,
-  );
-  constructor(
-    session: TokenSession,
-    engine: SwapEngine,
-    onTerminal: (pair: Address) => void,
-    dependencies: SwapListenerDependencies,
-  );
-  constructor(
     private readonly session: TokenSession,
-    second: CheckpointRepository | SwapEngine,
+    second: SwapEngine,
     third: SessionEngine | ((pair: Address) => void),
-    fourth: ((pair: Address) => void) | SwapListenerDependencies,
+    fourth?: ((pair: Address) => void) | SwapListenerDependencies,
   ) {
     if (typeof third === 'function') {
       this.engine = second as SwapEngine;
       this.onTerminal = third;
-      this.dependencies = fourth as SwapListenerDependencies;
+      this.dependencies = typeof fourth === 'object' && fourth !== null
+        ? fourth
+        : defaultDependencies;
+      this.hasCentralReconciliation = Boolean(
+        this.dependencies.requestReconcile,
+      );
       return;
     }
-    void second;
-    this.engine = third;
+
+    this.engine = third as SwapEngine;
     this.onTerminal = fourth as (pair: Address) => void;
     this.dependencies = defaultDependencies;
+    this.hasCentralReconciliation = false;
+  }
+
+  get pair(): Address {
+    return this.session.pair.pair;
+  }
+
+  get createdBlock(): bigint {
+    return this.session.pair.createdBlock;
+  }
+
+  get pairKey(): string {
+    return getCoordinatorKey(this.session.pair.pair);
+  }
+
+  isReconcileCapable(): boolean {
+    return !this.stopped && !this.replayPrepared;
   }
 
   async start(options: { signal?: AbortSignal } = {}): Promise<void> {
@@ -184,8 +194,13 @@ export class SwapListener {
       return;
     }
     if (this.stopped || !isSessionMonitorable(this.session)) return;
-    this.installInterval();
-    this.logActive();
+    logger.debug(
+      {
+        pair: this.session.pair.pair,
+        token: this.session.pair.token,
+      },
+      'Swap listener prêt en mode monitorage.',
+    );
   }
 
   async startForReplay(): Promise<void> {
@@ -216,12 +231,20 @@ export class SwapListener {
     );
     this.replayPrepared = false;
     this.externalIngestionEnabled = true;
-    if (!isSessionMonitorable(this.session)) return;
-    this.installInterval();
-    this.logActive();
+    this.requestReconcile();
   }
 
   private installWatcher(): void {
+    if (this.hasCentralReconciliation && !this.dependencies.requestReconcile) {
+      this.stopWatch = null;
+      logger.debug(
+        {
+          pair: this.session.pair.pair,
+        },
+        'Mode réconciliation centralisée: watcher Swap désactivé.',
+      );
+      return;
+    }
     logger.debug(
       {
         pair: this.session.pair.pair,
@@ -235,6 +258,10 @@ export class SwapListener {
       eventName: 'Swap',
       onLogs: () => {
         if (this.stopped || !this.externalIngestionEnabled) return;
+        if (this.dependencies.requestReconcile) {
+          this.dependencies.requestReconcile(this.session.pair.pair);
+          return;
+        }
         void this.requestReconcile().catch((error: unknown) =>
           logger.error(
             {
@@ -255,118 +282,6 @@ export class SwapListener {
     });
   }
 
-  private installInterval(): void {
-    if (this.interval) clearInterval(this.interval);
-    logger.debug(
-      {
-        pair: this.session.pair.pair,
-        intervalMs: this.dependencies.reconcileIntervalMs
-          ?? config.reconcileSeconds * 1_000,
-      },
-      'Installation de la réconciliation périodique Swap.',
-    );
-    this.interval = setInterval(() => {
-      if (this.stopped) return;
-      logger.debug(
-        { pair: this.session.pair.pair },
-        'Tick de réconciliation Swap planifié.',
-      );
-      void this.track(this.tick()).catch((error: unknown) =>
-        logger.error(
-          {
-            pair: this.session.pair.pair,
-            errorType: safeErrorType(error),
-          },
-          'Réconciliation Swap échouée.',
-        ),
-      );
-    }, this.dependencies.reconcileIntervalMs ?? config.reconcileSeconds * 1_000);
-  }
-
-  private logActive(): void {
-    logger.info(
-      {
-        pair: this.session.pair.pair,
-        token: this.session.pair.token,
-        status: this.session.status,
-      },
-      'Écoute Swap dédiée active.',
-    );
-  }
-
-  stop(): void {
-    logger.debug(
-      {
-        pair: this.session.pair.pair,
-        inFlight: this.inFlight.size,
-      },
-      'Arrêt de l’écouteur Swap.',
-    );
-    this.stopped = true;
-    this.externalIngestionEnabled = false;
-    this.replayPrepared = false;
-    this.stopWatch?.();
-    if (this.interval) clearInterval(this.interval);
-  }
-
-  async stopAndDrain(): Promise<void> {
-    logger.debug(
-      {
-        pair: this.session.pair.pair,
-      },
-      'Drain des opérations Swap en cours.',
-    );
-    this.stop();
-    while (this.inFlight.size > 0) {
-      await Promise.allSettled([...this.inFlight]);
-    }
-    logger.debug(
-      {
-        pair: this.session.pair.pair,
-      },
-      'Opérations Swap en cours drainées.',
-    );
-  }
-
-  reconcileNow(): Promise<void> {
-    logger.debug(
-      {
-        pair: this.session.pair.pair,
-      },
-      'Réconciliation Swap déclenchée manuellement.',
-    );
-    return this.requestReconcile();
-  }
-
-  private async tick(): Promise<void> {
-    logger.debug(
-      {
-        pair: this.session.pair.pair,
-        status: this.session.status,
-      },
-      'Tick Swap exécuté.',
-    );
-    if (await this.engine.expireIfNeeded(this.session)) {
-      logger.debug(
-        { pair: this.session.pair.pair },
-        'Session expirée au tick Swap.',
-      );
-      this.stopAndNotifyTerminal();
-      return;
-    }
-    await this.requestReconcile();
-    if (this.engine.isTerminal(this.session)) {
-      logger.debug(
-        {
-          pair: this.session.pair.pair,
-          status: this.session.status,
-        },
-        'Session devenue terminale pendant tick Swap.',
-      );
-      this.stopAndNotifyTerminal();
-    }
-  }
-
   private requestReconcile(signal?: AbortSignal): Promise<void> {
     if (this.stopped) {
       logger.debug(
@@ -375,6 +290,12 @@ export class SwapListener {
       );
       return Promise.resolve();
     }
+
+    if (this.dependencies.requestReconcile) {
+      this.dependencies.requestReconcile(this.session.pair.pair);
+      return Promise.resolve();
+    }
+
     if (this.reconciliation) {
       this.reconcilePending = true;
       logger.debug(
@@ -400,7 +321,7 @@ export class SwapListener {
         this.reconcilePending = false;
         try {
           await this.dependencies.coordinator.reconcile({
-            listenerKey: `swap:${this.session.pair.pair.toLowerCase()}`,
+            listenerKey: getCoordinatorKey(this.session.pair.pair),
             startBlock: this.session.pair.createdBlock,
             ...(signal ? { signal } : {}),
             processChunk: (fromBlock, toBlock, canonicalHeaders) =>
@@ -442,6 +363,15 @@ export class SwapListener {
     return this.reconciliation;
   }
 
+  async reconcileChunk(
+    fromBlock: bigint,
+    toBlock: bigint,
+    canonicalHeaders: readonly CanonicalBlock[],
+    logs: readonly unknown[],
+  ): Promise<boolean> {
+    return this.track(this.applySwapLogs(fromBlock, toBlock, canonicalHeaders, logs));
+  }
+
   private async processChunk(
     fromBlock: bigint,
     toBlock: bigint,
@@ -470,6 +400,15 @@ export class SwapListener {
       },
       'Chunk Swap confirmé récupéré.',
     );
+    return this.applySwapLogs(fromBlock, toBlock, canonicalHeaders, logs);
+  }
+
+  private async applySwapLogs(
+    fromBlock: bigint,
+    toBlock: bigint,
+    canonicalHeaders: readonly CanonicalBlock[],
+    logs: readonly unknown[],
+  ): Promise<boolean> {
     return this.processLogs(
       logs as SwapLog[],
       fromBlock,
@@ -524,14 +463,14 @@ export class SwapListener {
       },
       'Logs Swap validés et alignés avec la chaîne canonique.',
     );
-    const sorted = [...identified].sort((a, b) => {
-      if (a.blockNumber !== b.blockNumber) {
-        return a.blockNumber < b.blockNumber ? -1 : 1;
+    const sorted = [...identified].sort((left, right) => {
+      if (left.blockNumber !== right.blockNumber) {
+        return left.blockNumber < right.blockNumber ? -1 : 1;
       }
-      if (a.transactionIndex !== b.transactionIndex) {
-        return a.transactionIndex - b.transactionIndex;
+      if (left.transactionIndex !== right.transactionIndex) {
+        return left.transactionIndex - right.transactionIndex;
       }
-      return a.logIndex - b.logIndex;
+      return left.logIndex - right.logIndex;
     });
 
     for (const log of sorted) {
@@ -586,6 +525,16 @@ export class SwapListener {
     return true;
   }
 
+  async reconcileNow(): Promise<void> {
+    logger.debug(
+      {
+        pair: this.session.pair.pair,
+      },
+      'Réconciliation Swap déclenchée manuellement.',
+    );
+    return this.requestReconcile();
+  }
+
   private stopAndNotifyTerminal(): void {
     logger.warn(
       { pair: this.session.pair.pair },
@@ -595,6 +544,39 @@ export class SwapListener {
     if (this.terminalNotified) return;
     this.terminalNotified = true;
     this.onTerminal(this.session.pair.pair);
+  }
+
+  stop(): void {
+    logger.debug(
+      {
+        pair: this.session.pair.pair,
+        inFlight: this.inFlight.size,
+      },
+      'Arrêt de l’écouteur Swap.',
+    );
+    this.stopped = true;
+    this.externalIngestionEnabled = false;
+    this.replayPrepared = false;
+    this.stopWatch?.();
+  }
+
+  async stopAndDrain(): Promise<void> {
+    logger.debug(
+      {
+        pair: this.session.pair.pair,
+      },
+      'Drain des opérations Swap en cours.',
+    );
+    this.stop();
+    while (this.inFlight.size > 0) {
+      await Promise.all([...this.inFlight]);
+    }
+    logger.debug(
+      {
+        pair: this.session.pair.pair,
+      },
+      'Opérations Swap en cours drainées.',
+    );
   }
 
   private track<T>(operation: Promise<T>): Promise<T> {

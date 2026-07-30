@@ -17,11 +17,40 @@ function read(name: string, fallback?: string): string {
   throw new Error(`Variable d'environnement obligatoire manquante: ${name}`);
 }
 
-function firstUrl(name: string): string | undefined {
+function splitUrls(name: string): string[] {
   return process.env[name]
     ?.split(',')
     .map((value) => value.trim())
-    .find((value) => value.length > 0);
+    .filter((value) => value.length > 0) ?? [];
+}
+
+function firstUrl(name?: string, legacyName?: string): string | undefined {
+  if (!name) return undefined;
+  return [...splitUrls(name), ...(legacyName ? splitUrls(legacyName) : [])][0];
+}
+
+function parseProviderUrls(
+  name: string,
+  legacyName?: string,
+  secondaryLegacyName?: string,
+): string[] {
+  const urls = new Set<string>();
+  for (const url of [
+    ...splitUrls(name),
+    ...(legacyName ? splitUrls(legacyName) : []),
+    ...(secondaryLegacyName ? splitUrls(secondaryLegacyName) : []),
+  ]) {
+    if (url.length > 0) urls.add(url);
+  }
+  return [...urls];
+}
+
+function readWithFallback(
+  name: string,
+  legacyName?: string,
+  secondaryLegacyName?: string,
+): string | undefined {
+  return firstUrl(name, legacyName) ?? firstUrl(legacyName, secondaryLegacyName);
 }
 
 function readBoolean(name: string, fallback: boolean, legacyName?: string): boolean {
@@ -46,6 +75,14 @@ function readInteger(
     throw new Error(`${name} doit être un entier entre ${min} et ${max}.`);
   }
   return value;
+}
+
+export function parseRpcMaxLogBlockRange(value: string | undefined): number {
+  const parsed = Number(value ?? '100');
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 1500) {
+    throw new Error('RPC_MAX_LOG_BLOCK_RANGE doit être un entier entre 1 et 1500.');
+  }
+  return parsed;
 }
 
 function readAddress(name: string, fallback?: string): Address {
@@ -146,11 +183,35 @@ const positionExitSettings = parsePositionExitSettings({
   targetBuysAfterEntry,
 });
 
+const httpRpcUrls = parseProviderUrls(
+  'BSC_HTTP_RPC_URLS',
+  'BSC_HTTP_URLS',
+  'BSC_HTTP_RPC_URL',
+);
+const wsRpcUrls = parseProviderUrls(
+  'BSC_WS_RPC_URLS',
+  'BSC_WSS_URLS',
+  'BSC_WS_RPC_URL',
+);
+if (httpRpcUrls.length === 0) {
+  throw new Error('Aucun endpoint BSC_HTTP_RPC_URL / BSC_HTTP_RPC_URLS disponible.');
+}
+const httpRpcUrl = httpRpcUrls[0];
+if (!httpRpcUrl) throw new Error('Aucun endpoint BSC_HTTP_RPC_URL disponible.');
+const wsRpcUrl = wsRpcUrls[0] ?? httpRpcUrl;
+const txRpcUrl = readWithFallback(
+  'BSC_TX_RPC_URL',
+  'BSC_TX_URL',
+) ?? httpRpcUrl;
+
 export const config = {
   network,
   blockConfirmations: readBlockConfirmations(process.env),
-  httpRpcUrl: read('BSC_HTTP_RPC_URL', firstUrl('BSC_HTTP_URLS')),
-  wsRpcUrl: read('BSC_WS_RPC_URL', firstUrl('BSC_WSS_URLS')),
+  httpRpcUrls,
+  wsRpcUrls,
+  httpRpcUrl,
+  wsRpcUrl,
+  txRpcUrl,
   databaseUrl: read('DATABASE_URL'),
   autoMigrate: readBoolean('POSTGRES_AUTO_MIGRATE', true),
   dashboardEnabled: readBoolean('DASHBOARD_ENABLED', true),
@@ -203,6 +264,28 @@ export const config = {
   riskProbeAmountWei: parseEther(read('RISK_PROBE_AMOUNT_BNB', '0.005')),
   riskMaxBuyTaxBps: readInteger('RISK_MAX_BUY_TAX_BPS', 1500, 0, 10000),
   riskMaxSellTaxBps: readInteger('RISK_MAX_SELL_TAX_BPS', 1500, 0, 10000),
+  rpcMaxLogBlockRange: parseRpcMaxLogBlockRange(process.env.RPC_MAX_LOG_BLOCK_RANGE),
+  swapReconcileCoalesceWindowMs: readInteger(
+    'SWAP_RECONCILE_COALESCE_WINDOW_MS',
+    250,
+    10,
+    5_000,
+    'SWAP_SIGNAL_COALESCE_WINDOW_MS',
+  ),
+  swapLogBatchMaxAddresses: readInteger(
+    'SWAP_LOG_BATCH_MAX_ADDRESSES',
+    20,
+    1,
+    200,
+  ),
+  rpcMaxHttpRps: readInteger('RPC_MAX_HTTP_RPS', 20, 1, 25),
+  rpcMaxHttpRetries: readInteger('RPC_MAX_HTTP_RETRIES', 3, 1, 10),
+  rpcMonthlyRequestBudget: readInteger(
+    'RPC_MONTHLY_REQUEST_BUDGET',
+    3_000_000,
+    1,
+    100_000_000,
+  ),
   riskMaxRoundTripLossBps: readInteger(
     'RISK_MAX_ROUNDTRIP_LOSS_BPS',
     3000,

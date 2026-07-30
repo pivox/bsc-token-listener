@@ -15,6 +15,9 @@ export interface CanonicalBlockReader {
 export interface ConfirmedRangeRequest {
   listenerKey: string;
   startBlock: bigint;
+  checkpoint?: ListenerCheckpoint;
+  ignoreStoredCheckpoint?: boolean;
+  persistCheckpoint?: boolean;
   bootstrap?: 'confirmed-head';
   signal?: AbortSignal;
   processChunk(

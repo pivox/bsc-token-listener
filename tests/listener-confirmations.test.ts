@@ -215,6 +215,7 @@ test('PairCreated peut rejouer au démarrage avant d’activer le watcher', asyn
 test('Swap prépare le watcher muet pendant un replay hydraté puis ne l’active qu’après recovery', async () => {
   const watcher = new MemoryWatcher();
   const coordinator = new MemoryCoordinator();
+  const signaled: string[] = [];
   const subject = new SwapListener(
     tokenSession(),
     {
@@ -227,6 +228,7 @@ test('Swap prépare le watcher muet pendant un replay hydraté puis ne l’activ
       watcher,
       logReader: { getContractEvents: async () => [] },
       coordinator,
+      requestReconcile: (pair) => signaled.push(pair),
       reconcileIntervalMs: 60_000,
     },
   );
@@ -236,15 +238,17 @@ test('Swap prépare le watcher muet pendant un replay hydraté puis ne l’activ
   };
 
   await replay.startForReplay();
-  assert.equal(coordinator.requests.length, 1);
+  assert.equal(coordinator.requests.length, 0);
+  assert.equal(signaled.length, 1);
   watcher.options?.onLogs([]);
   await turn();
-  assert.equal(coordinator.requests.length, 1);
+  assert.equal(signaled.length, 1);
 
   replay.activateAfterReplay();
   watcher.options?.onLogs([]);
   await turn();
-  assert.equal(coordinator.requests.length, 2);
+  assert.equal(signaled.length, 3);
+  assert.equal(coordinator.requests.length, 0);
   subject.stop();
 });
 
@@ -762,4 +766,39 @@ test('stopAndDrain attend le traitement HTTP en vol déclenché par WebSocket', 
   release();
   await drain;
   assert.equal(drained, true);
+});
+
+test('callback WebSocket centralisé ne lance pas de réconciliation locale', async () => {
+  const watcher = new MemoryWatcher();
+  const coordinator = new MemoryCoordinator();
+  const signaled: string[] = [];
+  const subject = new SwapListener(
+    tokenSession(),
+    {
+      onSwap: async () => true,
+      expireIfNeeded: async () => false,
+      isTerminal: () => false,
+    },
+    () => {},
+    {
+      watcher,
+      logReader: {
+        getContractEvents: async () => {
+          throw new Error('le listener ne doit pas lire de logs HTTP');
+        },
+      },
+      coordinator,
+      requestReconcile: (pair) => signaled.push(pair),
+      reconcileIntervalMs: 60_000,
+    },
+  );
+
+  await subject.start();
+  watcher.options?.onLogs([swapLog()]);
+  watcher.options?.onLogs([swapLog()]);
+  await turn();
+
+  assert.equal(signaled.length, 3);
+  assert.equal(coordinator.requests.length, 0);
+  await subject.stopAndDrain();
 });

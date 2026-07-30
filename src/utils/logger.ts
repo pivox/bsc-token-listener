@@ -137,7 +137,15 @@ export const logger = pino(
     level: 'debug',
     timestamp: pino.stdTimeFunctions.isoTime,
     redact: {
-      paths: ['privateKey', '*.privateKey', 'BSC_HTTP_RPC_URL', 'BSC_WS_RPC_URL'],
+      paths: [
+        'privateKey',
+        '*.privateKey',
+        'BSC_HTTP_RPC_URL',
+        'BSC_WS_RPC_URL',
+        'BSC_HTTP_RPC_URLS',
+        'BSC_WS_RPC_URLS',
+        'BSC_TX_RPC_URL',
+      ],
       censor: '[REDACTED]',
     },
   },

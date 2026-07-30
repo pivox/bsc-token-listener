@@ -247,6 +247,22 @@ interface DashboardSnapshot {
       blockNumber: string | null;
       error: string | null;
     };
+    providers: Array<{
+      id: string;
+      kind: 'HTTP' | 'WEBSOCKET' | 'TX';
+      status: 'up' | 'down';
+      lagging: boolean;
+      blockNumber: string | null;
+      errorRate: number;
+      latencyMs: number | null;
+      switches: number;
+      lastError: string | null;
+      maxLogBlockRange: number;
+      lastBlockAgeMs: number | null;
+      lastWsMessageAgeMs: number | null;
+      inCooldownUntilMs: number | null;
+      consensusLag: string | null;
+    }>;
     recovery: {
       running: boolean;
       lastCompletedAt: string | null;

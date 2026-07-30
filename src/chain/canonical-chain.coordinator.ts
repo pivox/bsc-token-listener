@@ -877,28 +877,32 @@ export class CanonicalChainCoordinator {
         : storedTip;
     if (tip && tip.number > head) return false;
 
-    const storedCheckpoint = await this.checkpoints.get(request.listenerKey);
+    const storedCheckpoint = request.ignoreStoredCheckpoint
+      ? null
+      : await this.checkpoints.get(request.listenerKey);
+    const checkpoint = request.checkpoint ?? storedCheckpoint;
+    const availableCheckpoint = checkpoint ?? storedCheckpoint;
     const needsCutoffAnchor =
       this.cutoff !== null
-      && storedCheckpoint !== null
+      && availableCheckpoint !== null
       && (
-        storedCheckpoint.blockNumber < this.cutoff.number
+        availableCheckpoint.blockNumber < this.cutoff.number
         || (
-          storedCheckpoint.blockNumber === this.cutoff.number
+          availableCheckpoint.blockNumber === this.cutoff.number
           && (
-            storedCheckpoint.blockHash === null
-            || storedCheckpoint.blockHash.toLowerCase()
+            availableCheckpoint.blockHash === null
+            || availableCheckpoint.blockHash.toLowerCase()
               !== this.cutoff.hash.toLowerCase()
           )
         )
       );
-    const checkpoint =
+    const effectiveCheckpoint =
       needsCutoffAnchor && this.cutoff !== null
         ? {
             blockNumber: this.cutoff.number,
             blockHash: this.cutoff.hash,
           }
-        : storedCheckpoint;
+        : checkpoint;
     if (
       checkpoint?.blockHash === null
       && checkpoint.blockNumber > head
@@ -946,8 +950,8 @@ export class CanonicalChainCoordinator {
       knownHeaders.set(tip.number, validateHeader(tip, tip.number));
     }
 
-    const requestedFromBlock = checkpoint
-      ? checkpoint.blockNumber + 1n
+    const requestedFromBlock = effectiveCheckpoint
+      ? effectiveCheckpoint.blockNumber + 1n
       : request.bootstrap === 'confirmed-head'
         ? head
         : request.startBlock;
@@ -977,7 +981,7 @@ export class CanonicalChainCoordinator {
       const journalHeaders = await this.headerSpoolFactory.create();
       spools.push(journalHeaders);
       const prepared = await this.prepareCanonicalScan(
-        checkpoint,
+        effectiveCheckpoint,
         tip,
         knownHeaders,
         fromBlock,
@@ -997,20 +1001,22 @@ export class CanonicalChainCoordinator {
         : false;
       let checkpointPersisted = false;
       if (
-        checkpoint?.blockHash === null
-        && checkpoint.blockNumber <= head
+        effectiveCheckpoint?.blockHash === null
+        && effectiveCheckpoint.blockNumber <= head
       ) {
         const legacyHeader = prepared.legacyHeader;
         if (!legacyHeader) {
           throw new Error(
-            `Header legacy préparé absent pour le bloc ${checkpoint.blockNumber}.`,
+            `Header legacy préparé absent pour le bloc ${effectiveCheckpoint.blockNumber}.`,
           );
         }
-        await this.setCheckpoint(request.listenerKey, {
-          blockNumber: checkpoint.blockNumber,
-          blockHash: legacyHeader.hash,
-        });
-        checkpointPersisted = true;
+        if (request.persistCheckpoint !== false) {
+          await this.setCheckpoint(request.listenerKey, {
+            blockNumber: effectiveCheckpoint.blockNumber,
+            blockHash: legacyHeader.hash,
+          });
+          checkpointPersisted = true;
+        }
       }
 
       let chunkStart = fromBlock;
@@ -1044,11 +1050,13 @@ export class CanonicalChainCoordinator {
           ? await this.runtimeBarrier.runListener(processChunk)
           : await processChunk();
         if (!processed) break;
-        await this.setCheckpoint(request.listenerKey, {
-          blockNumber: header.number,
-          blockHash: header.hash,
-        });
-        checkpointPersisted = true;
+        if (request.persistCheckpoint !== false) {
+          await this.setCheckpoint(request.listenerKey, {
+            blockNumber: header.number,
+            blockHash: header.hash,
+          });
+          checkpointPersisted = true;
+        }
         chunkStart = header.number + 1n;
       }
       if (

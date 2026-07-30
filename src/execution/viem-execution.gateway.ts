@@ -4,9 +4,15 @@ import {
   type Address,
   type Hex,
 } from 'viem';
+import { chain } from '../config/chain.js';
 import { erc20Abi } from '../abi/erc20.abi.js';
 import { pancakeRouterAbi } from '../abi/pancake-router.abi.js';
-import { account, publicClient, walletClient } from '../rpc/clients.js';
+import {
+  account,
+  publicClient,
+  txClient,
+  walletClient,
+} from '../rpc/clients.js';
 import type {
   ExecutionGateway,
   ExecutionReceipt,
@@ -137,7 +143,7 @@ export class ViemExecutionGateway implements ExecutionGateway {
   }
 
   async sendRawTransaction(serializedTransaction: Hex) {
-    return publicClient.sendRawTransaction({ serializedTransaction });
+    return txClient.sendRawTransaction({ serializedTransaction });
   }
 
   async waitForReceipt(hash: `0x${string}`): Promise<ExecutionReceipt> {
@@ -173,6 +179,7 @@ export class ViemExecutionGateway implements ExecutionGateway {
     }
     const request = await walletClient.prepareTransactionRequest({
       account,
+      chain,
       to: input.toAddress,
       data: input.data,
       value: input.valueWei,

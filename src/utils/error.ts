@@ -1,3 +1,8 @@
+import { sanitizeRpcText } from './sanitize.js';
+
 export function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  if (error instanceof Error) {
+    return sanitizeRpcText(error.message);
+  }
+  return sanitizeRpcText(String(error));
 }

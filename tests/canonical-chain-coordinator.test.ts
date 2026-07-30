@@ -869,6 +869,115 @@ test('découpe par chunks et checkpoint chaque fin exacte', async () => {
   assert.equal(canonicalStore.blocks.size, 128);
 });
 
+test('découpe un rattrapage de 250 blocs en 100, 100 puis 50', async () => {
+  const checkpoints = new MemoryCheckpoints();
+  const canonicalStore = new MemoryCanonicalStore();
+  const ranges: Array<[bigint, bigint]> = [];
+  const subject = coordinator(
+    new MemoryBlockReader(255n),
+    canonicalStore,
+    checkpoints,
+    { chunkSize: 100 },
+  );
+
+  await subject.reconcile({
+    listenerKey: 'swaps',
+    startBlock: 1n,
+    processChunk: async (fromBlock, toBlock) => {
+      ranges.push([fromBlock, toBlock]);
+      return true;
+    },
+  });
+
+  assert.deepEqual(ranges, [
+    [1n, 100n],
+    [101n, 200n],
+    [201n, 250n],
+  ]);
+  let nextExpectedStart = 1n;
+  for (const [fromBlock, toBlock] of ranges) {
+    assert.equal(fromBlock, nextExpectedStart);
+    nextExpectedStart = toBlock + 1n;
+  }
+  assert.equal(nextExpectedStart, 251n);
+  assert.equal(
+    ranges.every(
+      ([fromBlock, toBlock]) => toBlock - fromBlock + 1n <= 100n,
+    ),
+    true,
+  );
+});
+
+test('une erreur de chunk ne checkpointe pas le remainder et la reprise reprend sur le bon bloc', async () => {
+  const checkpoints = new MemoryCheckpoints();
+  const canonicalStore = new MemoryCanonicalStore();
+  const firstRun: Array<[bigint, bigint]> = [];
+  const subject = coordinator(
+    new MemoryBlockReader(255n),
+    canonicalStore,
+    checkpoints,
+    { chunkSize: 100 },
+  );
+  const failure: Error = new Error('échec chunk 2');
+
+  await assert.rejects(
+    subject.reconcile({
+      listenerKey: 'swaps',
+      startBlock: 1n,
+      processChunk: async (fromBlock, toBlock) => {
+        firstRun.push([fromBlock, toBlock]);
+        if (toBlock === 200n) {
+          throw failure;
+        }
+        return true;
+      },
+    }),
+    (error) => error === failure,
+  );
+
+  assert.deepEqual(firstRun, [
+    [1n, 100n],
+    [101n, 200n],
+  ]);
+  assert.deepEqual(checkpoints.writes, [{
+    listenerKey: 'swaps',
+    checkpoint: {
+      blockNumber: 100n,
+      blockHash: hash(101n),
+    },
+  }]);
+  assert.equal(firstRun.some(([fromBlock, toBlock]) => toBlock - fromBlock + 1n > 100n), false);
+
+  const retryRun: Array<[bigint, bigint]> = [];
+  await subject.reconcile({
+    listenerKey: 'swaps',
+    startBlock: 1n,
+    processChunk: async (fromBlock, toBlock) => {
+      retryRun.push([fromBlock, toBlock]);
+      return true;
+    },
+  });
+
+  assert.deepEqual(retryRun, [
+    [101n, 200n],
+    [201n, 250n],
+  ]);
+  assert.deepEqual(checkpoints.writes.at(-1), {
+    listenerKey: 'swaps',
+    checkpoint: { blockNumber: 250n, blockHash: hash(251n) },
+  });
+  assert.equal(retryRun[0]?.[0], 101n);
+  assert.deepEqual(
+    [...firstRun, ...retryRun],
+    [
+      [1n, 100n],
+      [101n, 200n],
+      [101n, 200n],
+      [201n, 250n],
+    ],
+  );
+});
+
 test('false stoppe sans checkpoint le chunk ni le remainder', async () => {
   const checkpoints = new MemoryCheckpoints();
   const ranges: Array<[bigint, bigint]> = [];
