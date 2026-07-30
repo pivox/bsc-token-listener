@@ -265,3 +265,58 @@ test('un signal reçu après arrêt global n’est jamais exécuté', async () =
 
   assert.equal(target.calls, 0);
 });
+
+test('waitForIdle attend un passage planifié par microtask même s’il n’a pas encore démarré', async () => {
+  const barrier = createDeferredBarrier();
+  const timer = createFakeTimer();
+  const orchestrator = new SwapReconcileOrchestrator({
+    intervalMs: 15_000,
+    canRun: () => true,
+    onError: () => {},
+    setInterval: timer.setInterval as unknown as typeof setInterval,
+    clearInterval: timer.clearInterval as unknown as typeof clearInterval,
+  });
+  const target = createTarget('0x1111111111111111111111111111111111111111' as Address);
+
+  target.reconcileNow = async () => {
+    target.calls += 1;
+    await barrier.promise;
+  };
+
+  orchestrator.register(target);
+  orchestrator.signal(target.pair);
+
+  let idle = false;
+  const idlePromise = orchestrator.waitForIdle().then(() => {
+    idle = true;
+  });
+  await Promise.resolve();
+  assert.equal(idle, false);
+
+  barrier.resolve();
+  await idlePromise;
+  assert.equal(idle, true);
+  assert.equal(target.calls, 1);
+});
+
+test('requestAndWait rejette la promesse en cas d’erreur de réconciliation', async () => {
+  const timer = createFakeTimer();
+  const orchestrator = new SwapReconcileOrchestrator({
+    intervalMs: 15_000,
+    canRun: () => true,
+    onError: () => {},
+    setInterval: timer.setInterval as unknown as typeof setInterval,
+    clearInterval: timer.clearInterval as unknown as typeof clearInterval,
+  });
+  const target = createTarget('0x3333333333333333333333333333333333333333' as Address);
+  const expected = new Error('RPC indisponible');
+  target.reconcileNow = async () => {
+    throw expected;
+  };
+
+  orchestrator.register(target);
+  await assert.rejects(
+    orchestrator.requestAndWait(target.pair),
+    (error) => error === expected,
+  );
+});

@@ -13,7 +13,19 @@ interface SwapReconcileOrchestratorOptions {
   clearInterval: (handle: ReturnType<typeof setInterval>) => void;
 }
 
-function defaultSetInterval(callback: () => void, intervalMs: number): ReturnType<typeof setInterval> {
+interface SwapReconcileWaiter {
+  resolve: () => void;
+  reject: (error: unknown) => void;
+}
+
+interface SwapReconcileResult {
+  error?: unknown;
+}
+
+function defaultSetInterval(
+  callback: () => void,
+  intervalMs: number,
+): ReturnType<typeof setInterval> {
   return setInterval(callback, intervalMs);
 }
 
@@ -25,10 +37,25 @@ function getPairKey(pair: Address): string {
   return pair.toLowerCase();
 }
 
+function createWaiter(): SwapReconcileWaiter & { promise: Promise<void> } {
+  let resolve = () => {};
+  let reject = (_error: unknown) => {};
+  const promise = new Promise<void>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
+const stoppedError = new Error('Orchestrateur de réconciliation arrêté.');
+const notRegisteredError = new Error('Paire de réconciliation non enregistrée.');
+
 export class SwapReconcileOrchestrator {
   private readonly listeners = new Map<string, SwapReconcileTarget>();
   private readonly options: SwapReconcileOrchestratorOptions;
+  private readonly pairWaiters = new Map<string, Set<SwapReconcileWaiter>>();
   private running: Promise<void> | null = null;
+  private runningPairs = new Set<string>();
   private startScheduled = false;
   private requestedPairs = new Set<string>();
   private requestAll = false;
@@ -49,7 +76,10 @@ export class SwapReconcileOrchestrator {
   }
 
   unregister(pair: Address): void {
-    this.listeners.delete(getPairKey(pair));
+    const pairKey = getPairKey(pair);
+    this.listeners.delete(pairKey);
+    if (this.runningPairs.has(pairKey)) return;
+    this.failPairWaiters(pairKey, notRegisteredError);
   }
 
   start(): void {
@@ -62,9 +92,13 @@ export class SwapReconcileOrchestrator {
 
   stop(): void {
     this.stopped = true;
-    if (this.interval === null) return;
+    if (this.interval === null) {
+      this.failPendingRequestWaiters(stoppedError);
+      return;
+    }
     this.options.clearInterval(this.interval);
     this.interval = null;
+    this.failPendingRequestWaiters(stoppedError);
   }
 
   async stopAndDrain(): Promise<void> {
@@ -73,14 +107,31 @@ export class SwapReconcileOrchestrator {
   }
 
   waitForIdle(): Promise<void> {
-    return this.running?.then(() => undefined) ?? Promise.resolve();
+    return (async () => {
+      while (
+        this.running !== null
+        || this.startScheduled
+        || this.requestedPairs.size > 0
+        || this.requestAll
+      ) {
+        if (this.running) {
+          await this.running;
+        } else {
+          await Promise.resolve();
+        }
+      }
+    })();
   }
 
   signal(pair?: Address): void {
     if (this.stopped) return;
-
     if (pair) {
-      this.requestedPairs.add(getPairKey(pair));
+      const pairKey = getPairKey(pair);
+      if (!this.listeners.has(pairKey)) {
+        this.failPairWaiters(pairKey, notRegisteredError);
+        return;
+      }
+      this.requestedPairs.add(pairKey);
     } else {
       this.requestAll = true;
     }
@@ -99,6 +150,34 @@ export class SwapReconcileOrchestrator {
       this.startScheduled = false;
       if (this.stopped || this.running || !this.options.canRun()) return;
       this.running = this.runQueuedPasses();
+      this.running.finally(() => {
+        this.running = null;
+      });
+    });
+  }
+
+  requestAndWait(pair: Address): Promise<void> {
+    if (this.stopped) return Promise.reject(stoppedError);
+    const pairKey = getPairKey(pair);
+    if (!this.listeners.has(pairKey)) {
+      return Promise.reject(notRegisteredError);
+    }
+
+    const waiter = createWaiter();
+    const waiters = this.pairWaiters.get(pairKey)
+      ?? new Set<SwapReconcileWaiter>();
+    waiters.add(waiter);
+    this.pairWaiters.set(pairKey, waiters);
+
+    this.signal(pair);
+
+    return waiter.promise.finally(() => {
+      const currentWaiters = this.pairWaiters.get(pairKey);
+      if (!currentWaiters) return;
+      currentWaiters.delete(waiter);
+      if (currentWaiters.size === 0) {
+        this.pairWaiters.delete(pairKey);
+      }
     });
   }
 
@@ -113,30 +192,89 @@ export class SwapReconcileOrchestrator {
         && this.options.canRun()
       );
     } finally {
-      this.running = null;
+      return;
     }
   }
 
   private async reconcileQueuedListeners(): Promise<void> {
     const runAll = this.requestAll;
-    const requested = this.requestedPairs;
+    const requestedPairs = new Set(this.requestedPairs);
     this.requestAll = false;
-    this.requestedPairs = new Set<string>();
+    this.requestedPairs.clear();
 
     const targets = runAll
       ? [...this.listeners.values()]
-      : [...requested]
+      : [...requestedPairs]
         .map((pairKey) => this.listeners.get(pairKey))
         .filter((target): target is SwapReconcileTarget => target !== undefined);
 
+    const runningPairs = new Set(
+      targets.map((target) => getPairKey(target.pair)),
+    );
+    this.runningPairs = runningPairs;
+
+    const results = new Map<string, SwapReconcileResult>();
     await Promise.all(
       targets.map(async (target) => {
+        const pairKey = getPairKey(target.pair);
         try {
           await target.reconcileNow();
+          results.set(pairKey, {});
         } catch (error) {
+          results.set(pairKey, { error });
           this.options.onError(error);
         }
       }),
     );
+    this.runningPairs = new Set();
+
+    for (const pairKey of requestedPairs) {
+      const waiters = this.pairWaiters.get(pairKey);
+      if (!waiters || waiters.size === 0) continue;
+
+      const result = results.get(pairKey);
+      if (!results.has(pairKey) && !this.listeners.has(pairKey)) {
+        this.failPairWaiters(pairKey, notRegisteredError);
+      } else if (result?.error !== undefined) {
+        this.failPairWaiters(pairKey, result.error);
+      } else {
+        this.resolvePairWaiters(pairKey);
+      }
+    }
+  }
+
+  private failPendingRequestWaiters(error: unknown): void {
+    const pendingPairs = new Set(this.requestedPairs);
+    if (this.requestAll) {
+      for (const [pairKey, waiters] of this.pairWaiters) {
+        this.failPairWaiters(pairKey, error);
+      }
+      this.requestedPairs.clear();
+      this.requestAll = false;
+      return;
+    }
+
+    for (const pairKey of pendingPairs) {
+      this.failPairWaiters(pairKey, error);
+    }
+    this.requestedPairs.clear();
+  }
+
+  private resolvePairWaiters(pairKey: string): void {
+    const waiters = this.pairWaiters.get(pairKey);
+    if (!waiters || waiters.size === 0) return;
+    this.pairWaiters.delete(pairKey);
+    for (const waiter of waiters) {
+      waiter.resolve();
+    }
+  }
+
+  private failPairWaiters(pairKey: string, error: unknown): void {
+    const waiters = this.pairWaiters.get(pairKey);
+    if (!waiters || waiters.size === 0) return;
+    this.pairWaiters.delete(pairKey);
+    for (const waiter of waiters) {
+      waiter.reject(error);
+    }
   }
 }

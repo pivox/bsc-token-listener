@@ -8,6 +8,7 @@ import type {
 import { config } from '../src/config/env.js';
 import { PairCreatedListener } from '../src/listeners/pair-created.listener.js';
 import { SwapListener } from '../src/listeners/swap.listener.js';
+import { SwapReconcileOrchestrator } from '../src/monitoring/swap-reconcile-orchestrator.js';
 import type {
   PairInfo,
   SwapEvent,
@@ -58,6 +59,22 @@ class MemoryCoordinator {
     this.requests.push(request);
     await this.onReconcile(request);
   }
+}
+
+interface DeferredBarrier {
+  promise: Promise<void>;
+  resolve: () => void;
+  reject: (error: unknown) => void;
+}
+
+function createDeferredBarrier(): DeferredBarrier {
+  let resolve = () => {};
+  let reject = (_error: unknown) => {};
+  const promise = new Promise<void>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
 }
 
 function pairLog(
@@ -114,6 +131,45 @@ function tokenSession(): TokenSession {
     createdAtMs: 1,
     updatedAtMs: 1,
   };
+}
+
+function createReconciliationsWithSignals(
+  handlers: {
+    coordinator: MemoryCoordinator;
+    onSignal?: (pair: string) => void;
+  },
+) {
+  const orchestrator = new SwapReconcileOrchestrator({
+    intervalMs: 60_000,
+    canRun: () => true,
+    onError: () => {},
+  });
+  const watcher = new MemoryWatcher();
+  const signaled: string[] = [];
+  const session = tokenSession();
+  const listener = new SwapListener(
+    session,
+    {
+      onSwap: async () => true,
+      expireIfNeeded: async () => false,
+      isTerminal: () => false,
+    },
+    () => {},
+    {
+      watcher,
+      logReader: { getContractEvents: async () => [] },
+      coordinator: handlers.coordinator,
+      requestReconcile: (pair) => {
+        orchestrator.signal(pair);
+        handlers.onSignal?.(pair);
+      },
+      requestAndWait: async (pair) =>
+        orchestrator.requestAndWait(pair),
+      reconcileIntervalMs: 60_000,
+    },
+  );
+  orchestrator.register(listener);
+  return { orchestrator, watcher, signaled, listener, session };
 }
 
 function swapLog(
@@ -234,7 +290,7 @@ test('Swap prépare le watcher muet pendant un replay hydraté puis ne l’activ
   );
   const replay = subject as unknown as {
     startForReplay(): Promise<void>;
-    activateAfterReplay(): void;
+    activateAfterReplay(): Promise<void>;
   };
 
   await replay.startForReplay();
@@ -768,37 +824,206 @@ test('stopAndDrain attend le traitement HTTP en vol déclenché par WebSocket', 
   assert.equal(drained, true);
 });
 
-test('callback WebSocket centralisé ne lance pas de réconciliation locale', async () => {
-  const watcher = new MemoryWatcher();
+test('start() attend la réconciliation centrale réelle avant de revenir', async () => {
   const coordinator = new MemoryCoordinator();
-  const signaled: string[] = [];
-  const subject = new SwapListener(
-    tokenSession(),
-    {
-      onSwap: async () => true,
-      expireIfNeeded: async () => false,
-      isTerminal: () => false,
-    },
-    () => {},
-    {
-      watcher,
-      logReader: {
-        getContractEvents: async () => {
-          throw new Error('le listener ne doit pas lire de logs HTTP');
-        },
-      },
-      coordinator,
-      requestReconcile: (pair) => signaled.push(pair),
-      reconcileIntervalMs: 60_000,
-    },
-  );
+  const startGate = createDeferredBarrier();
+  coordinator.onReconcile = async () => {
+    await startGate.promise;
+  };
 
-  await subject.start();
-  watcher.options?.onLogs([swapLog()]);
-  watcher.options?.onLogs([swapLog()]);
+  const { listener } = createReconciliationsWithSignals({
+    coordinator,
+    onSignal: () => {},
+  });
+  let resolved = false;
+  const started = listener.start().then(() => {
+    resolved = true;
+  });
+
+  while (coordinator.requests.length === 0) {
+    await turn();
+  }
+  assert.equal(resolved, false);
+
+  startGate.resolve();
+  await started;
+  assert.equal(resolved, true);
+  assert.equal(coordinator.requests.length, 1);
+});
+
+test('startForReplay() attend la réconciliation de replay et garde le WS inactif', async () => {
+  const coordinator = new MemoryCoordinator();
+  const replayGate = createDeferredBarrier();
+  coordinator.onReconcile = async () => {
+    await replayGate.promise;
+  };
+
+  const { watcher, signaled, listener } = createReconciliationsWithSignals({
+    coordinator,
+    onSignal: () => signaled.push('signal'),
+  });
+  const started = listener.startForReplay();
   await turn();
 
+  assert.equal(coordinator.requests.length, 1);
+  assert.equal(signaled.length, 0);
+  watcher.options?.onLogs([swapLog()]);
+  await turn();
+  assert.equal(signaled.length, 0);
+
+  replayGate.resolve();
+  await started;
+  assert.equal(signaled.length, 0);
+  assert.equal(coordinator.requests.length, 1);
+});
+
+test('activateAfterReplay() attend la première passe live', async () => {
+  const coordinator = new MemoryCoordinator();
+  const replayGate = createDeferredBarrier();
+  const liveGate = createDeferredBarrier();
+  coordinator.onReconcile = async () => {
+    if (coordinator.requests.length === 1) {
+      await replayGate.promise;
+      return;
+    }
+    await liveGate.promise;
+  };
+
+  const { listener } = createReconciliationsWithSignals({ coordinator });
+  const started = listener.startForReplay();
+  await turn();
+  replayGate.resolve();
+  await started;
+
+  let activatedValue = false;
+  const activated = listener.activateAfterReplay().then(() => {
+    activatedValue = true;
+  });
+  await Promise.resolve();
+  assert.equal(activatedValue, false);
+  assert.equal(coordinator.requests.length, 2);
+
+  liveGate.resolve();
+  await activated;
+  assert.equal(activatedValue, true);
+});
+
+test('trois signaux WS centraux proches sont coalisés en un seul passage', async () => {
+  const coordinator = new MemoryCoordinator();
+  const firstGate = createDeferredBarrier();
+  coordinator.onReconcile = async () => {
+    if (coordinator.requests.length === 1) {
+      await firstGate.promise;
+    }
+  };
+
+  const { orchestrator, watcher, signaled, listener } = createReconciliationsWithSignals({
+    coordinator,
+    onSignal: (pair) => signaled.push(pair),
+  });
+  const started = listener.start();
+
+  while (coordinator.requests.length === 0) {
+    await turn();
+  }
+  watcher.options?.onLogs([swapLog()]);
+  watcher.options?.onLogs([swapLog()]);
+  watcher.options?.onLogs([swapLog()]);
+  firstGate.resolve();
+
+  await started;
+  await orchestrator.waitForIdle();
   assert.equal(signaled.length, 3);
-  assert.equal(coordinator.requests.length, 0);
-  await subject.stopAndDrain();
+  assert.equal(coordinator.requests.length, 2);
+});
+
+test('un signal WebSocket centralisé produit un appel coordonné, sans signalé de ré-exécution automatique', async () => {
+  const coordinator = new MemoryCoordinator();
+  coordinator.onReconcile = async () => {};
+  const { orchestrator, watcher, signaled, listener } = createReconciliationsWithSignals({
+    coordinator,
+    onSignal: (pair) => signaled.push(pair),
+  });
+
+  await listener.start();
+  assert.equal(signaled.length, 0);
+  signaled.length = 0;
+
+  watcher.options?.onLogs([swapLog()]);
+  await orchestrator.waitForIdle();
+
+  assert.equal(signaled.length, 1);
+  assert.equal(coordinator.requests.length, 2);
+});
+
+test('un signal pendant un passage provoque exactement un rerun', async () => {
+  const coordinator = new MemoryCoordinator();
+  const firstGate = createDeferredBarrier();
+  const secondGate = createDeferredBarrier();
+  coordinator.onReconcile = async () => {
+    if (coordinator.requests.length === 1) {
+      await firstGate.promise;
+      return;
+    }
+    await secondGate.promise;
+  };
+
+  const { orchestrator, watcher, listener } = createReconciliationsWithSignals({
+    coordinator,
+    onSignal: () => {},
+  });
+  const started = listener.start();
+  while (coordinator.requests.length === 0) {
+    await turn();
+  }
+  watcher.options?.onLogs([swapLog()]);
+  firstGate.resolve();
+  await started;
+  secondGate.resolve();
+  await orchestrator.waitForIdle();
+
+  assert.equal(coordinator.requests.length, 2);
+});
+
+test('un arrêt pendant une passe empêche un rerun de la paire', async () => {
+  const coordinator = new MemoryCoordinator();
+  const firstGate = createDeferredBarrier();
+  coordinator.onReconcile = async () => {
+    await firstGate.promise;
+  };
+
+  const { orchestrator, watcher, listener } = createReconciliationsWithSignals({
+    coordinator,
+    onSignal: () => {},
+  });
+  const started = listener.start();
+  while (coordinator.requests.length === 0) {
+    await turn();
+  }
+  watcher.options?.onLogs([swapLog()]);
+  orchestrator.unregister(listener.pair);
+  const stopped = listener.stopAndDrain();
+  firstGate.resolve();
+  await stopped;
+
+  await started;
+  await orchestrator.waitForIdle();
+  assert.equal(coordinator.requests.length, 1);
+});
+
+test('une erreur de réconciliation rejette la promesse d’attente', async () => {
+  const coordinator = new MemoryCoordinator();
+  coordinator.onReconcile = async () => {
+    throw new Error('RPC indisponible');
+  };
+
+  const { listener } = createReconciliationsWithSignals({
+    coordinator,
+    onSignal: () => {},
+  });
+
+  await assert.rejects(
+    listener.start(),
+    (error) => error instanceof Error && error.message === 'RPC indisponible',
+  );
 });

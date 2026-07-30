@@ -414,6 +414,7 @@ async function main(): Promise<void> {
         logReader: publicClient,
         coordinator: canonicalCoordinator,
         requestReconcile: (pair) => swapReconcileOrchestrator.signal(pair),
+        requestAndWait: (pair) => swapReconcileOrchestrator.requestAndWait(pair),
       },
     );
     swapReconcileOrchestrator.register(listener);

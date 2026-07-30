@@ -93,6 +93,7 @@ export interface SwapListenerDependencies {
   logReader: SwapLogReader;
   coordinator: ConfirmedRangeCoordinator;
   requestReconcile?: (pair: Address) => void;
+  requestAndWait?: (pair: Address, signal?: AbortSignal) => Promise<void>;
   reconcileIntervalMs?: number;
 }
 
@@ -146,7 +147,7 @@ export class SwapListener {
         ? fourth
         : defaultDependencies;
       this.hasCentralReconciliation = Boolean(
-        this.dependencies.requestReconcile,
+        this.dependencies.requestReconcile || this.dependencies.requestAndWait,
       );
       return;
     }
@@ -220,7 +221,7 @@ export class SwapListener {
     await this.requestReconcile();
   }
 
-  activateAfterReplay(): void {
+  async activateAfterReplay(): Promise<void> {
     if (this.stopped || !this.replayPrepared) return;
     logger.debug(
       {
@@ -231,7 +232,7 @@ export class SwapListener {
     );
     this.replayPrepared = false;
     this.externalIngestionEnabled = true;
-    this.requestReconcile();
+    await this.requestReconcile();
   }
 
   private installWatcher(): void {
@@ -258,19 +259,7 @@ export class SwapListener {
       eventName: 'Swap',
       onLogs: () => {
         if (this.stopped || !this.externalIngestionEnabled) return;
-        if (this.dependencies.requestReconcile) {
-          this.dependencies.requestReconcile(this.session.pair.pair);
-          return;
-        }
-        void this.requestReconcile().catch((error: unknown) =>
-          logger.error(
-            {
-              pair: this.session.pair.pair,
-              errorType: safeErrorType(error),
-            },
-            'Réconciliation Swap déclenchée par WebSocket échouée.',
-          ),
-        );
+        this.signalReconcile();
       },
       onError: (error: unknown) => logger.error(
         {
@@ -291,6 +280,12 @@ export class SwapListener {
       return Promise.resolve();
     }
 
+    if (this.dependencies.requestAndWait) {
+      return this.track(
+        this.dependencies.requestAndWait(this.session.pair.pair, signal),
+      );
+    }
+
     if (this.dependencies.requestReconcile) {
       this.dependencies.requestReconcile(this.session.pair.pair);
       return Promise.resolve();
@@ -305,6 +300,23 @@ export class SwapListener {
       return this.reconciliation;
     }
 
+    logger.debug(
+      {
+        pair: this.session.pair.pair,
+        createdBlock: this.session.pair.createdBlock.toString(),
+        hasSignal: Boolean(signal),
+      },
+      'Début d’un cycle de réconciliation Swap.',
+    );
+
+    const execution = this.runCanonicalReconcile(signal);
+    this.reconciliation = execution.finally(() => {
+      this.reconciliation = null;
+    });
+    return this.reconciliation;
+  }
+
+  private runCanonicalReconcile(signal?: AbortSignal): Promise<void> {
     logger.debug(
       {
         pair: this.session.pair.pair,
@@ -357,10 +369,23 @@ export class SwapListener {
       if (failed) throw firstFailure;
     })();
     const tracked = this.track(execution);
-    this.reconciliation = tracked.finally(() => {
-      this.reconciliation = null;
+    return tracked;
+  }
+
+  private signalReconcile(): void {
+    if (this.hasCentralReconciliation) {
+      this.dependencies.requestReconcile?.(this.session.pair.pair);
+      return;
+    }
+    void this.requestReconcile().catch((error: unknown) => {
+      logger.error(
+        {
+          pair: this.session.pair.pair,
+          errorType: safeErrorType(error),
+        },
+        'Réconciliation Swap déclenchée par WebSocket échouée.',
+      );
     });
-    return this.reconciliation;
   }
 
   async reconcileChunk(
@@ -532,6 +557,9 @@ export class SwapListener {
       },
       'Réconciliation Swap déclenchée manuellement.',
     );
+    if (this.dependencies.requestAndWait) {
+      return this.runCanonicalReconcile();
+    }
     return this.requestReconcile();
   }
 
