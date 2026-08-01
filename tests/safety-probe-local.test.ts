@@ -42,3 +42,21 @@ test('SafetyProbe distingue les taxes achat et vente', async () => {
     await scenario.close();
   }
 });
+
+test('SafetyProbe échoue quand le token bloque la vente', async () => {
+  const scenario = await deploySafetyProbeScenario('MockHoneypotToken');
+  try {
+    await assert.rejects(() => scenario.service.probe(scenario.pair));
+  } finally {
+    await scenario.close();
+  }
+});
+
+test('SafetyProbe échoue quand approve ne retourne aucune valeur', async () => {
+  const scenario = await deploySafetyProbeScenario('MockNonStandardToken');
+  try {
+    await assert.rejects(() => scenario.service.probe(scenario.pair));
+  } finally {
+    await scenario.close();
+  }
+});
