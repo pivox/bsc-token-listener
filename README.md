@@ -361,6 +361,16 @@ depuis une base vide puis une seconde fois pour vérifier leur idempotence,
 valide la sérialisation exacte des `bigint` et les contraintes de
 déduplication, puis supprime les schémas.
 
+Elle inclut aussi un parcours vertical déterministe : log `PairCreated`
+confirmé, admission de la paire, achats observés, rapport de risque persisté,
+achat et vente dry-run, déduplication, puis fermeture de session. Le scénario
+utilise PostgreSQL réel, mais aucun RPC public et aucune transaction
+blockchain.
+
+Ce parcours ne remplace pas les niveaux suivants de l’issue #12 : contrats de
+test et `SafetyProbe` sur chaîne locale ou fork, puis scénario testnet
+explicitement opt-in sans secret dans la CI.
+
 La validation complète avant commit reste :
 
 ```bash
