@@ -341,6 +341,26 @@ DASHBOARD_ACTIONS_ENABLED=false
 CONFIRM_DASHBOARD_TRADING_ACTIONS=
 ```
 
+## Tests chaîne locale
+
+```bash
+npm run test:chain
+```
+
+Cette commande lance Hardhat EDR directement dans Node, compile et déploie des
+fixtures déterministes, puis appelle le vrai contrat `SafetyProbe` avec le vrai
+`SafetyProbeService` et viem. Les scénarios couvrent un token standard, des
+taxes distinctes à l'achat et à la vente, un rejet à la vente et un `approve`
+non standard.
+
+Aucun Docker, RPC public, secret ou transaction sur un réseau public n'est
+utilisé. Hardhat fournit uniquement un compte local éphémère déverrouillé ; sa
+clé n'est ni lue, ni stockée, ni journalisée. Cette suite fait également partie
+de `npm test`.
+
+Le scénario BSC testnet reste séparé et explicitement opt-in. Il ne doit jamais
+être lancé par défaut ni recevoir de secret depuis la CI.
+
 ## Tests PostgreSQL
 
 La suite standard `npm test` ne nécessite pas PostgreSQL. La CI exécute aussi
@@ -367,9 +387,9 @@ achat et vente dry-run, déduplication, puis fermeture de session. Le scénario
 utilise PostgreSQL réel, mais aucun RPC public et aucune transaction
 blockchain.
 
-Ce parcours ne remplace pas les niveaux suivants de l’issue #12 : contrats de
-test et `SafetyProbe` sur chaîne locale ou fork, puis scénario testnet
-explicitement opt-in sans secret dans la CI.
+Ce parcours complète les tests `SafetyProbe` sur chaîne locale. Le dernier
+niveau restant de l'issue #12 est le scénario testnet explicitement opt-in,
+sans secret dans la CI.
 
 La validation complète avant commit reste :
 

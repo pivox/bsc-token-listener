@@ -9,6 +9,7 @@
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --import ./tests/setup-env.ts --test tests/*.test.ts",
+    "test:chain": "tsx --import ./tests/setup-env.ts --test tests/safety-probe-local.test.ts",
     "test:postgres": "tsx --test tests/postgres/*.test.ts",
     "rpc:check": "tsx scripts/check-rpc.ts",
     "pair:diagnose": "tsx scripts/diagnose-pair-created.ts",
@@ -25,6 +26,7 @@
   "devDependencies": {
     "@types/node": "^24.0.0",
     "@types/pg": "^8.15.0",
+    "hardhat": "^3.12.0",
     "solc": "^0.8.36",
     "tsx": "^4.23.1",
     "typescript": "^5.8.0"
