@@ -155,14 +155,32 @@ test('parcourt PairCreated jusqu’à CLOSED en dry-run avec audit PostgreSQL id
     const events = new SwapEventRepository(database);
     const reports = new RiskReportRepository(database);
     const trades = new TradeRepository(database);
+    let reportPersisted = false;
+    const riskStore = {
+      save: async (...args: Parameters<typeof reports.save>) => {
+        await reports.save(...args);
+        reportPersisted = true;
+      },
+    };
+    const journeyGateway: ExecutionGateway = {
+      ...deterministicGateway,
+      quote: async ({ amountIn }) => {
+        assert.equal(
+          reportPersisted,
+          true,
+          'Le TokenRiskReport doit être persisté avant toute quote d’entrée.',
+        );
+        return amountIn * 100n;
+      },
+    };
     const executor = new TradeExecutor(
       trades,
-      deterministicGateway,
+      journeyGateway,
       'dry-run',
     );
     const engine = new SessionEngine(
       sessions,
-      reports,
+      riskStore as never,
       { analyze: async () => report } as never,
       executor,
       new EntryAmountService({ getWalletBalanceWei: async () => null }),
