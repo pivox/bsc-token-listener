@@ -55,6 +55,11 @@ deploys the router, token and real `SafetyProbe`, constructs the real
 `SafetyProbeService`, and calls `probe()` through `eth_call`. The chain
 connection is always closed in `finally`.
 
+The EDR genesis date and service clock are both fixed to 2030-01-01. Compiled
+artifacts are cached for the test process, while every scenario still receives
+an isolated chain state. The mock router validates the same two-token WETH
+endpoints used by PancakeSwap for quotes, buys and sells.
+
 The service receives only the pair fields used by the probe; all other
 `PairInfo` fields use deterministic zero-like addresses and hashes. A fixed
 clock makes the deadline reproducible.

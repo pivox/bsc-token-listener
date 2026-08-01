@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { ContractFunctionExecutionError } from 'viem';
 import { deploySafetyProbeScenario } from './fixtures/local-evm.js';
 
 test('SafetyProbe mesure un aller-retour sans perte pour un token standard', async () => {
@@ -46,7 +47,11 @@ test('SafetyProbe distingue les taxes achat et vente', async () => {
 test('SafetyProbe échoue quand le token bloque la vente', async () => {
   const scenario = await deploySafetyProbeScenario('MockHoneypotToken');
   try {
-    await assert.rejects(() => scenario.service.probe(scenario.pair));
+    await assert.rejects(
+      () => scenario.service.probe(scenario.pair),
+      (error: unknown) => error instanceof ContractFunctionExecutionError
+        && error.message.includes('0x1cf2b6fd'),
+    );
   } finally {
     await scenario.close();
   }
@@ -55,7 +60,11 @@ test('SafetyProbe échoue quand le token bloque la vente', async () => {
 test('SafetyProbe échoue quand approve ne retourne aucune valeur', async () => {
   const scenario = await deploySafetyProbeScenario('MockNonStandardToken');
   try {
-    await assert.rejects(() => scenario.service.probe(scenario.pair));
+    await assert.rejects(
+      () => scenario.service.probe(scenario.pair),
+      (error: unknown) => error instanceof ContractFunctionExecutionError
+        && error.message.includes('Transaction reverted without a reason string'),
+    );
   } finally {
     await scenario.close();
   }

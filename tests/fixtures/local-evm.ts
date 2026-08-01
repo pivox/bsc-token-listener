@@ -41,7 +41,7 @@ const safetyProbePath = fileURLToPath(
   new URL('../../contracts/SafetyProbe.sol', import.meta.url),
 );
 
-async function compileContracts(): Promise<Map<string, CompiledContract>> {
+async function compileContracts(): Promise<ReadonlyMap<string, CompiledContract>> {
   const fixtureFiles = (await readdir(fixtureDirectory))
     .filter((file) => file.endsWith('.sol'))
     .sort();
@@ -77,6 +77,8 @@ async function compileContracts(): Promise<Map<string, CompiledContract>> {
   return contracts;
 }
 
+const compiledContracts = compileContracts();
+
 export async function deploySafetyProbeScenario(
   tokenContract: string,
   tokenArgs: readonly unknown[] = [],
@@ -105,7 +107,7 @@ export async function deploySafetyProbeScenario(
     }
     const caller = getAddress(firstAccount);
     const walletClient = createWalletClient({ account: caller, chain, transport });
-    const contracts = await compileContracts();
+    const contracts = await compiledContracts;
 
     const deploy = async (
       contractName: string,
@@ -148,7 +150,7 @@ export async function deploySafetyProbeScenario(
       caller,
       amountWei: 10_000n,
       deadlineSeconds: 300,
-      nowMs: () => 2_000_000_000_000,
+      nowMs: () => Date.parse('2030-01-01T00:00:00.000Z'),
     });
     return {
       service,

@@ -95,6 +95,7 @@ export default defineConfig({
     local: {
       type: 'edr-simulated',
       chainType: 'l1',
+      initialDate: '2030-01-01T00:00:00.000Z',
     },
   },
 });
@@ -143,8 +144,9 @@ The helper must:
    define the matching viem chain dynamically;
 3. read and validate the first unlocked address through the EIP-1193
    `eth_accounts` request;
-4. compile `SafetyProbe.sol`, the router and present token fixtures with solc,
-   using the same optimizer and `viaIR` settings as the deployment script;
+4. compile `SafetyProbe.sol`, the router and present token fixtures once per
+   process with solc, using the same optimizer and `viaIR` settings as the
+   deployment script;
 5. deploy the router, then the selected token with `[router, ...tokenArgs]`;
 6. deploy the production `SafetyProbe`;
 7. construct `SafetyProbeService` with amount `10_000n`, a fixed clock and the

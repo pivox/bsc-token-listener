@@ -9,18 +9,24 @@ interface IMockRouterToken {
 
 contract MockSafetyProbeRouter {
     error Expired();
+    error InvalidPath();
     error TokenTransferFailed();
     error NativeTransferFailed();
 
+    address private constant WRAPPED_NATIVE = address(0xBEEF);
+
     function WETH() external pure returns (address) {
-        return address(0xBEEF);
+        return WRAPPED_NATIVE;
     }
 
     function getAmountsOut(
         uint256 amountIn,
         address[] calldata path
     ) external pure returns (uint256[] memory amounts) {
-        require(path.length == 2, "INVALID_PATH");
+        if (path.length != 2) revert InvalidPath();
+        bool isBuy = path[0] == WRAPPED_NATIVE && path[1] != WRAPPED_NATIVE;
+        bool isSell = path[0] != WRAPPED_NATIVE && path[1] == WRAPPED_NATIVE;
+        if (!isBuy && !isSell) revert InvalidPath();
         amounts = new uint256[](2);
         amounts[0] = amountIn;
         amounts[1] = amountIn;
@@ -33,6 +39,11 @@ contract MockSafetyProbeRouter {
         uint256 deadline
     ) external payable {
         if (deadline < block.timestamp) revert Expired();
+        if (
+            path.length != 2 ||
+            path[0] != WRAPPED_NATIVE ||
+            path[1] == WRAPPED_NATIVE
+        ) revert InvalidPath();
         if (!IMockRouterToken(path[1]).transfer(to, msg.value)) {
             revert TokenTransferFailed();
         }
@@ -46,6 +57,11 @@ contract MockSafetyProbeRouter {
         uint256 deadline
     ) external {
         if (deadline < block.timestamp) revert Expired();
+        if (
+            path.length != 2 ||
+            path[0] == WRAPPED_NATIVE ||
+            path[1] != WRAPPED_NATIVE
+        ) revert InvalidPath();
         IMockRouterToken token = IMockRouterToken(path[0]);
         uint256 balanceBefore = token.balanceOf(address(this));
         if (!token.transferFrom(msg.sender, address(this), amountIn)) {
