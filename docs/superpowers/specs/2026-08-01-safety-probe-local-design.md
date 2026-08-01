@@ -67,4 +67,3 @@ clock makes the deadline reproducible.
 - Honeypot and non-standard approvals reject.
 - No private key, mnemonic or public network endpoint is added.
 - `npm run check`, `npm test`, `npm run test:postgres` and `npm run build` pass.
-

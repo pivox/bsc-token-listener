@@ -91,7 +91,6 @@ Create `hardhat.config.ts`:
 import { defineConfig } from 'hardhat/config';
 
 export default defineConfig({
-  defaultNetwork: 'local',
   networks: {
     local: {
       type: 'edr-simulated',
@@ -140,9 +139,12 @@ export async function deploySafetyProbeScenario(
 The helper must:
 
 1. call `network.create({ network: 'local', chainType: 'l1' })`;
-2. wrap `connection.provider` with viem `custom`;
-3. read the first unlocked address using `eth_accounts`;
-4. compile `SafetyProbe.sol`, the router and present token fixtures with solc;
+2. wrap `connection.provider` with viem `custom`, read `eth_chainId`, and
+   define the matching viem chain dynamically;
+3. read and validate the first unlocked address through the EIP-1193
+   `eth_accounts` request;
+4. compile `SafetyProbe.sol`, the router and present token fixtures with solc,
+   using the same optimizer and `viaIR` settings as the deployment script;
 5. deploy the router, then the selected token with `[router, ...tokenArgs]`;
 6. deploy the production `SafetyProbe`;
 7. construct `SafetyProbeService` with amount `10_000n`, a fixed clock and the
@@ -365,4 +367,3 @@ gh pr view "$pr_number" --comments
 
 Do not merge while checks fail or blocking feedback remains. After a clean
 review, merge, fetch `origin/main`, and begin the separate opt-in testnet plan.
-
