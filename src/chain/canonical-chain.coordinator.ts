@@ -72,7 +72,7 @@ export interface CanonicalChainCoordinatorOptions {
   cutoff?: CanonicalBlock;
   headerSpoolFactory?: CanonicalHeaderSpoolFactory;
   afterReorg?: (state: CanonicalChainState) => Promise<CanonicalReorgCompletion | void>;
-  onRecovered?: () => void;
+  onRecovered?: () => void | Promise<void>;
   onCleanupError?: (errorType: string) => void;
 }
 
@@ -346,7 +346,7 @@ export class CanonicalChainCoordinator {
   private readonly headerSpoolFactory: CanonicalHeaderSpoolFactory;
   private readonly afterReorg:
     ((state: CanonicalChainState) => Promise<CanonicalReorgCompletion | void>) | undefined;
-  private readonly onRecovered: (() => void) | undefined;
+  private readonly onRecovered: (() => void | Promise<void>) | undefined;
   private readonly onCleanupError: ((errorType: string) => void) | undefined;
   private readonly postReorgScopes =
     new AsyncLocalStorage<PostReorgScope>();
@@ -732,8 +732,8 @@ export class CanonicalChainCoordinator {
       throw new Error('Rollback shallow incomplet: finalisation post-reorg indisponible.');
     }
     const completion = await this.runPostReorg();
+    await this.onRecovered?.();
     this.promoteRecoveredReorg(completion);
-    this.onRecovered?.();
   }
 
   waitForIdle(): Promise<void> {

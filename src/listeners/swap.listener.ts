@@ -397,6 +397,19 @@ export class SwapListener {
     return this.track(this.applySwapLogs(fromBlock, toBlock, canonicalHeaders, logs));
   }
 
+  async expireIfNeeded(): Promise<boolean> {
+    return this.track(this.expireActiveSessionIfNeeded());
+  }
+
+  private async expireActiveSessionIfNeeded(): Promise<boolean> {
+    if (this.stopped) return false;
+    const expired = await this.engine.expireIfNeeded(this.session);
+    if (!expired) return false;
+    this.stop();
+    this.onTerminal(this.session.pair.pair);
+    return true;
+  }
+
   private async processChunk(
     fromBlock: bigint,
     toBlock: bigint,
@@ -594,7 +607,7 @@ export class SwapListener {
     );
     this.stop();
     while (this.inFlight.size > 0) {
-      await Promise.all([...this.inFlight]);
+      await Promise.allSettled([...this.inFlight]);
     }
     logger.debug(
       {

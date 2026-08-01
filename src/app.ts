@@ -653,11 +653,21 @@ async function main(): Promise<void> {
         return completion;
       });
     },
-    onRecovered: () => {
-      for (const key of monitorsAwaitingReplayActivation) {
-        monitors.get(key)?.activateAfterReplay();
+    onRecovered: async () => {
+      const keys = [...monitorsAwaitingReplayActivation];
+      const activations = await Promise.allSettled(
+        keys.map(async (key) => {
+          const monitor = monitors.get(key);
+          if (monitor) await monitor.activateAfterReplay();
+          monitorsAwaitingReplayActivation.delete(key);
+        }),
+      );
+      const failed = activations.find(
+        (result): result is PromiseRejectedResult => result.status === 'rejected',
+      );
+      if (failed) {
+        throw failed.reason;
       }
-      monitorsAwaitingReplayActivation.clear();
     },
   });
   swapLogBatchReconciler = new SwapLogBatchReconciler({

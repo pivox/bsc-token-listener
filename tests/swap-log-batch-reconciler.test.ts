@@ -139,6 +139,7 @@ class MemoryTarget implements SwapLogBatchTarget {
   readonly pairKey: string;
   active = true;
   calls = 0;
+  expiryCalls = 0;
   readonly processed: Array<{ blockNumber: bigint; logIndex: number }> = [];
   onProcess: ((log: Record<string, unknown>) => Promise<boolean>) | undefined;
 
@@ -151,6 +152,11 @@ class MemoryTarget implements SwapLogBatchTarget {
 
   isReconcileCapable(): boolean {
     return this.active;
+  }
+
+  async expireIfNeeded(): Promise<boolean> {
+    this.expiryCalls += 1;
+    return false;
   }
 
   async reconcileChunk(
@@ -215,6 +221,17 @@ for (const fixture of [
     assert.equal(coordinator.requests.length, fixture.pairs === 0 ? 0 : 1);
   });
 }
+
+test('une paire active silencieuse exécute son contrôle TTL sans log Swap', async () => {
+  const target = new MemoryTarget(address(1));
+  const { subject, reader } = createSubject({ targets: [target] });
+
+  await subject.reconcile([target]);
+
+  assert.equal(reader.calls.length, 1);
+  assert.equal(target.calls, 0);
+  assert.equal(target.expiryCalls, 1);
+});
 
 test('50 paires sur trois chunks respectent explicitement appels = chunks x lots', async () => {
   const targets = Array.from({ length: 50 }, (_, index) =>

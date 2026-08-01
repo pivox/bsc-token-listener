@@ -18,6 +18,7 @@ export interface SwapLogBatchTarget {
   readonly pairKey: string;
   readonly createdBlock: bigint;
   isReconcileCapable(): boolean;
+  expireIfNeeded(): Promise<boolean>;
   reconcileChunk(
     fromBlock: bigint,
     toBlock: bigint,
@@ -265,6 +266,20 @@ export class SwapLogBatchReconciler {
   ): Promise<boolean> {
     const concerned = entries.filter((entry) => entry.nextBlock <= toBlock);
     if (concerned.length === 0) return true;
+    for (const entry of concerned) this.assertActive(entry);
+
+    const expiryResults = await Promise.allSettled(
+      concerned.map((entry) => entry.target.expireIfNeeded()),
+    );
+    const expiryFailure = expiryResults.find(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+    if (expiryFailure) throw expiryFailure.reason;
+    if (expiryResults.some(
+      (result) => result.status === 'fulfilled' && result.value,
+    )) {
+      return false;
+    }
     for (const entry of concerned) this.assertActive(entry);
 
     const addressBatches = partition(

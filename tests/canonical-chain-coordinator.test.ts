@@ -211,6 +211,7 @@ function coordinator(
     runtimeBarrier?: RuntimeRecoveryBarrier;
     headerSpoolFactory?: CanonicalChainCoordinatorOptions['headerSpoolFactory'];
     afterReorg?: CanonicalChainCoordinatorOptions['afterReorg'];
+    onRecovered?: CanonicalChainCoordinatorOptions['onRecovered'];
   } = {},
 ): CanonicalChainCoordinator {
   return new CanonicalChainCoordinator({
@@ -232,6 +233,9 @@ function coordinator(
     ...(options.afterReorg === undefined
       ? {}
       : { afterReorg: options.afterReorg }),
+    ...(options.onRecovered === undefined
+      ? {}
+      : { onRecovered: options.onRecovered }),
   });
 }
 
@@ -1436,6 +1440,8 @@ test('réconcilie depuis l’ancêtre commun avant tout chunk ou checkpoint', as
 test('un shallow reorg reste RECONCILING pendant le replay puis promeut le compteur final atomiquement', async () => {
   const replayStarted = deferred();
   const replayGate = deferred();
+  const activationStarted = deferred();
+  const activationGate = deferred();
   const reader = new MemoryBlockReader(115n);
   const originalGetBlock = reader.getBlock.bind(reader);
   reader.getBlock = async (number) =>
@@ -1460,6 +1466,10 @@ test('un shallow reorg reste RECONCILING pendant le replay puis promeut le compt
         replayedEvents: 7,
       };
     },
+    onRecovered: async () => {
+      activationStarted.resolve();
+      await activationGate.promise;
+    },
   });
 
   await subject.reconcile({
@@ -1474,6 +1484,10 @@ test('un shallow reorg reste RECONCILING pendant le replay puis promeut le compt
   assert.equal(subject.currentStatus.lastReorg?.impact.replayedEvents, 0);
 
   replayGate.resolve();
+  await activationStarted.promise;
+  assert.equal(subject.currentStatus.state, 'RECONCILING');
+  assert.equal(subject.currentStatus.lastReorg?.status, 'RECONCILING');
+  activationGate.resolve();
   await subject.waitForIdle();
 
   assert.equal(subject.currentStatus.state, 'HEALTHY');

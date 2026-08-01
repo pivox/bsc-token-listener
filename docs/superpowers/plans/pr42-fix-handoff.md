@@ -60,6 +60,13 @@ Le test de 50 paires sur trois chunks vérifie explicitement `appels = chunks x 
 - Configuration moderne prioritaire avec legacy uniquement en fallback : validé.
 - Limite de logs propre au provider conservée pendant les health checks : validé.
 
+### Suivi de revue du 1er août 2026
+
+- Les sessions actives silencieuses exécutent désormais `expireIfNeeded()` une fois par chunk concerné, même lorsqu'aucun log Swap n'est retourné.
+- La finalisation shallow reorg attend toutes les activations post-replay avant de promouvoir l'état `RECOVERED`; un échec d'activation conserve la récupération en échec.
+- `SwapListener.stopAndDrain()` attend toutes les opérations suivies avec `Promise.allSettled()`, même si l'une d'elles rejette.
+- Les trois régressions disposent de tests rouges puis verts dans les suites batch, coordinateur canonique et confirmations listener.
+
 ### Fichiers modifiés
 
 - `.env.example`
@@ -67,6 +74,7 @@ Le test de 50 paires sur trois chunks vérifie explicitement `appels = chunks x 
 - `docs/superpowers/plans/pr42-fix-handoff.md`
 - `scripts/check-rpc.ts`
 - `src/app.ts`
+- `src/chain/canonical-chain.coordinator.ts`
 - `src/config/env.ts`
 - `src/dashboard/dashboard.page.ts`
 - `src/dashboard/dashboard.ts`
@@ -81,6 +89,7 @@ Le test de 50 paires sur trois chunks vérifie explicitement `appels = chunks x 
 - `src/storage/repositories.ts`
 - `src/types/domain.ts`
 - `tests/canonical-chain-repository.test.ts`
+- `tests/canonical-chain-coordinator.test.ts`
 - `tests/check-rpc.test.ts`
 - `tests/config-env.test.ts`
 - `tests/dashboard-page.test.ts`
@@ -95,7 +104,8 @@ Le test de 50 paires sur trois chunks vérifie explicitement `appels = chunks x 
 ### Résultats exacts
 
 - `npm run check` : succès, code 0.
-- `npm test` : 521 tests, 521 succès, 0 échec, code 0.
+- `npm test` : 523 tests, 523 succès, 0 échec, code 0.
+- Suites ciblées de suivi de revue : 120 tests, 120 succès, 0 échec.
 - `npm run build` : succès, code 0.
 - `git diff --check` : succès, aucune sortie, code 0.
 - `node --test --import tsx tests/check-rpc.test.ts` : 9 tests, 9 succès, 0 échec.

@@ -830,6 +830,60 @@ test('stopAndDrain attend le traitement HTTP en vol déclenché par WebSocket', 
   assert.equal(drained, true);
 });
 
+test('stopAndDrain attend toutes les opérations même si une réconciliation échoue', async () => {
+  const firstEntered = createDeferredBarrier();
+  const secondEntered = createDeferredBarrier();
+  const failFirst = createDeferredBarrier();
+  const releaseSecond = createDeferredBarrier();
+  let calls = 0;
+  const subject = new SwapListener(
+    tokenSession(),
+    {
+      onSwap: async () => {
+        calls += 1;
+        if (calls === 1) {
+          firstEntered.resolve();
+          await failFirst.promise;
+          throw new Error('première réconciliation échouée');
+        }
+        secondEntered.resolve();
+        await releaseSecond.promise;
+        return true;
+      },
+      expireIfNeeded: async () => false,
+      isTerminal: () => false,
+    },
+    () => {},
+    {
+      watcher: new MemoryWatcher(),
+      logReader: { getContractEvents: async () => [] },
+      coordinator: new MemoryCoordinator(),
+      reconcileIntervalMs: 60_000,
+    },
+  );
+  const headers = canonicalHeaders([12n, HASH_2]);
+  const first = subject.reconcileChunk(12n, 12n, headers, [swapLog()])
+    .catch((error: unknown) => error);
+  const second = subject.reconcileChunk(12n, 12n, headers, [
+    swapLog({ transactionHash: HASH_1, logIndex: 3 }),
+  ]).catch((error: unknown) => error);
+  await Promise.all([firstEntered.promise, secondEntered.promise]);
+
+  let drainSettled = false;
+  const drain = subject.stopAndDrain().then(
+    () => { drainSettled = true; },
+    () => { drainSettled = true; },
+  );
+  failFirst.resolve();
+  await turn();
+  assert.equal(drainSettled, false);
+
+  releaseSecond.resolve();
+  await drain;
+  await Promise.all([first, second]);
+  assert.equal(drainSettled, true);
+});
+
 test('start() attend la réconciliation centrale réelle avant de revenir', async () => {
   const coordinator = new MemoryCoordinator();
   const startGate = createDeferredBarrier();
