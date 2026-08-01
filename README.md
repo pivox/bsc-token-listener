@@ -343,17 +343,33 @@ CONFIRM_DASHBOARD_TRADING_ACTIONS=
 
 ## Tests PostgreSQL
 
-La suite unitaire standard ne nécessite pas PostgreSQL. Le cycle de vie SQL peut
-être validé séparément sur une base de test jetable :
+La suite standard `npm test` ne nécessite pas PostgreSQL. La CI exécute aussi
+la suite d’intégration PostgreSQL sur chaque push et pull request avec un
+service PostgreSQL 16 jetable.
+
+Pour reproduire cette validation localement, démarrer PostgreSQL puis fournir
+explicitement une base de test :
 
 ```bash
+docker compose up -d postgres
 TEST_DATABASE_URL=postgresql://bscbot:bscbot@127.0.0.1:5432/bscbot \
   npm run test:postgres
 ```
 
-Cette commande crée un schéma temporaire, exécute la migration deux fois, vérifie
-la sérialisation exacte des `bigint` et les contraintes de déduplication, puis
-supprime le schéma.
+Cette commande crée des schémas temporaires isolés, exécute les migrations
+depuis une base vide puis une seconde fois pour vérifier leur idempotence,
+valide la sérialisation exacte des `bigint` et les contraintes de
+déduplication, puis supprime les schémas.
+
+La validation complète avant commit reste :
+
+```bash
+npm run check
+npm test
+TEST_DATABASE_URL=postgresql://bscbot:bscbot@127.0.0.1:5432/bscbot \
+  npm run test:postgres
+npm run build
+```
 
 Le serveur reste lié à `127.0.0.1` par défaut. Ne définir `DASHBOARD_HOST=0.0.0.0` que derrière un pare-feu ou un reverse proxy correctement protégé.
 
