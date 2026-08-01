@@ -18,8 +18,8 @@ import {
   DashboardRepository,
   DashboardService,
 } from './dashboard/dashboard.js';
+import { PairAdmissionService } from './discovery/pair-admission.service.js';
 import { TokenMetadataService } from './discovery/token-metadata.service.js';
-import { restoreReappearedPairSession } from './discovery/reappeared-pair.js';
 import { TradeExecutor } from './execution/trade-executor.js';
 import { HeartbeatService } from './heartbeat/heartbeat.js';
 import { PairCreatedListener } from './listeners/pair-created.listener.js';
@@ -79,7 +79,7 @@ import { PositionExitSettingsProvider } from './strategy/position-exit-settings.
 import { PositionMetricsService } from './strategy/position-metrics.service.js';
 import { PositionExitMonitor } from './strategy/position-exit-monitor.js';
 import { isSessionMonitorable } from './strategy/session-monitor-policy.js';
-import type { PairInfo, TokenSession } from './types/domain.js';
+import type { TokenSession } from './types/domain.js';
 import { errorMessage } from './utils/error.js';
 import { logger } from './utils/logger.js';
 
@@ -683,73 +683,17 @@ async function main(): Promise<void> {
     freshStartRun.appliedAtMs,
   );
 
-  const onPair = async (pair: PairInfo): Promise<void> => {
-    const key = pair.pair.toLowerCase();
-    if (monitors.has(key)) return;
-    const existing = await sessions.findByPair(pair.pair);
-    if (existing) {
-      const restored = restoreReappearedPairSession(existing, pair, Date.now());
-      if (restored) {
-        await discovered.upsert({
-          pair,
-          metadata: restored.metadata,
-          source: 'PAIR_CREATED',
-        });
-        await sessions.save(restored);
-        requestMonitorReconcile();
-        return;
-      }
-      requestMonitorReconcile();
-      return;
-    }
-    if (await ignoredAssets.isIgnored(pair.token)) {
-      logger.info(
-        { pair: pair.pair, token: pair.token },
-        'Paire ignorée: le token figure dans la liste d’ignorance.',
-      );
-      return;
-    }
-
-    await discovered.upsert({ pair, source: 'PAIR_CREATED' });
-    let metadata;
-    try {
-      metadata = await metadataService.read(pair.token);
-    } catch (error) {
-      logger.warn(
-        { pair: pair.pair, token: pair.token, reason: errorMessage(error) },
-        'Nouvelle paire ignorée: contrat non compatible BEP-20 minimal.',
-      );
-      return;
-    }
-    await discovered.upsert({ pair, metadata, source: 'PAIR_CREATED' });
-
-    const now = Date.now();
-    const session: TokenSession = {
-      pair,
-      metadata,
-      status: 'WAITING_FIRST_BUY',
-      entryObservationBuys: [],
-      subsequentBuyCount: 0,
-      targetBuysAfterEntry: config.targetBuysAfterEntry,
-      countedBuyTransactionHashes: [],
-      sellAttempts: 0,
-      createdAtMs: now,
-      updatedAtMs: now,
-    };
-    await sessions.save(session);
-    logger.info(
-      {
-        pair: pair.pair,
-        token: pair.token,
-        name: metadata.name,
-        symbol: metadata.symbol,
-        blockNumber: pair.createdBlock.toString(),
-        transactionHash: pair.createdTransactionHash,
-      },
-      'Nouvelle paire Token/WBNB enregistrée.',
-    );
-    requestMonitorReconcile();
-  };
+  const pairAdmission = new PairAdmissionService({
+    sessions,
+    discovered,
+    ignored: ignoredAssets,
+    metadata: metadataService,
+    isMonitored: (pair) => monitors.has(pair.toLowerCase()),
+    scheduleMonitor: () => requestMonitorReconcile(),
+    targetBuysAfterEntry: config.targetBuysAfterEntry,
+    now: Date.now,
+  });
+  const onPair = pairAdmission.admit.bind(pairAdmission);
 
   pairListener = new PairCreatedListener(onPair, {
     watcher: wsClient,
