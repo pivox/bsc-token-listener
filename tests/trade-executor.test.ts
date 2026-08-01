@@ -12,6 +12,7 @@ import type {
   ExecutionReceipt,
   PreparedExecutionTransaction,
 } from '../src/execution/execution.types.js';
+import { TransactionBroadcastRejectedError } from '../src/execution/execution.types.js';
 import type {
   TokenSession,
   TradeRecord,
@@ -200,7 +201,7 @@ test('persiste hash et nonce avant diffusion puis mesure un achat taxé', async 
   const store = new MemoryTradeStore();
   const gateway = new FakeExecutionGateway();
   gateway.beforeSend = () => {
-    assert.equal(store.lifecycles.at(-1)?.transaction.status, 'CREATED');
+    assert.equal(store.lifecycles.at(-1)?.transaction.status, 'PENDING_BROADCAST');
     assert.equal(store.lifecycles.at(-1)?.transaction.transactionHash, HASH);
     assert.equal(store.lifecycles.at(-1)?.transaction.nonce, 1n);
   };
@@ -706,5 +707,16 @@ test('conserve une erreur typée UNKNOWN si PostgreSQL échoue après diffusion'
       && error.message.includes('PostgreSQL indisponible après diffusion'),
   );
 
-  assert.equal(store.lifecycles[0]?.transaction.status, 'CREATED');
+  assert.equal(store.lifecycles[0]?.transaction.status, 'PENDING_BROADCAST');
+});
+
+test('persiste REJECTED pour un rejet définitif avant diffusion', async () => {
+  const store = new MemoryTradeStore();
+  const gateway = new FakeExecutionGateway();
+  gateway.sendError = new TransactionBroadcastRejectedError(HASH, 'invalid sender');
+  const executor = new TradeExecutor(store, gateway, 'live');
+
+  await assert.rejects(() => executor.buy(session(), 100n), /rejetée avant diffusion/u);
+  assert.equal(store.trades.at(-1)?.status, 'FAILED');
+  assert.equal(store.lifecycles.at(-1)?.transaction.status, 'REJECTED');
 });

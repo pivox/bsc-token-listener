@@ -29,17 +29,17 @@ function firstUrl(name?: string, legacyName?: string): string | undefined {
   return [...splitUrls(name), ...(legacyName ? splitUrls(legacyName) : [])][0];
 }
 
-function parseProviderUrls(
+export function parseProviderUrls(
   name: string,
   legacyName?: string,
   secondaryLegacyName?: string,
 ): string[] {
   const urls = new Set<string>();
-  for (const url of [
-    ...splitUrls(name),
-    ...(legacyName ? splitUrls(legacyName) : []),
-    ...(secondaryLegacyName ? splitUrls(secondaryLegacyName) : []),
-  ]) {
+  const primary = splitUrls(name);
+  const fallback = primary.length > 0
+    ? []
+    : [...(legacyName ? splitUrls(legacyName) : []), ...(secondaryLegacyName ? splitUrls(secondaryLegacyName) : [])];
+  for (const url of primary.length > 0 ? primary : fallback) {
     if (url.length > 0) urls.add(url);
   }
   return [...urls];
@@ -279,7 +279,7 @@ export const config = {
     200,
   ),
   rpcMaxHttpRps: readInteger('RPC_MAX_HTTP_RPS', 20, 1, 25),
-  rpcMaxHttpRetries: readInteger('RPC_MAX_HTTP_RETRIES', 3, 1, 10),
+  rpcMaxHttpRetries: readInteger('RPC_MAX_HTTP_RETRIES', 3, 0, 10),
   rpcMonthlyRequestBudget: readInteger(
     'RPC_MONTHLY_REQUEST_BUDGET',
     3_000_000,

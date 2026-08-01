@@ -1,4 +1,5 @@
 import type { Address } from 'viem';
+import { rpcUsage } from './rpc-usage.js';
 
 export interface SwapReconcileTarget {
   pair: Address;
@@ -125,6 +126,7 @@ export class SwapReconcileOrchestrator {
 
   signal(pair?: Address): void {
     if (this.stopped) return;
+    rpcUsage.markReconciliationRequest();
     if (pair) {
       const pairKey = getPairKey(pair);
       if (!this.listeners.has(pairKey)) {
@@ -137,11 +139,13 @@ export class SwapReconcileOrchestrator {
     }
 
     if (this.running) {
+      rpcUsage.markCoalescedRequest();
       this.rerunRequested = true;
       return;
     }
 
     if (!this.options.canRun() || this.startScheduled) {
+      if (this.startScheduled) rpcUsage.markCoalescedRequest();
       return;
     }
 

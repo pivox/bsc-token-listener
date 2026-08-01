@@ -5,6 +5,7 @@ import {
   type Hash,
 } from 'viem';
 import { pancakePairAbi } from '../abi/pancake-pair.abi.js';
+import { rpcUsage } from './rpc-usage.js';
 import type {
   AnchoredListenerCheckpoint,
   CanonicalBlock,
@@ -199,9 +200,13 @@ export class SwapLogBatchReconciler {
   }
 
   async reconcile(targets: readonly SwapLogBatchTarget[]): Promise<void> {
+    rpcUsage.markCentralPass();
     const targetSnapshot = [...targets].filter((target) =>
       target.isReconcileCapable());
-    if (targetSnapshot.length === 0) return;
+    if (targetSnapshot.length === 0) {
+      rpcUsage.markReconciliationSuccess();
+      return;
+    }
 
     const targetByAddress = new Map<string, SwapLogBatchTarget>();
     const listenerKeys = new Set<string>();
@@ -235,15 +240,21 @@ export class SwapLogBatchReconciler {
     );
     const aggregateCheckpoint = selectAggregateCheckpoint(entries, firstBlock);
 
-    await this.options.coordinator.reconcile({
-      listenerKey: 'swap-batch',
-      startBlock: firstBlock,
-      ...(aggregateCheckpoint ? { checkpoint: aggregateCheckpoint } : {}),
-      ignoreStoredCheckpoint: true,
-      persistCheckpoint: false,
-      processChunk: (fromBlock, toBlock, canonicalHeaders) =>
-        this.processChunk(entries, fromBlock, toBlock, canonicalHeaders),
-    });
+    try {
+      await this.options.coordinator.reconcile({
+        listenerKey: 'swap-batch',
+        startBlock: firstBlock,
+        ...(aggregateCheckpoint ? { checkpoint: aggregateCheckpoint } : {}),
+        ignoreStoredCheckpoint: true,
+        persistCheckpoint: false,
+        processChunk: (fromBlock, toBlock, canonicalHeaders) =>
+          this.processChunk(entries, fromBlock, toBlock, canonicalHeaders),
+      });
+      rpcUsage.markReconciliationSuccess();
+    } catch (error) {
+      rpcUsage.markReconciliationError();
+      throw error;
+    }
   }
 
   private async processChunk(
@@ -260,6 +271,7 @@ export class SwapLogBatchReconciler {
       concerned.map((entry) => entry.address),
       this.options.maxAddressesPerBatch,
     );
+    rpcUsage.markChunk();
     const reads = await Promise.allSettled(
       addressBatches.map((address) =>
         this.options.logReader.getContractEvents({
@@ -270,6 +282,13 @@ export class SwapLogBatchReconciler {
           toBlock,
         })),
     );
+    for (let index = 0; index < reads.length; index += 1) {
+      const result = reads[index];
+      rpcUsage.markAddressBatch(
+        addressBatches[index]?.length ?? 0,
+        result?.status === 'fulfilled' ? result.value.length : 0,
+      );
+    }
     const failed = reads.find(
       (result): result is PromiseRejectedResult => result.status === 'rejected',
     );

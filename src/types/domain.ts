@@ -138,6 +138,9 @@ export type TradeStatus =
 export type TradeTransactionStep = 'BUY' | 'APPROVE' | 'SELL';
 export type TradeTransactionStatus =
   | 'CREATED'
+  | 'PENDING_BROADCAST'
+  | 'BROADCASTED'
+  | 'REJECTED'
   | 'SUBMITTED'
   | 'CONFIRMED'
   | 'REVERTED'

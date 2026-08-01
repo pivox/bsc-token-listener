@@ -6,6 +6,28 @@ import type {
   TradeTransactionStep,
 } from '../types/domain.js';
 
+export class TransactionBroadcastUnknownError extends Error {
+  constructor(
+    readonly transactionHash: Hash,
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(`Transaction ${transactionHash} au status UNKNOWN: ${message}`, options);
+    this.name = 'TransactionBroadcastUnknownError';
+  }
+}
+
+export class TransactionBroadcastRejectedError extends Error {
+  constructor(
+    readonly transactionHash: Hash,
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(`Transaction ${transactionHash} rejetée avant diffusion: ${message}`, options);
+    this.name = 'TransactionBroadcastRejectedError';
+  }
+}
+
 export interface PreparedExecutionTransaction {
   step: TradeTransactionStep;
   hash: Hash;

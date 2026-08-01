@@ -5,6 +5,7 @@ import type { CanonicalChainState } from '../src/chain/canonical-chain.types.js'
 import type { ListenerCheckpoint } from '../src/chain/canonical-chain.types.js';
 import { HeartbeatService, type ChainHealth } from '../src/heartbeat/heartbeat.js';
 import type { CheckpointRepository, SessionRepository } from '../src/storage/repositories.js';
+import { RpcUsageTracker } from '../src/monitoring/rpc-usage.js';
 
 const BLOCK_HASH = `0x${'1'.repeat(64)}` as Hash;
 
@@ -30,12 +31,16 @@ function createCheckpointStore(
 }
 
 test('collecte et expose un heartbeat complet avec RPC disponibles', async () => {
+  const usage = new RpcUsageTracker();
+  usage.recordMethodCall('eth_blockNumber');
+  usage.recordMethodSuccess('eth_blockNumber');
   const heartbeat = new HeartbeatService(
     createCheckpointStore(3_456n) as unknown as CheckpointRepository,
     createSessionStore(4) as unknown as SessionRepository,
     {
       getHttpLatestBlock: async () => 12_345n,
       getWsLatestBlock: async () => 12_346n,
+      getRpcUsage: async () => usage.getSnapshot(),
     },
     'dry-run',
     {
@@ -78,6 +83,7 @@ test('collecte et expose un heartbeat complet avec RPC disponibles', async () =>
   assert.equal(snapshot.webSocket.blockNumber, '12346');
   assert.equal(snapshot.http.error, null);
   assert.equal(snapshot.webSocket.error, null);
+  assert.equal(snapshot.rpcUsage?.methods.eth_blocknumber?.calls, 1);
   assert.equal(snapshot.recovery.pendingSessions, 1);
   assert.equal(snapshot.recovery.manualReviewSessions, 3);
   assert.equal(snapshot.recovery.lastProcessedSessions, 2);

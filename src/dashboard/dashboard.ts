@@ -257,6 +257,7 @@ interface DashboardSnapshot {
       latencyMs: number | null;
       switches: number;
       lastError: string | null;
+      configuredMaxLogBlockRange: number;
       maxLogBlockRange: number;
       lastBlockAgeMs: number | null;
       lastWsMessageAgeMs: number | null;
@@ -272,6 +273,7 @@ interface DashboardSnapshot {
       manualReviewSessions: number;
     };
     chain: ChainHealth;
+    rpcUsage: import('../monitoring/rpc-usage.js').RpcUsageSnapshot | null;
   } | null;
   tokens: DashboardTokenView[];
 }

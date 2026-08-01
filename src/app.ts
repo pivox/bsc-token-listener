@@ -40,6 +40,7 @@ import { RuntimeRecoveryBarrier } from './recovery/runtime-recovery-barrier.js';
 import {
   account,
   getRpcProviderSnapshots,
+  getRpcUsageSnapshot,
   publicClient,
   wsClient,
 } from './rpc/clients.js';
@@ -275,6 +276,7 @@ async function main(): Promise<void> {
       getHttpLatestBlock: () => publicClient.getBlockNumber(),
       getWsLatestBlock: () => wsClient.getBlockNumber(),
       getProviderSnapshots: () => getRpcProviderSnapshots(),
+      getRpcUsage: () => getRpcUsageSnapshot(),
     },
     config.executionMode,
     recovery,

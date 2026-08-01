@@ -52,9 +52,9 @@ npm run dev
 
 ## Configurer un provider RPC BSC
 
-Copiez votre endpoint HTTPS complet dans `BSC_HTTP_RPC_URL` (ou dans `BSC_HTTP_URLS` si vous utilisez la liste d’alias).
+Configurez la liste prioritaire `BSC_HTTP_RPC_URLS`. Si elle est absente, le bot utilise `BSC_HTTP_URLS`, puis `BSC_HTTP_RPC_URL` pour compatibilité.
 
-Copiez votre endpoint WebSocket complet dans `BSC_WS_RPC_URL` (ou dans `BSC_WSS_URLS` pour les alias).
+Configurez la liste prioritaire `BSC_WS_RPC_URLS`. Si elle est absente, le bot utilise `BSC_WSS_URLS`, puis `BSC_WS_RPC_URL` pour compatibilité.
 
 La clé du provider peut être incluse directement dans l’URL (`https://.../v1/<API_KEY>`).
 

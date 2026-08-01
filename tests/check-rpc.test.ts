@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { chain } from '../src/config/chain.js';
 import { config } from '../src/config/env.js';
 import { sanitizeRpcError, runRpcChecks } from '../scripts/check-rpc.js';
 
@@ -57,13 +58,13 @@ class MockChainClient {
 }
 
 test('runRpcChecks valide la chaîne et limite correctement la fenêtre de PairCreated', async () => {
-  const http = new MockChainClient(56, 123n, [{ pair: '0x' }]);
-  const ws = new MockChainClient(56, 130n);
+  const http = new MockChainClient(chain.id, 123n, [{ pair: '0x' }]);
+  const ws = new MockChainClient(chain.id, 130n);
 
   const report = await runRpcChecks({ http, ws });
 
-  assert.equal(report.httpChainId, 56);
-  assert.equal(report.wsChainId, 56);
+  assert.equal(report.httpChainId, chain.id);
+  assert.equal(report.wsChainId, chain.id);
   assert.equal(report.blockDelta, '7');
   assert.equal(report.pairCreatedEventCount, 1);
   assert.equal(http.contractEventCalls.length, 1);
@@ -75,27 +76,49 @@ test('runRpcChecks valide la chaîne et limite correctement la fenêtre de PairC
 });
 
 test('runRpcChecks accepte une réponse PairCreated vide', async () => {
-  const http = new MockChainClient(56, 200n, []);
-  const ws = new MockChainClient(56, 199n);
+  const http = new MockChainClient(chain.id, 200n, []);
+  const ws = new MockChainClient(chain.id, 199n);
   const report = await runRpcChecks({ http, ws });
 
   assert.equal(report.pairCreatedEventCount, 0);
   assert.equal(ws.closeCallCount, 1);
 });
 
+test('runRpcChecks valide explicitement BSC mainnet', async () => {
+  const http = new MockChainClient(56, 200n, []);
+  const ws = new MockChainClient(56, 200n, []);
+  const report = await runRpcChecks(
+    { http, ws },
+    { expectedChainId: 56, network: 'mainnet' },
+  );
+  assert.equal(report.network, 'mainnet');
+  assert.equal(report.expectedChainId, 56);
+});
+
+test('runRpcChecks valide explicitement BSC testnet', async () => {
+  const http = new MockChainClient(97, 200n, []);
+  const ws = new MockChainClient(97, 200n, []);
+  const report = await runRpcChecks(
+    { http, ws },
+    { expectedChainId: 97, network: 'testnet' },
+  );
+  assert.equal(report.network, 'testnet');
+  assert.equal(report.expectedChainId, 97);
+});
+
 test('runRpcChecks échoue en cas de chainId HTTP invalide', async () => {
   const http = new MockChainClient(1, 200n, []);
-  const ws = new MockChainClient(56, 200n, []);
+  const ws = new MockChainClient(chain.id, 200n, []);
   await assert.rejects(
     () => runRpcChecks({ http, ws }),
-    /chainId HTTP ne correspond pas/,
+    /Le chainId HTTP ne correspond pas/,
   );
   assert.equal(ws.closeCallCount, 1);
 });
 
 test('runRpcChecks échoue en cas d’écart de tête anormal entre HTTP et WS', async () => {
-  const http = new MockChainClient(56, 200n, []);
-  const ws = new MockChainClient(56, 218n, []);
+  const http = new MockChainClient(chain.id, 200n, []);
+  const ws = new MockChainClient(chain.id, 218n, []);
   await assert.rejects(
     () => runRpcChecks({ http, ws }),
     /Écart anormal entre HTTP \(200\) et WS \(218\)/u,
@@ -105,12 +128,12 @@ test('runRpcChecks échoue en cas d’écart de tête anormal entre HTTP et WS',
 
 test('runRpcChecks échoue si eth_getLogs retourne une erreur RPC', async () => {
   const http = new MockChainClient(
-    56,
+    chain.id,
     123n,
     [],
     new Error('JSON-RPC error: eth_getLogs internal error'),
   );
-  const ws = new MockChainClient(56, 123n, []);
+  const ws = new MockChainClient(chain.id, 123n, []);
   await assert.rejects(
     () => runRpcChecks({ http, ws }),
     /eth_getLogs/,
@@ -130,8 +153,8 @@ test('sanitizeRpcError supprime toute URL complète', () => {
 });
 
 test('runRpcChecks n’attend pas indéfiniment sur un WebSocket silencieux', async () => {
-  const http = new MockChainClient(56, 100n, []);
-  const ws = new MockChainClient(56, 100n, [], undefined, true);
+  const http = new MockChainClient(chain.id, 100n, []);
+  const ws = new MockChainClient(chain.id, 100n, [], undefined, true);
   const started = Date.now();
   await assert.rejects(
     () => runRpcChecks({ http, ws }, { timeoutMs: 80 }),

@@ -3,9 +3,8 @@ import { fileURLToPath } from 'node:url';
 import type { Address } from 'viem';
 import { pancakeFactoryAbi } from '../src/abi/pancake-factory.abi.js';
 import { config } from '../src/config/env.js';
+import { chain } from '../src/config/chain.js';
 import { publicClient, wsClient } from '../src/rpc/clients.js';
-
-const EXPECTED_MAINNET_CHAIN_ID = 56;
 const MAX_HEAD_DELTA = 10n;
 const DIAGNOSTIC_RANGE_BLOCKS = 10n;
 const DEFAULT_CHECK_TIMEOUT_MS = 60_000;
@@ -81,20 +80,30 @@ async function withTimeout<T>(
 
 export async function runRpcChecks(
   clients: RpcCheckClients,
-  options: { timeoutMs?: number } = {},
+  options: {
+    timeoutMs?: number;
+    expectedChainId?: number;
+    network?: string;
+  } = {},
 ): Promise<RpcCheckReport> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS;
+  const expectedChainId = options.expectedChainId ?? chain.id;
+  const network = options.network ?? config.network;
   const requestTimeoutMs = timeoutMs <= 15_000 ? timeoutMs : 15_000;
   try {
     const [httpChainId, wsChainId] = await Promise.all([
       withTimeout(() => clients.http.getChainId(), requestTimeoutMs, 'Lecture chainId HTTP'),
       withTimeout(() => clients.ws.getChainId(), requestTimeoutMs, 'Lecture chainId WS'),
     ]);
-    if (httpChainId !== EXPECTED_MAINNET_CHAIN_ID) {
-      throw new Error('Le chainId HTTP ne correspond pas à BSC mainnet.');
+    if (httpChainId !== expectedChainId) {
+      throw new Error(
+        `Le chainId HTTP ne correspond pas à ${network}.`,
+      );
     }
-    if (wsChainId !== EXPECTED_MAINNET_CHAIN_ID) {
-      throw new Error('Le chainId WebSocket ne correspond pas à BSC mainnet.');
+    if (wsChainId !== expectedChainId) {
+      throw new Error(
+        `Le chainId WebSocket ne correspond pas à ${network}.`,
+      );
     }
 
     const [httpLatestBlock, wsLatestBlock] = await Promise.all([
@@ -124,8 +133,8 @@ export async function runRpcChecks(
     );
 
     return {
-      network: config.network,
-      expectedChainId: EXPECTED_MAINNET_CHAIN_ID,
+      network,
+      expectedChainId,
       httpChainId,
       wsChainId,
       httpLatestBlock: httpLatestBlock.toString(),
@@ -178,12 +187,15 @@ async function main(): Promise<void> {
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  await main().catch((error: unknown) => {
+  try {
+    await main();
+    process.exit(0);
+  } catch (error) {
     console.error(
       sanitizeRpcError(
         error instanceof Error ? error.message : String(error),
       ),
     );
-    process.exitCode = 1;
-  });
+    process.exit(1);
+  }
 }
