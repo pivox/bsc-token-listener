@@ -1,7 +1,8 @@
-import { createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'node:fs';
+import { createWriteStream, mkdirSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { Writable } from 'node:stream';
 import pino from 'pino';
+import { tolerateMissingFile } from './missing-file-tolerance.js';
 
 type LogLevel = pino.Level;
 
@@ -43,10 +44,7 @@ class RotatingFileStream extends Writable {
   }
 
   private getCurrentFileSize(path: string): number {
-    if (!existsSync(path)) {
-      return 0;
-    }
-    return statSync(path).size;
+    return tolerateMissingFile(() => statSync(path).size) ?? 0;
   }
 
   private rotate(): void {
@@ -72,9 +70,10 @@ class RotatingFileStream extends Writable {
       .filter((name) => name.startsWith(`${this.filePrefix}.`) && name.endsWith('.log'))
       .map((name) => {
         const path = join(this.baseDirectory, name);
-        const { mtimeMs } = statSync(path);
-        return { path, mtimeMs };
+        const stats = tolerateMissingFile(() => statSync(path));
+        return stats ? { path, mtimeMs: stats.mtimeMs } : null;
       })
+      .filter((file): file is { path: string; mtimeMs: number } => file !== null)
       .sort((a, b) => a.mtimeMs - b.mtimeMs);
 
     while (files.length > this.retainedFiles) {
@@ -82,7 +81,7 @@ class RotatingFileStream extends Writable {
       if (!oldest) {
         return;
       }
-      unlinkSync(oldest.path);
+      tolerateMissingFile(() => unlinkSync(oldest.path));
     }
   }
 
