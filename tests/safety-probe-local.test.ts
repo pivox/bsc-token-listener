@@ -20,3 +20,25 @@ test('SafetyProbe mesure un aller-retour sans perte pour un token standard', asy
     await scenario.close();
   }
 });
+
+test('SafetyProbe distingue les taxes achat et vente', async () => {
+  const scenario = await deploySafetyProbeScenario('MockTaxToken', [
+    1_000n,
+    2_000n,
+  ]);
+  try {
+    const result = await scenario.service.probe(scenario.pair);
+
+    assert.deepEqual(result, {
+      buyTaxBps: 1_000,
+      sellTaxBps: 2_000,
+      roundTripLossBps: 2_800,
+      quotedTokens: 10_000n,
+      receivedTokens: 9_000n,
+      quotedNative: 9_000n,
+      recoveredNative: 7_200n,
+    });
+  } finally {
+    await scenario.close();
+  }
+});
