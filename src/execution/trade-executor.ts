@@ -11,6 +11,7 @@ import type {
   TradeTransactionRecord,
 } from '../types/domain.js';
 import { errorMessage } from '../utils/error.js';
+import { sanitizeRpcText } from '../utils/sanitize.js';
 import {
   calculateBuyPrincipal,
   calculateGasCost,
@@ -23,6 +24,7 @@ import type {
   PreparedExecutionTransaction,
   TradeStore,
 } from './execution.types.js';
+import { TransactionBroadcastRejectedError } from './execution.types.js';
 import { TransactionQueue } from './transaction-queue.js';
 import { ViemExecutionGateway } from './viem-execution.gateway.js';
 
@@ -646,6 +648,18 @@ export class TradeExecutor {
         { tradeId: trade.id, step: transaction.step, error: errorMessage(error) },
         'Échec de diffusion.',
       );
+      if (error instanceof TransactionBroadcastRejectedError) {
+        const rejectedAtMs = Date.now();
+        const reason = sanitizeRpcText(errorMessage(error));
+        transaction.status = 'REJECTED';
+        transaction.error = reason;
+        transaction.updatedAtMs = rejectedAtMs;
+        trade.status = 'FAILED';
+        trade.error = reason;
+        trade.updatedAtMs = rejectedAtMs;
+        await this.trades.saveLifecycle(trade, transaction);
+        throw error;
+      }
       const safeError = new Error(
         `Échec RPC de diffusion (${error instanceof Error ? error.name : typeof error}); `
         + `hash local ${prepared.hash}.`,
@@ -661,7 +675,7 @@ export class TradeExecutor {
     let receipt: ExecutionReceipt;
     try {
       const submittedAtMs = Date.now();
-      transaction.status = 'SUBMITTED';
+      transaction.status = 'BROADCASTED';
       transaction.submittedAtMs = submittedAtMs;
       transaction.updatedAtMs = submittedAtMs;
       trade.status = 'SUBMITTED';
@@ -842,7 +856,7 @@ export class TradeExecutor {
       id: randomUUID(),
       tradeId,
       step: prepared.step,
-      status: 'CREATED',
+      status: 'PENDING_BROADCAST',
       walletAddress: prepared.walletAddress,
       transactionHash: prepared.hash,
       nonce: prepared.nonce,

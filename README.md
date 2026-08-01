@@ -50,6 +50,34 @@ npm test
 npm run dev
 ```
 
+## Configurer un provider RPC BSC
+
+Configurez la liste prioritaire `BSC_HTTP_RPC_URLS`. Si elle est absente, le bot utilise `BSC_HTTP_URLS`, puis `BSC_HTTP_RPC_URL` pour compatibilité.
+
+Configurez la liste prioritaire `BSC_WS_RPC_URLS`. Si elle est absente, le bot utilise `BSC_WSS_URLS`, puis `BSC_WS_RPC_URL` pour compatibilité.
+
+La clé du provider peut être incluse directement dans l’URL (`https://.../v1/<API_KEY>`).
+
+Aucun endpoint réel ne doit jamais être committé dans le dépôt ; seuls des placeholders doivent rester dans `.env.example`.
+
+`RPC_MAX_LOG_BLOCK_RANGE` fixe la taille maximum d’une plage d’appels `eth_getLogs` utilisée par le coordinator et les diagnostics. 
+
+Cette valeur dépend de la limite du provider (100 chez Chainstack Developer). Utilisez la valeur la plus basse demandée par votre provider.
+
+Pour Chainstack Developer, utilisez :
+
+```bash
+RPC_MAX_LOG_BLOCK_RANGE=100
+```
+
+Lancer une vérification RPC :
+
+```bash
+npm run rpc:check
+```
+
+Le mécanisme reste agnostique du provider (NodeReal, Chainstack ou tout autre endpoint EVM compatible).
+
 ## SafetyProbe
 
 Le probe doit être déployé une fois. Commencer sur testnet :

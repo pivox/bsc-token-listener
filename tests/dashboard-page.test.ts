@@ -30,6 +30,10 @@ test('dashboard affiche les champs heartbeat dans la page', () => {
   assert.match(html, /chain\.canonicalBlockHash/);
   assert.match(html, /chain\.lastReorg/);
   assert.match(html, /chain\.state/);
+  assert.match(html, /id="rpc-usage-total"/);
+  assert.match(html, /id="rpc-usage-budget"/);
+  assert.match(html, /id="rpc-usage-retries"/);
+  assert.match(html, /snapshot\.heartbeat\.rpcUsage/);
 });
 
 test('dashboard affiche l’entrée à la seconde et le lien Dexscreener de la paire', () => {

@@ -7,6 +7,7 @@ import type {
   CanonicalChainState,
   ChainReorgStatus,
 } from '../chain/canonical-chain.types.js';
+import type { RpcUsageSnapshot } from '../monitoring/rpc-usage.js';
 
 export type RpcStatus = 'up' | 'down';
 
@@ -55,11 +56,33 @@ export interface HeartbeatSnapshot {
     manualReviewSessions: number;
   };
   chain: ChainHealth;
+  providers: HeartbeatProviderSnapshot[];
+  rpcUsage: RpcUsageSnapshot | null;
 }
+
+export type HeartbeatProviderSnapshot = {
+  id: string;
+  kind: 'HTTP' | 'WEBSOCKET' | 'TX';
+  status: RpcStatus;
+  lagging: boolean;
+  blockNumber: string | null;
+  errorRate: number;
+  latencyMs: number | null;
+  switches: number;
+  lastError: string | null;
+  configuredMaxLogBlockRange: number;
+  maxLogBlockRange: number;
+  lastBlockAgeMs: number | null;
+  lastWsMessageAgeMs: number | null;
+  inCooldownUntilMs: number | null;
+  consensusLag: string | null;
+};
 
 export interface HeartbeatDependencies {
   getHttpLatestBlock: () => Promise<bigint>;
   getWsLatestBlock: () => Promise<bigint>;
+  getProviderSnapshots?: () => Promise<HeartbeatProviderSnapshot[]>;
+  getRpcUsage?: () => Promise<RpcUsageSnapshot>;
 }
 
 interface RecoveryStatusProvider {
@@ -110,11 +133,15 @@ export class HeartbeatService {
       activeSessions,
       http,
       webSocket,
+      providers,
+      rpcUsage,
     ] = await Promise.all([
       this.checkpoints.get('pair-created'),
       this.sessions.countActive(),
       this.fetchRpcHealth(this.dependencies.getHttpLatestBlock),
       this.fetchRpcHealth(this.dependencies.getWsLatestBlock),
+      this.fetchProviderSnapshots(),
+      this.fetchRpcUsage(),
     ]);
 
     const latestBlock = http.blockNumber ?? this.snapshot?.latestBlock ?? null;
@@ -140,9 +167,33 @@ export class HeartbeatService {
       webSocket,
       recovery: this.recoverySnapshot(),
       chain,
+      providers,
+      rpcUsage,
     };
 
     return this.snapshot;
+  }
+
+  private async fetchProviderSnapshots(): Promise<HeartbeatSnapshot['providers']> {
+    if (!this.dependencies.getProviderSnapshots) {
+      return [];
+    }
+    try {
+      return await this.dependencies.getProviderSnapshots();
+    } catch {
+      return [];
+    }
+  }
+
+  private async fetchRpcUsage(): Promise<RpcUsageSnapshot | null> {
+    if (!this.dependencies.getRpcUsage) {
+      return null;
+    }
+    try {
+      return await this.dependencies.getRpcUsage();
+    } catch {
+      return null;
+    }
   }
 
   private async fetchChainHealth(latestBlock: bigint | null): Promise<ChainHealth> {

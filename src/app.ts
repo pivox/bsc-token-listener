@@ -29,13 +29,21 @@ import {
   MonitorScheduler,
   type MonitorReconcileResult,
 } from './monitoring/monitor-scheduler.js';
+import { SwapReconcileOrchestrator } from './monitoring/swap-reconcile-orchestrator.js';
+import { SwapLogBatchReconciler } from './monitoring/swap-log-batch-reconciler.js';
 import { RecoveryCoordinator } from './recovery/recovery-coordinator.js';
 import { RecoveryIntentService } from './recovery/recovery-intent.service.js';
 import { ReconciliationRepository } from './recovery/reconciliation.repository.js';
 import { SessionReconciler } from './recovery/session-reconciler.js';
 import { ViemReconciliationGateway } from './recovery/viem-reconciliation.gateway.js';
 import { RuntimeRecoveryBarrier } from './recovery/runtime-recovery-barrier.js';
-import { account, publicClient, wsClient } from './rpc/clients.js';
+import {
+  account,
+  getRpcProviderSnapshots,
+  getRpcUsageSnapshot,
+  publicClient,
+  wsClient,
+} from './rpc/clients.js';
 import { drainRuntimeForShutdown } from './runtime/runtime-shutdown.js';
 import { FreshStartRepository } from './runtime/fresh-start.repository.js';
 import { FreshStartService } from './runtime/fresh-start.service.js';
@@ -267,6 +275,8 @@ async function main(): Promise<void> {
     {
       getHttpLatestBlock: () => publicClient.getBlockNumber(),
       getWsLatestBlock: () => wsClient.getBlockNumber(),
+      getProviderSnapshots: () => getRpcProviderSnapshots(),
+      getRpcUsage: () => getRpcUsageSnapshot(),
     },
     config.executionMode,
     recovery,
@@ -291,6 +301,21 @@ async function main(): Promise<void> {
   let monitorSchedulingEnabled = false;
   const reorgReplayAdmission = new ReorgReplayAdmissionGate();
   const monitorsAwaitingReplayActivation = new Set<string>();
+  let swapLogBatchReconciler: SwapLogBatchReconciler;
+  const swapReconcileOrchestrator = new SwapReconcileOrchestrator({
+    intervalMs: config.reconcileSeconds * 1_000,
+    canRun: () =>
+      monitorSchedulingEnabled
+      && !recovery.currentStatus.running
+      && monitorsPendingRecoveryDrain.size === 0,
+    onError: (error) => logger.error(
+      { reason: errorMessage(error) },
+      'Réconciliation centralisée Swap échouée.',
+    ),
+    runPass: (targets) => swapLogBatchReconciler.reconcile(
+      targets as readonly SwapListener[],
+    ),
+  });
   let requestMonitorReconcile = (): void => {};
 
   const removeMonitor = (
@@ -298,6 +323,7 @@ async function main(): Promise<void> {
     scheduleNext = true,
     logRelease = true,
   ): void => {
+    swapReconcileOrchestrator.unregister(pair);
     const pairKey = pair.toLowerCase();
     const tokenKey = activeTokenByPair.get(pairKey);
     const removed = monitors.delete(pairKey);
@@ -319,6 +345,7 @@ async function main(): Promise<void> {
     logRelease = true,
   ): Promise<void> => {
     const key = pair.toLowerCase();
+    swapReconcileOrchestrator.unregister(pair);
     if (terminalPairsPendingRetirement.has(key)) {
       await retireTerminalPair(pair);
       return;
@@ -393,8 +420,11 @@ async function main(): Promise<void> {
         watcher: wsClient,
         logReader: publicClient,
         coordinator: canonicalCoordinator,
+        requestReconcile: (pair) => swapReconcileOrchestrator.signal(pair),
+        requestAndWait: (pair) => swapReconcileOrchestrator.requestAndWait(pair),
       },
     );
+    swapReconcileOrchestrator.register(listener);
     monitors.set(key, listener);
     activeSessionsByToken.set(tokenKey, session);
     activeTokenByPair.set(key, tokenKey);
@@ -405,6 +435,7 @@ async function main(): Promise<void> {
       );
       if (!started) {
         await listener.stopAndDrain();
+        swapReconcileOrchestrator.unregister(session.pair.pair);
         removeMonitor(session.pair.pair, false, false);
         return false;
       }
@@ -414,6 +445,7 @@ async function main(): Promise<void> {
       return true;
     } catch (error) {
       await listener.stopAndDrain();
+      swapReconcileOrchestrator.unregister(session.pair.pair);
       monitorsAwaitingReplayActivation.delete(key);
       removeMonitor(session.pair.pair, false, false);
       throw error;
@@ -467,12 +499,14 @@ async function main(): Promise<void> {
       const current = refreshedByPair.get(pairKey);
       if (!current) {
         const listener = monitors.get(pairKey);
+        if (listener) swapReconcileOrchestrator.unregister(pairKey as Address);
         listener?.stop();
         if (listener) monitorsPendingRecoveryDrain.set(pairKey, listener);
         continue;
       }
       if (!isSessionMonitorable(current)) {
         const listener = monitors.get(pairKey);
+        if (listener) swapReconcileOrchestrator.unregister(pairKey as Address);
         listener?.stop();
         if (listener) monitorsPendingRecoveryDrain.set(pairKey, listener);
         refreshedByPair.delete(pairKey);
@@ -494,6 +528,7 @@ async function main(): Promise<void> {
     for (const pair of reconciliation.monitorsToStop) {
       const pairKey = pair.toLowerCase();
       const listener = monitors.get(pairKey);
+      if (listener) swapReconcileOrchestrator.unregister(pairKey as Address);
       listener?.stop();
       if (listener) {
         monitorsPendingRecoveryDrain.set(pairKey, listener);
@@ -532,6 +567,7 @@ async function main(): Promise<void> {
     canonicalStore: chainRepository,
     checkpoints,
     confirmations: config.blockConfirmations,
+    chunkSize: config.rpcMaxLogBlockRange,
     cutoff: freshStartRun.cutoff,
     runtimeBarrier: runtimeRecoveryBarrier,
     reorgHandler: {
@@ -581,9 +617,7 @@ async function main(): Promise<void> {
             reconcilePairs: async () => pairListener?.reconcileNow(),
             waitForMonitorIdle: () => monitorScheduler.waitForIdle(),
             reconcileActiveSwaps: async () => {
-              await Promise.all(
-                [...monitors.values()].map((listener) => listener.reconcileNow()),
-              );
+              await swapLogBatchReconciler.reconcile([...monitors.values()]);
             },
             countCanonicalProcessedEvents: (eventIds) =>
               chainRepository.countCanonicalProcessedEvents(eventIds),
@@ -619,12 +653,28 @@ async function main(): Promise<void> {
         return completion;
       });
     },
-    onRecovered: () => {
-      for (const key of monitorsAwaitingReplayActivation) {
-        monitors.get(key)?.activateAfterReplay();
+    onRecovered: async () => {
+      const keys = [...monitorsAwaitingReplayActivation];
+      const activations = await Promise.allSettled(
+        keys.map(async (key) => {
+          const monitor = monitors.get(key);
+          if (monitor) await monitor.activateAfterReplay();
+          monitorsAwaitingReplayActivation.delete(key);
+        }),
+      );
+      const failed = activations.find(
+        (result): result is PromiseRejectedResult => result.status === 'rejected',
+      );
+      if (failed) {
+        throw failed.reason;
       }
-      monitorsAwaitingReplayActivation.clear();
     },
+  });
+  swapLogBatchReconciler = new SwapLogBatchReconciler({
+    coordinator: canonicalCoordinator,
+    checkpoints,
+    logReader: publicClient,
+    maxAddressesPerBatch: config.swapLogBatchMaxAddresses,
   });
   chainHealthProvider = new CanonicalChainHealthProvider(
     config.blockConfirmations,
@@ -738,6 +788,7 @@ async function main(): Promise<void> {
       });
       monitorSchedulingEnabled = true;
       await monitorScheduler.reconcile();
+      swapReconcileOrchestrator.signal();
     },
     activateListeners: async () => {
       await startPositionExitRuntime({
@@ -754,12 +805,14 @@ async function main(): Promise<void> {
         monitorSchedulingEnabled = false;
         positionExitMonitor.stop();
         pairListener.stop();
+        swapReconcileOrchestrator.stop();
         for (const listener of monitors.values()) listener.stop();
       },
       stopRecovery: () => recovery.stop(),
       waitForMonitorIdle: async () => {
         await positionExitMonitor.waitForIdle();
         await monitorScheduler.waitForIdle();
+        await swapReconcileOrchestrator.waitForIdle();
       },
       waitForCanonicalIdle: () => canonicalCoordinator.waitForIdle(),
       drainListeners: async () => {
@@ -782,10 +835,7 @@ async function main(): Promise<void> {
       },
     },
   });
-  const monitorQueueInterval = setInterval(() => {
-    requestMonitorReconcile();
-  }, config.reconcileSeconds * 1_000);
-  monitorQueueInterval.unref();
+  swapReconcileOrchestrator.start();
 
   const refreshHeartbeat = async (): Promise<void> => {
     const snapshot = await heartbeat.refresh(
@@ -860,15 +910,20 @@ async function main(): Promise<void> {
     await drainRuntimeForShutdown({
       disableSchedulingAndStopNewWork: () => {
         monitorSchedulingEnabled = false;
-        clearInterval(monitorQueueInterval);
         clearInterval(heartbeatInterval);
+        swapReconcileOrchestrator.stop();
         pairListener.stop();
         for (const listener of monitors.values()) listener.stop();
       },
       stopPositionExits: () => positionExitMonitor.stop(),
       stopRecovery: () => recovery.stop(),
       waitForPositionExitIdle: () => positionExitMonitor.waitForIdle(),
-      waitForMonitorIdle: () => monitorScheduler.waitForIdle(),
+      waitForMonitorIdle: async () => {
+        await Promise.all([
+          monitorScheduler.waitForIdle(),
+          swapReconcileOrchestrator.waitForIdle(),
+        ]);
+      },
       waitForCanonicalIdle: () => canonicalCoordinator.waitForIdle(),
     });
     await Promise.all(
