@@ -30,6 +30,8 @@ interface RepositoryDatabase extends SessionDatabase {
   connect(): Promise<RepositoryDatabaseClient>;
 }
 
+type CheckpointDatabase = SessionDatabase & Partial<Pick<RepositoryDatabase, 'connect'>>;
+
 export class SessionRepository {
   constructor(
     private readonly database: SessionDatabase =
@@ -517,8 +519,8 @@ export class DiscoveredTokenRepository {
 
 export class CheckpointRepository {
   constructor(
-    private readonly database: SessionDatabase =
-      pool as unknown as SessionDatabase,
+    private readonly database: CheckpointDatabase =
+      pool as unknown as RepositoryDatabase,
   ) {}
 
   async get(key: string): Promise<ListenerCheckpoint | null> {
@@ -559,6 +561,31 @@ export class CheckpointRepository {
     return blockNumber === null ? null : BigInt(blockNumber);
   }
 
+  async getMany(keys: readonly string[]): Promise<Map<string, ListenerCheckpoint>> {
+    if (keys.length === 0) return new Map();
+    const result = await this.database.query<{
+      listener_key: string;
+      block_number: string;
+      block_hash: string | null;
+    }>(
+      `SELECT listener_key, block_number::text, block_hash
+       FROM listener_checkpoints
+       WHERE listener_key = ANY($1::text[])`,
+      [[...keys]],
+    );
+    const checkpoints = new Map<string, ListenerCheckpoint>();
+    for (const row of result.rows) {
+      if (row.block_hash !== null && !isHash(row.block_hash)) {
+        throw new Error(`Hash de checkpoint invalide pour ${row.listener_key}.`);
+      }
+      checkpoints.set(row.listener_key, {
+        blockNumber: BigInt(row.block_number),
+        blockHash: row.block_hash,
+      } as ListenerCheckpoint);
+    }
+    return checkpoints;
+  }
+
   async set(
     key: string,
     checkpoint: AnchoredListenerCheckpoint,
@@ -576,6 +603,46 @@ export class CheckpointRepository {
         checkpoint.blockHash.toLowerCase(),
       ],
     );
+  }
+
+  async setManyAtomically(
+    writes: readonly {
+      key: string;
+      checkpoint: AnchoredListenerCheckpoint;
+    }[],
+  ): Promise<void> {
+    if (writes.length === 0) return;
+    if (new Set(writes.map(({ key }) => key)).size !== writes.length) {
+      throw new Error('Clés de checkpoints dupliquées dans la transaction.');
+    }
+    if (!this.database.connect) {
+      throw new Error('Transactions de checkpoints indisponibles.');
+    }
+    const client = await this.database.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `INSERT INTO listener_checkpoints(listener_key, block_number, block_hash)
+         SELECT listener_key, block_number, block_hash
+         FROM UNNEST($1::text[], $2::bigint[], $3::text[])
+           AS checkpoints(listener_key, block_number, block_hash)
+         ON CONFLICT (listener_key) DO UPDATE SET
+           block_number = EXCLUDED.block_number,
+           block_hash = EXCLUDED.block_hash,
+           updated_at = NOW()`,
+        [
+          writes.map(({ key }) => key),
+          writes.map(({ checkpoint }) => checkpoint.blockNumber.toString()),
+          writes.map(({ checkpoint }) => checkpoint.blockHash.toLowerCase()),
+        ],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async delete(key: string): Promise<void> {

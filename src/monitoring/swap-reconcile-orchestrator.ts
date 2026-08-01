@@ -1,14 +1,14 @@
 import type { Address } from 'viem';
 
-interface SwapReconcileTarget {
+export interface SwapReconcileTarget {
   pair: Address;
-  reconcileNow(): Promise<void>;
 }
 
 interface SwapReconcileOrchestratorOptions {
   intervalMs: number;
   canRun: () => boolean;
   onError: (error: unknown) => void;
+  runPass: (targets: readonly SwapReconcileTarget[]) => Promise<void>;
   setInterval: (callback: () => void, intervalMs: number) => ReturnType<typeof setInterval>;
   clearInterval: (handle: ReturnType<typeof setInterval>) => void;
 }
@@ -214,18 +214,17 @@ export class SwapReconcileOrchestrator {
     this.runningPairs = runningPairs;
 
     const results = new Map<string, SwapReconcileResult>();
-    await Promise.all(
-      targets.map(async (target) => {
-        const pairKey = getPairKey(target.pair);
-        try {
-          await target.reconcileNow();
-          results.set(pairKey, {});
-        } catch (error) {
-          results.set(pairKey, { error });
-          this.options.onError(error);
-        }
-      }),
-    );
+    try {
+      await this.options.runPass(targets);
+      for (const target of targets) {
+        results.set(getPairKey(target.pair), {});
+      }
+    } catch (error) {
+      for (const target of targets) {
+        results.set(getPairKey(target.pair), { error });
+      }
+      this.options.onError(error);
+    }
     this.runningPairs = new Set();
 
     for (const pairKey of requestedPairs) {

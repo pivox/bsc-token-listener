@@ -143,6 +143,12 @@ function createReconciliationsWithSignals(
     intervalMs: 60_000,
     canRun: () => true,
     onError: () => {},
+    runPass: async (targets) => {
+      await Promise.all(
+        targets.map((target) =>
+          (target as SwapListener).runCanonicalReconcile()),
+      );
+    },
   });
   const watcher = new MemoryWatcher();
   const signaled: string[] = [];

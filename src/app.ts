@@ -30,6 +30,7 @@ import {
   type MonitorReconcileResult,
 } from './monitoring/monitor-scheduler.js';
 import { SwapReconcileOrchestrator } from './monitoring/swap-reconcile-orchestrator.js';
+import { SwapLogBatchReconciler } from './monitoring/swap-log-batch-reconciler.js';
 import { RecoveryCoordinator } from './recovery/recovery-coordinator.js';
 import { RecoveryIntentService } from './recovery/recovery-intent.service.js';
 import { ReconciliationRepository } from './recovery/reconciliation.repository.js';
@@ -298,6 +299,7 @@ async function main(): Promise<void> {
   let monitorSchedulingEnabled = false;
   const reorgReplayAdmission = new ReorgReplayAdmissionGate();
   const monitorsAwaitingReplayActivation = new Set<string>();
+  let swapLogBatchReconciler: SwapLogBatchReconciler;
   const swapReconcileOrchestrator = new SwapReconcileOrchestrator({
     intervalMs: config.reconcileSeconds * 1_000,
     canRun: () =>
@@ -307,6 +309,9 @@ async function main(): Promise<void> {
     onError: (error) => logger.error(
       { reason: errorMessage(error) },
       'Réconciliation centralisée Swap échouée.',
+    ),
+    runPass: (targets) => swapLogBatchReconciler.reconcile(
+      targets as readonly SwapListener[],
     ),
   });
   let requestMonitorReconcile = (): void => {};
@@ -610,9 +615,7 @@ async function main(): Promise<void> {
             reconcilePairs: async () => pairListener?.reconcileNow(),
             waitForMonitorIdle: () => monitorScheduler.waitForIdle(),
             reconcileActiveSwaps: async () => {
-              await Promise.all(
-                [...monitors.values()].map((listener) => listener.reconcileNow()),
-              );
+              await swapLogBatchReconciler.reconcile([...monitors.values()]);
             },
             countCanonicalProcessedEvents: (eventIds) =>
               chainRepository.countCanonicalProcessedEvents(eventIds),
@@ -654,6 +657,12 @@ async function main(): Promise<void> {
       }
       monitorsAwaitingReplayActivation.clear();
     },
+  });
+  swapLogBatchReconciler = new SwapLogBatchReconciler({
+    coordinator: canonicalCoordinator,
+    checkpoints,
+    logReader: publicClient,
+    maxAddressesPerBatch: config.swapLogBatchMaxAddresses,
   });
   chainHealthProvider = new CanonicalChainHealthProvider(
     config.blockConfirmations,

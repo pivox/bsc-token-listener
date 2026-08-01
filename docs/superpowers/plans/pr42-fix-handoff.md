@@ -1,5 +1,16 @@
 # PR42 - Handoff opératoire (swap reconcile orchestrator / listener)
 
+PROMPT 1 TERMINÉ — ORCHESTRATEUR VALIDÉ
+PROMPT 2 TERMINÉ — BATCHING ET CHECKPOINTS VALIDÉS
+
+## Réconciliation Swap groupée
+- `SwapReconcileOrchestrator` conserve le timer unique, les signaux, la coalescence, les demandes avec attente et les reruns.
+- `SwapLogBatchReconciler` prend un snapshot de listeners, charge les checkpoints `swap:<pair>`, prépare une plage via `CanonicalChainCoordinator`, partitionne les adresses et route les logs validés dans l’ordre canonique global.
+- Le coordinateur est appelé avec `ignoreStoredCheckpoint: true` et `persistCheckpoint: false`; seuls les checkpoints individuels sont persistés par le batch.
+- `CheckpointRepository.setManyAtomically()` écrit tous les checkpoints d’un chunk dans une transaction PostgreSQL unique. Une lecture, validation, décision métier ou écriture en échec ne fait avancer aucun checkpoint du chunk.
+- Appels `eth_getLogs` par chunk avec lot de 20: 1 paire = 1, 10 paires = 1, 50 paires = 3. Sur 250 blocs avec une limite de 100 et 50 paires: `3 chunks x 3 lots = 9` appels.
+- Tests batch: `21/21` passés; atomicité repository ciblée: `2/2`; orchestrateur: `13/13`; confirmations listeners: `31/31`.
+
 ## Branche courante
 - `chore/issue-15-rpc-ha-observability`
 

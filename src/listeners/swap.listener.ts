@@ -171,7 +171,7 @@ export class SwapListener {
   }
 
   isReconcileCapable(): boolean {
-    return !this.stopped && !this.replayPrepared;
+    return !this.stopped;
   }
 
   async start(options: { signal?: AbortSignal } = {}): Promise<void> {
@@ -316,7 +316,7 @@ export class SwapListener {
     return this.reconciliation;
   }
 
-  private runCanonicalReconcile(signal?: AbortSignal): Promise<void> {
+  runCanonicalReconcile(signal?: AbortSignal): Promise<void> {
     logger.debug(
       {
         pair: this.session.pair.pair,
@@ -557,9 +557,6 @@ export class SwapListener {
       },
       'Réconciliation Swap déclenchée manuellement.',
     );
-    if (this.dependencies.requestAndWait) {
-      return this.runCanonicalReconcile();
-    }
     return this.requestReconcile();
   }
 

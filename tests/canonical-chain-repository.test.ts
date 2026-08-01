@@ -344,6 +344,27 @@ class RecordingDatabase {
   }
 }
 
+class TransactionRecordingDatabase extends RecordingDatabase {
+  released = false;
+  failCheckpointUpsert = false;
+
+  async connect(): Promise<this> {
+    return this;
+  }
+
+  release(): void {
+    this.released = true;
+  }
+
+  override async query<T>(sql: string, values?: unknown[]): Promise<{ rows: T[] }> {
+    if (this.failCheckpointUpsert && sql.includes('INSERT INTO listener_checkpoints')) {
+      this.calls.push({ sql, ...(values ? { values } : {}) });
+      throw new Error('checkpoint upsert failed');
+    }
+    return super.query<T>(sql, values);
+  }
+}
+
 test('charge un checkpoint avec son hash sans convertir le bigint en number', async () => {
   const database = new RecordingDatabase();
   database.rows = [{ block_number: '9007199254740993', block_hash: HASH_12 }];
@@ -399,6 +420,46 @@ test('upsert le numéro et le hash du checkpoint', async () => {
     /INSERT INTO listener_checkpoints\(listener_key, block_number, block_hash\)/u,
   );
   assert.match(database.calls[0]?.sql ?? '', /block_hash = EXCLUDED\.block_hash/u);
+});
+
+test('met à jour plusieurs checkpoints dans une seule transaction', async () => {
+  const database = new TransactionRecordingDatabase();
+  const repository = new CheckpointRepository(database);
+
+  await repository.setManyAtomically([
+    { key: 'swap:0xa', checkpoint: { blockNumber: 12n, blockHash: HASH_12 } },
+    { key: 'swap:0xb', checkpoint: { blockNumber: 13n, blockHash: HASH_13 } },
+  ]);
+
+  const statements = database.calls.map(({ sql }) =>
+    sql.replace(/\s+/gu, ' ').trim());
+  assert.equal(statements[0], 'BEGIN');
+  assert.match(statements[1] ?? '', /^INSERT INTO listener_checkpoints/u);
+  assert.equal(statements[2], 'COMMIT');
+  assert.deepEqual(database.calls[1]?.values, [
+    ['swap:0xa', 'swap:0xb'],
+    ['12', '13'],
+    [HASH_12, HASH_13],
+  ]);
+  assert.equal(database.released, true);
+});
+
+test('rollback toute la transaction si la mise à jour atomique échoue', async () => {
+  const database = new TransactionRecordingDatabase();
+  database.failCheckpointUpsert = true;
+  const repository = new CheckpointRepository(database);
+
+  await assert.rejects(
+    repository.setManyAtomically([
+      { key: 'swap:0xa', checkpoint: { blockNumber: 12n, blockHash: HASH_12 } },
+      { key: 'swap:0xb', checkpoint: { blockNumber: 13n, blockHash: HASH_13 } },
+    ]),
+    /checkpoint upsert failed/u,
+  );
+
+  assert.equal(database.calls.at(-1)?.sql, 'ROLLBACK');
+  assert.equal(database.calls.some(({ sql }) => sql === 'COMMIT'), false);
+  assert.equal(database.released, true);
 });
 
 test('supprime exactement le checkpoint terminal demandé', async () => {

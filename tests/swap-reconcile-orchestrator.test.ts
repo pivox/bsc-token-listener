@@ -53,6 +53,12 @@ function createOrchestrator(
     onError: () => {
       throw new Error('reconcile listener échoué');
     },
+    runPass: async (targets) => {
+      await Promise.all(
+        targets.map((target) =>
+          (target as ReconcileTarget).reconcileNow()),
+      );
+    },
     setInterval: timer.setInterval as unknown as typeof setInterval,
     clearInterval: timer.clearInterval as unknown as typeof clearInterval,
   });
@@ -273,6 +279,11 @@ test('waitForIdle attend un passage planifié par microtask même s’il n’a p
     intervalMs: 15_000,
     canRun: () => true,
     onError: () => {},
+    runPass: async (targets) => {
+      await Promise.all(
+        targets.map((entry) => (entry as ReconcileTarget).reconcileNow()),
+      );
+    },
     setInterval: timer.setInterval as unknown as typeof setInterval,
     clearInterval: timer.clearInterval as unknown as typeof clearInterval,
   });
@@ -305,6 +316,11 @@ test('requestAndWait rejette la promesse en cas d’erreur de réconciliation', 
     intervalMs: 15_000,
     canRun: () => true,
     onError: () => {},
+    runPass: async (targets) => {
+      await Promise.all(
+        targets.map((entry) => (entry as ReconcileTarget).reconcileNow()),
+      );
+    },
     setInterval: timer.setInterval as unknown as typeof setInterval,
     clearInterval: timer.clearInterval as unknown as typeof clearInterval,
   });
