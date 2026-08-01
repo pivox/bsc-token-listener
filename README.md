@@ -358,8 +358,40 @@ utilisé. Hardhat fournit uniquement un compte local éphémère déverrouillé 
 clé n'est ni lue, ni stockée, ni journalisée. Cette suite fait également partie
 de `npm test`.
 
-Le scénario BSC testnet reste séparé et explicitement opt-in. Il ne doit jamais
-être lancé par défaut ni recevoir de secret depuis la CI.
+## Smoke SafetyProbe sur BSC testnet
+
+Ce scénario externe reste séparé de `npm test` et de la CI. Il utilise
+uniquement un client public viem et un `eth_call` : il ne construit aucun
+wallet, ne signe rien et n'envoie aucune transaction. Il refuse toute
+`PRIVATE_KEY`, le mode `live`, un réseau autre que `testnet` et un endpoint dont
+le chain ID n'est pas exactement `97`.
+
+Dans un environnement dédié, renseigner des contrats effectivement déployés sur
+BSC testnet et un compte public suffisamment approvisionné pour que le nœud
+puisse valider le `msg.value` simulé :
+
+```env
+BSC_NETWORK=testnet
+EXECUTION_MODE=dry-run
+BSC_HTTP_RPC_URL=https://...
+PRIVATE_KEY=
+SAFETY_PROBE_ADDRESS=0x...
+RISK_PROBE_CALLER=0x...
+PANCAKE_ROUTER_ADDRESS=0x...
+TESTNET_PROBE_TOKEN_ADDRESS=0x...
+RISK_PROBE_AMOUNT_BNB=0.005
+CONFIRM_TESTNET_PROBE=I_UNDERSTAND_READ_ONLY_TESTNET
+```
+
+Puis lancer explicitement :
+
+```bash
+npm run test:testnet
+```
+
+Avant la simulation, la commande vérifie le bytecode du probe, du routeur et du
+token ainsi que le solde du compte appelant. Son rapport JSON ne contient pas
+l'URL RPC. Une erreur nettoie également les URL avant affichage.
 
 ## Tests PostgreSQL
 
@@ -387,8 +419,8 @@ achat et vente dry-run, déduplication, puis fermeture de session. Le scénario
 utilise PostgreSQL réel, mais aucun RPC public et aucune transaction
 blockchain.
 
-Ce parcours complète les tests `SafetyProbe` sur chaîne locale. Le dernier
-niveau restant de l'issue #12 est le scénario testnet explicitement opt-in,
+Ce parcours complète les tests `SafetyProbe` sur chaîne locale. Le smoke BSC
+testnet documenté ci-dessus constitue le niveau externe explicitement opt-in,
 sans secret dans la CI.
 
 La validation complète avant commit reste :

@@ -10,6 +10,7 @@
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --import ./tests/setup-env.ts --test tests/*.test.ts",
     "test:chain": "tsx --import ./tests/setup-env.ts --test tests/safety-probe-local.test.ts",
+    "test:testnet": "tsx scripts/check-testnet-safety-probe.ts",
     "test:postgres": "tsx --test tests/postgres/*.test.ts",
     "rpc:check": "tsx scripts/check-rpc.ts",
     "pair:diagnose": "tsx scripts/diagnose-pair-created.ts",
