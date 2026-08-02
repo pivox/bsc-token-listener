@@ -261,7 +261,7 @@ export function renderDashboardPage(nonce: string, refreshSeconds: number): stri
         : providers.map(function (provider) {
           const lag = provider.lagging ? ' · LAG' : '';
           return provider.id + '/' + provider.kind + ' · ' + provider.status + lag;
-        }).join('\n');
+        }).join('\\n');
       byId('heartbeat-providers-detail').textContent = providers.length === 0
         ? 'Détails: indisponible'
         : providers.map(function (provider) {
