@@ -28,6 +28,8 @@ import type { PositionExitDecision } from './position-exit.types.js';
 
 const TERMINAL = new Set(['CLOSED', 'REJECTED', 'EXPIRED']);
 
+type RiskAnalysisPhase = 'EARLY' | 'ENTRY';
+
 export interface SwapEventLifecycle {
   claim(event: SwapEvent, before: TokenSession): Promise<boolean>;
   markProcessed(eventId: string, after: TokenSession): Promise<void>;
@@ -294,6 +296,87 @@ export class SessionEngine {
     }
   }
 
+  private riskBlocks(report: TokenRiskReport): boolean {
+    return config.riskPolicy === 'allow-only'
+      ? report.verdict !== 'ALLOW'
+      : report.verdict === 'BLOCK';
+  }
+
+  private async persistRiskReport(
+    session: TokenSession,
+    event: SwapEvent,
+    report: TokenRiskReport,
+    phase: RiskAnalysisPhase,
+  ): Promise<void> {
+    await this.reports.save(report, event.id);
+    session.riskReportId = report.id;
+    session.updatedAtMs = Date.now();
+    await this.sessions.save(session);
+
+    logger.info(
+      {
+        pair: session.pair.pair,
+        token: session.pair.token,
+        phase,
+        reportId: report.id,
+        score: report.score,
+        verdict: report.verdict,
+        failedChecks: report.checks
+          .filter((check) => check.status === 'FAIL')
+          .map((check) => check.code),
+        warningChecks: report.checks
+          .filter((check) => check.status === 'WARN' || check.status === 'UNKNOWN')
+          .map((check) => check.code),
+      },
+      'TokenRiskReport enregistré.',
+    );
+  }
+
+  private async runEarlyRiskPrecheck(
+    session: TokenSession,
+    event: SwapEvent,
+  ): Promise<void> {
+    let report: TokenRiskReport;
+    try {
+      report = await this.risk.analyze({
+        pair: session.pair,
+        metadata: session.metadata,
+        blockNumber: event.cursor.blockNumber,
+      });
+    } catch (error) {
+      logger.warn(
+        {
+          pair: session.pair.pair,
+          token: session.pair.token,
+          triggerTransaction: event.transactionHash,
+          reason: errorMessage(error),
+        },
+        'Pré-analyse de risque indisponible; nouvel essai au prochain achat.',
+      );
+      return;
+    }
+
+    await this.persistRiskReport(session, event, report, 'EARLY');
+    if (this.riskBlocks(report)) {
+      await this.reject(
+        session,
+        `Pré-analyse de risque ${report.verdict}, score ${report.score}/100.`,
+      );
+      return;
+    }
+
+    logger.info(
+      {
+        pair: session.pair.pair,
+        token: session.pair.token,
+        reportId: report.id,
+        observedBuyCount: session.entryObservationBuys?.length ?? 0,
+        requiredBuyCount: config.entryObservationBuys,
+      },
+      'Pré-analyse de risque favorable; observation des achats maintenue.',
+    );
+  }
+
   private async handle(session: TokenSession, event: SwapEvent): Promise<void> {
     if (this.isTerminal(session)) return;
     logger.debug(
@@ -334,6 +417,10 @@ export class SessionEngine {
       }
 
       if (count < config.entryObservationBuys) {
+        if (!session.riskReportId) {
+          await this.runEarlyRiskPrecheck(session, event);
+          if (this.isTerminal(session)) return;
+        }
         logger.info(
           {
             pair: session.pair.pair,
@@ -359,7 +446,7 @@ export class SessionEngine {
           triggerTransaction: event.transactionHash,
           amountWbnb: formatEther(event.amountWbnb),
         },
-        'Premier achat confirmé détecté; analyse de risque en cours.',
+        'Tranche d’entrée observée; validation finale du risque en cours.',
       );
 
       const openPositions = await this.sessions.countOpenPositions();
@@ -375,35 +462,9 @@ export class SessionEngine {
           metadata: session.metadata,
           blockNumber: event.cursor.blockNumber,
         });
-        await this.reports.save(
-          report,
-          session.pendingExecutionSourceEventId,
-        );
-        session.riskReportId = report.id;
-        session.updatedAtMs = Date.now();
-        await this.sessions.save(session);
+        await this.persistRiskReport(session, event, report, 'ENTRY');
 
-        logger.info(
-          {
-            pair: session.pair.pair,
-            token: session.pair.token,
-            reportId: report.id,
-            score: report.score,
-            verdict: report.verdict,
-            failedChecks: report.checks
-              .filter((check) => check.status === 'FAIL')
-              .map((check) => check.code),
-            warningChecks: report.checks
-              .filter((check) => check.status === 'WARN' || check.status === 'UNKNOWN')
-              .map((check) => check.code),
-          },
-          'TokenRiskReport enregistré.',
-        );
-
-        const blocked = config.riskPolicy === 'allow-only'
-          ? report.verdict !== 'ALLOW'
-          : report.verdict === 'BLOCK';
-        if (blocked) {
+        if (this.riskBlocks(report)) {
           await this.reject(
             session,
             `TokenRiskReport ${report.verdict}, score ${report.score}/100.`,
